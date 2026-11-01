@@ -7641,7 +7641,8 @@ fn ensure_linux_desktop_entry() {
     };
     if needs_icon_update {
         let _ = std::fs::write(&icon_path, APP_ICON_PNG);
-        if let Ok(img) = image::load_from_memory_with_format(APP_ICON_PNG, image::ImageFormat::Png) {
+        if let Ok(img) = image::load_from_memory_with_format(APP_ICON_PNG, image::ImageFormat::Png)
+        {
             for size in [256, 128, 64, 48, 32, 16] {
                 let size_dir = data_dir.join(format!("icons/hicolor/{size}x{size}/apps"));
                 let _ = std::fs::create_dir_all(&size_dir);

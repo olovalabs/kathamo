@@ -1404,7 +1404,7 @@ impl PlatformWindow for X11Window {
         .log_err();
     }
     fn set_window_icon(&mut self, icon: &WindowIcon) {
-        let standard_sizes = [16, 24, 32, 48, 64, 128, 256];
+        let standard_sizes = [16, 24, 32, 48, 64, 128, 256, 512];
         let src_img = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone());
         let mut data: Vec<u32> = Vec::new();
 

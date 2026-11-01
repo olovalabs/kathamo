@@ -7630,13 +7630,26 @@ fn ensure_linux_desktop_entry() {
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".local/share"));
     let apps_dir = data_dir.join("applications");
-    let icons_dir = data_dir.join("icons/hicolor/512x512/apps");
+    let icons_512_dir = data_dir.join("icons/hicolor/512x512/apps");
     let _ = std::fs::create_dir_all(&apps_dir);
-    let _ = std::fs::create_dir_all(&icons_dir);
+    let _ = std::fs::create_dir_all(&icons_512_dir);
 
-    let icon_path = icons_dir.join("kathamo.png");
-    if !icon_path.exists() {
+    let icon_path = icons_512_dir.join("kathamo.png");
+    let needs_icon_update = match std::fs::read(&icon_path) {
+        Ok(existing) => existing != APP_ICON_PNG,
+        Err(_) => true,
+    };
+    if needs_icon_update {
         let _ = std::fs::write(&icon_path, APP_ICON_PNG);
+        if let Ok(img) = image::load_from_memory_with_format(APP_ICON_PNG, image::ImageFormat::Png) {
+            for size in [256, 128, 64, 48, 32, 16] {
+                let size_dir = data_dir.join(format!("icons/hicolor/{size}x{size}/apps"));
+                let _ = std::fs::create_dir_all(&size_dir);
+                let target = size_dir.join("kathamo.png");
+                let resized = img.resize_exact(size, size, image::imageops::FilterType::Lanczos3);
+                let _ = resized.save_with_format(&target, image::ImageFormat::Png);
+            }
+        }
     }
 
     let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kathamo"));

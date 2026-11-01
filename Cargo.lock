@@ -3242,7 +3242,7 @@ dependencies = [
 
 [[package]]
 name = "kathamo"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -6225,7 +6225,7 @@ dependencies = [
 
 [[package]]
 name = "terminal"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "alacritty_terminal",
  "anyhow",

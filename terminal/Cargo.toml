@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "terminal"
-version = "0.0.3"
+version = "0.0.1"
 description = "Terminal emulator component for Kathamo"
 license = "MIT OR Apache-2.0"
 

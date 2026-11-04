@@ -6,6 +6,7 @@ use crate::highlighter::LanguageConfig;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_iterator::Sequence)]
 pub enum Language {
     Json,
+    Bash,
 }
 
 #[cfg(feature = "tree-sitter-languages")]
@@ -59,7 +60,10 @@ impl Language {
 
     pub fn name(&self) -> &'static str {
         #[cfg(not(feature = "tree-sitter-languages"))]
-        return "json";
+        return match self {
+            Self::Json => "json",
+            Self::Bash => "bash",
+        };
 
         #[cfg(feature = "tree-sitter-languages")]
         match self {
@@ -102,7 +106,10 @@ impl Language {
     #[allow(unused)]
     pub fn from_str(s: &str) -> Self {
         #[cfg(not(feature = "tree-sitter-languages"))]
-        return Self::Json;
+        return match s {
+            "bash" | "sh" | "zsh" => Self::Bash,
+            _ => Self::Json,
+        };
 
         #[cfg(feature = "tree-sitter-languages")]
         match s {
@@ -181,6 +188,12 @@ impl Language {
             Self::Json => (
                 tree_sitter_json::LANGUAGE,
                 include_str!("languages/json/highlights.scm"),
+                "",
+                "",
+            ),
+            Self::Bash => (
+                tree_sitter_bash::LANGUAGE,
+                tree_sitter_bash::HIGHLIGHT_QUERY,
                 "",
                 "",
             ),
@@ -373,6 +386,32 @@ impl Language {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(not(feature = "tree-sitter-languages"))]
+    fn test_minimal_language_set_includes_bash() {
+        use super::*;
+
+        assert_eq!(Language::Bash.name(), "bash");
+        assert_eq!(Language::from_str("zsh"), Language::Bash);
+        assert_eq!(Language::from_str("unknown"), Language::Json);
+        assert!(Language::all().any(|language| language == Language::Bash));
+    }
+
+    #[test]
+    #[cfg(not(feature = "tree-sitter-languages"))]
+    fn test_bash_highlighter_produces_styles() {
+        use crate::highlighter::{HighlightTheme, SyntaxHighlighter};
+
+        let text = ropey::Rope::from_str("echo hi # comment\n");
+        let mut highlighter = SyntaxHighlighter::new("bash");
+        highlighter.update(None, &text);
+        let styles = highlighter.styles(&(0..text.len()), &HighlightTheme::default_dark());
+        assert!(
+            !styles.is_empty(),
+            "bash grammar should highlight a comment"
+        );
+    }
+
     #[test]
     #[cfg(feature = "tree-sitter-languages")]
     fn test_language_name() {

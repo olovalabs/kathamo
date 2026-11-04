@@ -25,6 +25,7 @@ rfd = "0.15"
 libc = "0.2"
 regex = "1"
 toml = "1"
+unicode-width = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 
 [dev-dependencies]
@@ -36,9 +37,13 @@ gpui-component = { path = "components" }
 
 [profile.dev]
 opt-level = 1
+debug = 1
+split-debuginfo = "unpacked"
+incremental = false
 
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
 
 [profile.dev.package.kathamo]
 opt-level = 2

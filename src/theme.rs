@@ -102,6 +102,19 @@ pub struct ThemeTokens {
     pub pill_inactive_bg: Hsla,
     pub pill_inactive_fg: Hsla,
     pub ring: Hsla,
+
+    // Command blocks (Warp style)
+    pub block_bg: Hsla,
+    pub block_bg_hover: Hsla,
+    pub block_border: Hsla,
+    pub block_border_selected: Hsla,
+    pub block_success: Hsla,
+    pub block_failure: Hsla,
+    pub block_warning: Hsla,
+    pub block_separator: Hsla,
+    pub block_status_bg: Hsla,
+    pub editor_bar_bg: Hsla,
+    pub editor_bar_border: Hsla,
 }
 
 impl ThemeTokens {
@@ -168,6 +181,18 @@ impl ThemeTokens {
             pill_inactive_bg: rgba(0x23242cff).into(),
             pill_inactive_fg: rgba(0x918995ff).into(),
             ring: rgba(0x388bfdff).into(),
+
+            block_bg: rgba(0x11151aff).into(),
+            block_bg_hover: rgba(0x151a21ff).into(),
+            block_border: rgba(0x1f242bff).into(),
+            block_border_selected: rgba(0x4c9aedff).into(),
+            block_success: rgba(0x3fb950ff).into(),
+            block_failure: rgba(0xf85149ff).into(),
+            block_warning: rgba(0xd29922ff).into(),
+            block_separator: rgba(0x1b2027ff).into(),
+            block_status_bg: rgba(0x0d1116ff).into(),
+            editor_bar_bg: rgba(0x0d1014ff).into(),
+            editor_bar_border: rgba(0x1f242bff).into(),
         }
     }
 
@@ -226,6 +251,18 @@ impl ThemeTokens {
             pill_inactive_bg: rgba(0xeaeef2ff).into(),
             pill_inactive_fg: rgba(0x59636eff).into(),
             ring: rgba(0x0969daff).into(),
+
+            block_bg: rgba(0xffffffff).into(),
+            block_bg_hover: rgba(0xf6f8faff).into(),
+            block_border: rgba(0xd1d9e0ff).into(),
+            block_border_selected: rgba(0x0969daff).into(),
+            block_success: rgba(0x1a7f37ff).into(),
+            block_failure: rgba(0xcf222eff).into(),
+            block_warning: rgba(0x9a6700ff).into(),
+            block_separator: rgba(0xeaeef2ff).into(),
+            block_status_bg: rgba(0xf6f8faff).into(),
+            editor_bar_bg: rgba(0xffffffff).into(),
+            editor_bar_border: rgba(0xd1d9e0ff).into(),
         }
     }
 }

@@ -15,6 +15,7 @@ pub mod input;
 pub mod mouse;
 pub mod render;
 pub mod search;
+pub mod shell_integration;
 pub mod terminal;
 pub mod view;
 
@@ -29,6 +30,9 @@ pub use event::{
 pub use hyperlink::{HyperlinkKind, HyperlinkMatch, RegexSearches};
 pub use render::{PaintContext, TerminalRenderer};
 pub use search::SearchState;
+pub use shell_integration::{
+    BlockLine, BlockRun, BlockSnapshot, MAX_BLOCK_BYTES, ShellEvent, render_output_lines,
+};
 pub use terminal::{TermDimensions, TerminalState};
 pub use view::{
     BellCallback, ClipboardStoreCallback, ExitCallback, KeyHandler, LinkCallback, ResizeCallback,

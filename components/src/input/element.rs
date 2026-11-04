@@ -76,7 +76,6 @@ impl TextElement {
 
         let mut cursor = state.cursor();
         if state.masked {
-
             selected_range.start = state.text.offset_to_char_index(selected_range.start);
             selected_range.end = state.text.offset_to_char_index(selected_range.end);
             cursor = state.text.offset_to_char_index(cursor);
@@ -113,7 +112,6 @@ impl TextElement {
                 .then(|| lines.get(ix.saturating_sub(visible_range.start)))
                 .flatten()
             {
-
                 if cursor_pos.is_none() {
                     let offset = cursor.saturating_sub(prev_lines_offset);
                     if let Some(pos) = line.position_for_index(offset, line_height) {
@@ -138,7 +136,6 @@ impl TextElement {
 
                 prev_lines_offset += line.len() + 1;
             } else {
-
                 if prev_lines_offset >= cursor && cursor_pos.is_none() {
                     current_row = Some(row);
                     cursor_pos = Some(line_origin);
@@ -164,10 +161,8 @@ impl TextElement {
                 scroll_offset.x = if scroll_offset.x + cursor_pos.x
                     > (bounds.size.width - line_number_width - RIGHT_MARGIN)
                 {
-
                     bounds.size.width - line_number_width - RIGHT_MARGIN - cursor_pos.x
                 } else if scroll_offset.x + cursor_pos.x < px(0.) {
-
                     scroll_offset.x - cursor_pos.x
                 } else {
                     scroll_offset.x
@@ -175,10 +170,8 @@ impl TextElement {
 
                 scroll_offset.y =
                     if scroll_offset.y + cursor_pos.y > bounds.size.height - top_bottom_margin {
-
                         scroll_offset.y - line_height
                     } else if scroll_offset.y + cursor_pos.y < top_bottom_margin {
-
                         (scroll_offset.y + line_height).min(px(0.))
                     } else {
                         scroll_offset.y
@@ -186,20 +179,16 @@ impl TextElement {
 
                 if state.selection_reversed {
                     if scroll_offset.x + cursor_start.x < px(0.) {
-
                         scroll_offset.x = -cursor_start.x;
                     }
                     if scroll_offset.y + cursor_start.y < px(0.) {
-
                         scroll_offset.y = -cursor_start.y;
                     }
                 } else {
                     if scroll_offset.x + cursor_end.x <= px(0.) {
-
                         scroll_offset.x = -cursor_end.x;
                     }
                     if scroll_offset.y + cursor_end.y <= px(0.) {
-
                         scroll_offset.y = -cursor_end.y;
                     }
                 }
@@ -432,7 +421,6 @@ impl TextElement {
         }
 
         if state.masked {
-
             selected_range.start = state.text.offset_to_char_index(selected_range.start);
             selected_range.end = state.text.offset_to_char_index(selected_range.end);
         }
@@ -455,7 +443,6 @@ impl TextElement {
         line_height: Pixels,
         input_height: Pixels,
     ) -> (Range<usize>, Pixels) {
-
         let extra_rows = 1;
         let mut visible_top = px(0.);
         if state.mode.is_single_line() {
@@ -534,7 +521,6 @@ impl TextElement {
         window: &mut Window,
         cx: &App,
     ) -> (Option<ShapedLine>, Vec<ShapedLine>) {
-
         if !state.focus_handle.is_focused(window) {
             return (None, vec![]);
         }
@@ -624,12 +610,10 @@ impl TextElement {
             } else {
                 s
             };
-            let shaped_line = window.text_system().shape_line(
-                clean_text.into(),
-                font_size,
-                &runs,
-                None,
-            );
+            let shaped_line =
+                window
+                    .text_system()
+                    .shape_line(clean_text.into(), font_size, &runs, None);
 
             return vec![LineLayout::new().lines(smallvec::smallvec![shaped_line])];
         }
@@ -711,18 +695,22 @@ impl TextElement {
                 highlighter,
                 diagnostics,
                 ..
-            } => (highlighter.borrow(), diagnostics),
+            } => (highlighter.borrow(), Some(diagnostics)),
+            InputMode::AutoGrow { highlighter, .. } => (highlighter.borrow(), None),
             _ => return None,
         };
         let highlighter = highlighter.as_ref()?;
 
-        let clamped_range = visible_byte_range.start.min(text.len())..visible_byte_range.end.min(text.len());
+        let clamped_range =
+            visible_byte_range.start.min(text.len())..visible_byte_range.end.min(text.len());
         if clamped_range.is_empty() {
             return None;
         }
 
         let mut styles = highlighter.styles(&clamped_range, &cx.theme().highlight_theme);
-        let diagnostic_styles = diagnostics.styles_for_range(&clamped_range, cx);
+        let diagnostic_styles = diagnostics
+            .map(|diagnostics| diagnostics.styles_for_range(&clamped_range, cx))
+            .unwrap_or_default();
 
         if let Some(hover_style) = self.layout_hover_definition(cx) {
             styles.push(hover_style);
@@ -735,7 +723,6 @@ impl TextElement {
 }
 
 pub(super) struct PrepaintState {
-
     last_layout: LastLayout,
 
     line_numbers: Option<Vec<SmallVec<[ShapedLine; 1]>>>,
@@ -760,7 +747,6 @@ pub(super) struct PrepaintState {
 }
 
 impl PrepaintState {
-
     fn cursor_bounds_with_scroll(&self) -> Option<Bounds<Pixels>> {
         self.cursor_bounds.map(|mut bounds| {
             bounds.origin.y += self.cursor_scroll_offset.y;
@@ -836,14 +822,12 @@ impl Element for TextElement {
             style.flex_grow = 1.0;
             style.size.height = relative(1.).into();
             if state.mode.is_auto_grow() {
-
                 let rows = state.mode.max_rows().min(state.mode.rows());
                 style.min_size.height = (rows * line_height).into();
             } else {
                 style.min_size.height = line_height.into();
             }
         } else {
-
             style.size.height = line_height.into();
         };
 
@@ -974,7 +958,6 @@ impl Element for TextElement {
                 vec![run]
             }
         } else if let Some(ime_marked_range) = &state.ime_marked_range {
-
             vec![
                 TextRun {
                     len: ime_marked_range.start,
@@ -1198,7 +1181,6 @@ impl Element for TextElement {
         let mut mask_offset_y = px(0.);
         let state = self.state.read(cx);
         if state.masked && state.text.len() > 0 {
-
             if cfg!(target_os = "macos") {
                 mask_offset_y = px(3.);
             } else {
@@ -1430,7 +1412,6 @@ fn split_runs_by_bg_segments(
             }
 
             if run_start < bg_range.start {
-
                 result.push(TextRun {
                     len: bg_range.start - run_start,
                     ..run.clone()
@@ -1459,7 +1440,6 @@ fn split_runs_by_bg_segments(
         }
 
         if run_end > cursor {
-
             result.push(TextRun {
                 len: run_end - cursor,
                 ..run.clone()
@@ -1488,27 +1468,22 @@ mod tests {
         };
 
         let runs = vec![
-
             TextRun {
                 len: 3,
                 ..run.clone()
             },
-
             TextRun {
                 len: 1,
                 ..run.clone()
             },
-
             TextRun {
                 len: 5,
                 ..run.clone()
             },
-
             TextRun {
                 len: 1,
                 ..run.clone()
             },
-
             TextRun {
                 len: 12,
                 ..run.clone()

@@ -25,6 +25,7 @@ use crate::hyperlink::{HyperlinkMatch, RegexSearches};
 use crate::input::keystroke_to_bytes;
 use crate::render::{PaintContext, TerminalRenderer};
 use crate::search::SearchState;
+use crate::shell_integration::ShellEvent;
 use crate::terminal::TerminalState;
 use alacritty_terminal::event::WindowSize as PtyWindowSize;
 use alacritty_terminal::grid::{Dimensions as GridDimensions, Scroll as GridScroll};
@@ -63,6 +64,10 @@ pub struct TerminalConfig {
     pub line_height_multiplier: f32,
     pub padding: Edges<Pixels>,
     pub colors: ColorPalette,
+
+    /// Per-run token required on OSC 133 markers. Empty accepts all markers
+    /// (standalone use and tests).
+    pub shell_token: String,
 
     /// Blink the cursor when the application asks for a blinking cursor.
     pub cursor_blink: bool,
@@ -110,6 +115,7 @@ impl Default for TerminalConfig {
             line_height_multiplier: 1.2,
             padding: Edges::all(px(0.0)),
             colors: ColorPalette::default(),
+            shell_token: String::new(),
             cursor_blink: true,
             blink_interval: Duration::from_millis(500),
             copy_on_select: false,
@@ -263,7 +269,10 @@ impl TerminalView {
             &config.semantic_escape_chars,
             config.allow_osc52_paste,
         );
-        let state = TerminalState::with_config(config.cols, config.rows, alac_config, event_proxy);
+        let mut state =
+            TerminalState::with_config(config.cols, config.rows, alac_config, event_proxy);
+        state.set_palette(config.colors.clone());
+        state.set_shell_token(config.shell_token.clone());
 
         let renderer = TerminalRenderer::new(
             config.font_family.clone(),
@@ -331,8 +340,11 @@ impl TerminalView {
 
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             let diag_parse = crate::diagnostics::parse_start();
-                            view.state.process_bytes(&bytes);
+                            let shell_events = view.state.process_bytes(&bytes);
                             crate::diagnostics::parse_end(diag_parse, bytes.len());
+                            for event in shell_events {
+                                cx.emit(event);
+                            }
                             view.screen_revision.fetch_add(1, Ordering::Relaxed);
                             // Hidden terminals do not need a live match list;
                             // the first render after they reappear refreshes it.
@@ -1654,6 +1666,11 @@ impl TerminalView {
         self.state.resize(cols, rows);
         self.screen_revision.fetch_add(1, Ordering::Relaxed);
         self.sync_window_size();
+        // The paint pass does this inline. Block mode hides the grid, so the
+        // host calls `resize` explicitly and the PTY must follow.
+        if let Some(callback) = self.resize_callback.as_ref() {
+            callback(cols, rows);
+        }
     }
 
     /// Monotonic change counter for the terminal's visible grid.
@@ -1663,6 +1680,11 @@ impl TerminalView {
 
     pub fn config(&self) -> &TerminalConfig {
         &self.config
+    }
+
+    /// Shaped cell size. Used by the block renderer to align captured output.
+    pub fn cell_metrics(&self) -> (Pixels, Pixels) {
+        (self.renderer.cell_width, self.renderer.cell_height)
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -1694,6 +1716,11 @@ impl TerminalView {
     /// Current OSC 9;4 progress value for agent-specific detection rules.
     pub fn osc_progress(&self) -> &str {
         self.state.osc_progress()
+    }
+
+    /// Most recent cwd reported by shell integration (OSC 7 / OSC 7502).
+    pub fn shell_cwd(&self) -> Option<&str> {
+        self.state.shell_cwd()
     }
 
     /// Read bottom N lines of visible terminal text
@@ -1737,6 +1764,8 @@ impl TerminalView {
         self.renderer.line_height_multiplier = config.line_height_multiplier;
         self.renderer.palette = config.colors.clone();
         *self.palette_handle.lock() = config.colors.clone();
+        self.state.set_palette(config.colors.clone());
+        self.state.set_shell_token(config.shell_token.clone());
 
         if alac_changed {
             self.state.set_config(TerminalState::build_config(
@@ -1766,6 +1795,8 @@ impl TerminalView {
         };
     }
 }
+
+impl EventEmitter<ShellEvent> for TerminalView {}
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

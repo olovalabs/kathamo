@@ -1,5 +1,6 @@
 use crate::colors::ColorPalette;
 use crate::event::GpuiEventProxy;
+use crate::shell_integration::{BlockLine, BlockRun};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column as GridColumn, Line as GridLine, Point as GridPoint};
 use alacritty_terminal::selection::SelectionRange;
@@ -680,6 +681,63 @@ impl TerminalRenderer {
         let merged_backgrounds = self.merge_backgrounds(backgrounds);
 
         (merged_backgrounds, text_runs)
+    }
+
+    /// Snapshot one terminal row as immutable block runs.
+    ///
+    /// Reuses the exact cell styling and run-batching used by the live painter,
+    /// so captured output keeps ANSI colours, bold/italic, underlines and wide
+    /// characters. Trailing spaces are trimmed because a block lays its own
+    /// background and width.
+    pub fn snapshot_line(
+        &self,
+        row: usize,
+        cells: impl Iterator<Item = (usize, Cell)>,
+        colors: &Colors,
+    ) -> BlockLine {
+        let (_, runs) = self.layout_row(row, cells, colors);
+        let default_bg = self
+            .palette
+            .resolve(Color::Named(NamedColor::Background), colors);
+
+        let mut out = Vec::with_capacity(runs.len());
+        let mut total_cells = 0usize;
+        for run in runs {
+            total_cells += run.cell_count;
+            out.push(BlockRun {
+                text: run.text,
+                fg: run.fg_color,
+                bg: if run.bg_color == default_bg {
+                    None
+                } else {
+                    Some(run.bg_color)
+                },
+                bold: run.bold,
+                italic: run.italic,
+                underline: run.underline,
+                strikethrough: run.strikethrough,
+                wavy: run.wavy_underline,
+            });
+        }
+
+        while let Some(last) = out.last_mut() {
+            let trimmed = last.text.trim_end_matches(' ');
+            let removed = last.text.chars().count() - trimmed.chars().count();
+            if removed > 0 {
+                last.text.truncate(trimmed.len());
+                total_cells = total_cells.saturating_sub(removed);
+            }
+            if last.text.is_empty() {
+                out.pop();
+            } else {
+                break;
+            }
+        }
+
+        BlockLine {
+            runs: out,
+            cells: total_cells,
+        }
     }
 
     pub fn merge_backgrounds(&self, mut rects: Vec<BackgroundRect>) -> Vec<BackgroundRect> {

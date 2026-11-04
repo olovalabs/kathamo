@@ -34,7 +34,6 @@ use crate::{highlighter::DiagnosticSet, input::text_wrapper::LineItem};
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
 pub struct Enter {
-
     pub secondary: bool,
 }
 
@@ -220,7 +219,6 @@ pub(crate) fn init(cx: &mut App) {
 
 #[derive(Clone)]
 pub(super) struct LastLayout {
-
     pub(super) visible_range: Range<usize>,
 
     pub(super) visible_top: Pixels,
@@ -239,7 +237,6 @@ pub(super) struct LastLayout {
 }
 
 impl LastLayout {
-
     pub(crate) fn line(&self, row: usize) -> Option<&LineLayout> {
         if row < self.visible_range.start || row >= self.visible_range.end {
             return None;
@@ -442,8 +439,6 @@ impl InputState {
         &self.focus_handle
     }
 
-
-
     pub fn line_number(mut self, line_number: bool) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
@@ -495,6 +490,14 @@ impl InputState {
                 *language = new_language.into();
                 *highlighter.borrow_mut() = None;
             }
+            InputMode::AutoGrow {
+                language,
+                highlighter,
+                ..
+            } => {
+                *language = Some(new_language.into());
+                *highlighter.borrow_mut() = None;
+            }
             _ => {}
         }
         cx.notify();
@@ -503,6 +506,9 @@ impl InputState {
     fn reset_highlighter(&mut self, cx: &mut Context<Self>) {
         match &mut self.mode {
             InputMode::CodeEditor { highlighter, .. } => {
+                *highlighter.borrow_mut() = None;
+            }
+            InputMode::AutoGrow { highlighter, .. } => {
                 *highlighter.borrow_mut() = None;
             }
             _ => {}
@@ -586,11 +592,16 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let value: SharedString = value.into();
-        let value: SharedString = if self.mode.is_single_line() && (value.contains('\n') || value.contains('\r')) {
-            value.replace("\r\n", " ").replace('\n', " ").replace('\r', "").into()
-        } else {
-            value
-        };
+        let value: SharedString =
+            if self.mode.is_single_line() && (value.contains('\n') || value.contains('\r')) {
+                value
+                    .replace("\r\n", " ")
+                    .replace('\n', " ")
+                    .replace('\r', "")
+                    .into()
+            } else {
+                value
+            };
         self.history.ignore = true;
         let was_disabled = self.disabled;
         self.disabled = false;
@@ -620,11 +631,15 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let text: SharedString = text.into();
-        let text: SharedString = if self.mode.is_single_line() && (text.contains('\n') || text.contains('\r')) {
-            text.replace("\r\n", " ").replace('\n', " ").replace('\r', "").into()
-        } else {
-            text
-        };
+        let text: SharedString =
+            if self.mode.is_single_line() && (text.contains('\n') || text.contains('\r')) {
+                text.replace("\r\n", " ")
+                    .replace('\n', " ")
+                    .replace('\r', "")
+                    .into()
+            } else {
+                text
+            };
         let range_utf16 = self.range_to_utf16(&(self.cursor()..self.cursor()));
         self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
         self.selected_range = (self.selected_range.end..self.selected_range.end).into();
@@ -637,11 +652,15 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let text: SharedString = text.into();
-        let text: SharedString = if self.mode.is_single_line() && (text.contains('\n') || text.contains('\r')) {
-            text.replace("\r\n", " ").replace('\n', " ").replace('\r', "").into()
-        } else {
-            text
-        };
+        let text: SharedString =
+            if self.mode.is_single_line() && (text.contains('\n') || text.contains('\r')) {
+                text.replace("\r\n", " ")
+                    .replace('\n', " ")
+                    .replace('\r', "")
+                    .into()
+            } else {
+                text
+            };
         self.replace_text_in_range_silent(None, &text, window, cx);
         self.selected_range = (self.selected_range.end..self.selected_range.end).into();
     }
@@ -1185,7 +1204,6 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-
         self.clear_inline_completion(cx);
 
         if let Some(ime_marked_range) = &self.ime_marked_range {
@@ -1237,7 +1255,6 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-
         let offset = self.index_for_mouse_position(event.position);
         self.handle_mouse_move(offset, event, window, cx);
 
@@ -1348,13 +1365,11 @@ impl InputState {
             .lines
             .get(row.saturating_sub(last_layout.visible_range.start))
         {
-
             if let Some(pos) = line.position_for_index(point.column, line_height) {
                 let bounds_width = bounds.size.width - last_layout.line_number_width;
                 let col_offset_x = pos.x;
                 row_offset_y += pos.y;
                 if col_offset_x - RIGHT_MARGIN < -scroll_offset.x {
-
                     scroll_offset.x = -col_offset_x + RIGHT_MARGIN;
                 } else if col_offset_x + RIGHT_MARGIN > -scroll_offset.x + bounds_width {
                     scroll_offset.x = -(col_offset_x - bounds_width + RIGHT_MARGIN);
@@ -1368,10 +1383,8 @@ impl InputState {
             line_height
         };
         if row_offset_y - edge_height + line_height < -scroll_offset.y {
-
             scroll_offset.y = -row_offset_y + edge_height - line_height;
         } else if row_offset_y + edge_height > -scroll_offset.y + bounds.size.height {
-
             scroll_offset.y = -(row_offset_y - bounds.size.height + edge_height);
         }
 
@@ -1421,7 +1434,10 @@ impl InputState {
         if let Some(clipboard) = cx.read_from_clipboard() {
             let mut new_text = clipboard.text().unwrap_or_default();
             if !self.mode.is_multi_line() {
-                new_text = new_text.replace("\r\n", " ").replace('\n', " ").replace('\r', "");
+                new_text = new_text
+                    .replace("\r\n", " ")
+                    .replace('\n', " ")
+                    .replace('\r', "");
             }
 
             self.replace_text_in_range_silent(None, &new_text, window, cx);
@@ -1476,7 +1492,6 @@ impl InputState {
     }
 
     pub(crate) fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
-
         if self.text.len() == 0 {
             return 0;
         }
@@ -1534,7 +1549,6 @@ impl InputState {
         };
 
         if self.masked {
-
             self.text.char_index_to_offset(index)
         } else {
             index
@@ -1547,7 +1561,6 @@ impl InputState {
         line: &LineItem,
         line_height: Pixels,
     ) -> Point<Pixels> {
-
         if self.mode.is_multi_line() {
             let p = point(px(0.), *y_offset);
             *y_offset += line.height(line_height);
@@ -1752,7 +1765,6 @@ impl InputState {
         if let Some(last_layout) = self.last_layout.as_ref() {
             if wrap_width_changed {
                 let wrap_width = if !self.soft_wrap {
-
                     None
                 } else {
                     last_layout.wrap_width

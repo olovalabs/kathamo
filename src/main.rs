@@ -1,18 +1,19 @@
 use anyhow::Result;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Application, Bounds, ClipboardEntry, Context,
-    CursorStyle, Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
-    Point, Render, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _,
-    Transformation, Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
-    actions, deferred, div, img, percentage, px, relative, rgba, size, svg,
+    Animation, AnimationExt as _, App, AppContext, Application, Bounds, ClipboardEntry,
+    ClipboardItem, Context, CursorStyle, Edges, Entity, ExternalPaths, Hsla,
+    InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, StyledImage as _, Transformation, Window,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowOptions, actions, deferred, div, img,
+    percentage, px, relative, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
-use gpui_component::scroll::ScrollableElement as _;
+use gpui_component::scroll::{ScrollableElement as _, Scrollbar};
 use gpui_component::{Root, Sizable as _, TitleBar};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -21,12 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use terminal::{ColorPalette, TerminalConfig, TerminalView};
+use terminal::{ColorPalette, ShellEvent, TerminalConfig, TerminalView};
 
 mod agent_rules;
 mod assets;
 mod attachments;
 mod attention;
+mod blocks;
 mod cli;
 mod completion;
 mod diagnostics;
@@ -51,8 +53,24 @@ use theme::{ThemePreference, ThemeTokens, load_github_palette};
 /// `Root` context for focus traversal, which would otherwise consume the key
 /// before the completion handler runs.
 const KATHAMO_INPUT_CONTEXT: &str = "KathamoInput";
+/// Key context for the block list. The same actions are also bound in the
+/// input context so Ctrl+Up/Down work while the editor has focus.
+const KATHAMO_BLOCKS_CONTEXT: &str = "KathamoBlocks";
 
 actions!(kathamo_input, [CompleteCommand, IgnoreKey]);
+actions!(
+    kathamo_blocks,
+    [
+        BlockPrev,
+        BlockNext,
+        BlockCopyCommand,
+        BlockCopyOutput,
+        BlockCopyMarkdown,
+        BlockRerun,
+        BlockToggleCollapse,
+        BlockToggleBookmark
+    ]
+);
 
 fn init_kathamo_input_bindings(cx: &mut App) {
     cx.bind_keys([
@@ -60,6 +78,22 @@ fn init_kathamo_input_bindings(cx: &mut App) {
         // Keep Shift+Tab from running the Root context's focus traversal.
         gpui::KeyBinding::new("shift-tab", IgnoreKey, Some(KATHAMO_INPUT_CONTEXT)),
     ]);
+}
+
+fn init_block_bindings(cx: &mut App) {
+    for context in [KATHAMO_BLOCKS_CONTEXT, KATHAMO_INPUT_CONTEXT] {
+        cx.bind_keys([
+            gpui::KeyBinding::new("ctrl-up", BlockPrev, Some(context)),
+            gpui::KeyBinding::new("ctrl-down", BlockNext, Some(context)),
+            gpui::KeyBinding::new("ctrl-shift-c", BlockCopyCommand, Some(context)),
+            gpui::KeyBinding::new("ctrl-shift-o", BlockCopyOutput, Some(context)),
+            gpui::KeyBinding::new("ctrl-shift-m", BlockCopyMarkdown, Some(context)),
+            gpui::KeyBinding::new("ctrl-shift-r", BlockRerun, Some(context)),
+            // `ctrl-shift-e` is SelectToEndOfLine inside the editor.
+            gpui::KeyBinding::new("ctrl-shift-h", BlockToggleCollapse, Some(context)),
+            gpui::KeyBinding::new("ctrl-shift-b", BlockToggleBookmark, Some(context)),
+        ]);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -181,6 +215,10 @@ pub struct TerminalPane {
     /// Images staged in the input bar; dropped, pasted, or picked. They are
     /// sent to the agent as file paths when the prompt is submitted.
     pub attachments: Vec<attachments::AttachedImage>,
+    /// Warp-style command blocks, independent of the terminal grid.
+    pub block_pane: blocks::BlockPane,
+    /// Keeps the terminal's `ShellEvent` subscription alive for this pane.
+    pub terminal_subscription: Option<gpui::Subscription>,
 }
 
 /// One visible completion popup for a pane.
@@ -254,6 +292,8 @@ impl TerminalPane {
             bottom_input_visible: bottom_input_enabled,
             plus_menu_open: false,
             attachments: Vec::new(),
+            block_pane: blocks::BlockPane::default(),
+            terminal_subscription: None,
         }
     }
 
@@ -268,12 +308,26 @@ impl TerminalPane {
             return false;
         }
 
+        // While a command owns stdin, the editor is hidden and raw input goes
+        // straight to the PTY (sudo, ssh, read, interactive CLIs).
+        if self.block_pane.running {
+            return false;
+        }
+
         // Alternate screen mode (vim, nano, htop, less, etc.) always hides the bottom bar
         if self.terminal.read(cx).is_alt_screen() {
             return false;
         }
 
         true
+    }
+
+    /// Content area shows the block list instead of the raw grid.
+    ///
+    /// Requires the editor to be available: a pane whose editor is disabled is
+    /// a plain terminal, and block mode with no input would be a dead end.
+    pub fn shows_blocks(&self, cx: &App) -> bool {
+        self.block_pane.shows_blocks() && self.should_show_bottom_input(cx)
     }
 }
 
@@ -585,13 +639,13 @@ impl AppState {
             let id = self.next_id;
             self.next_id += 1;
             let weak = cx.entity().downgrade();
-            let Ok((terminal, pid, generation)) =
+            let Ok((terminal, pid, generation, terminal_subscription)) =
                 Self::spawn_terminal_view(Some(&project.path), self.palette.clone(), weak, id, cx)
             else {
                 continue;
             };
             let title = SharedString::from("terminal 1");
-            let pane = TerminalPane::new(
+            let mut pane = TerminalPane::new(
                 id,
                 generation,
                 terminal,
@@ -600,6 +654,7 @@ impl AppState {
                 pid,
                 saved.bottom_input,
             );
+            pane.terminal_subscription = Some(terminal_subscription);
             let session = Session {
                 id,
                 title: title.clone(),
@@ -636,11 +691,11 @@ impl AppState {
             let id = self.next_id;
             self.next_id += 1;
             let weak = cx.entity().downgrade();
-            if let Ok((terminal, pid, generation)) =
+            if let Ok((terminal, pid, generation, terminal_subscription)) =
                 Self::spawn_terminal_view(Some(&default_dir), self.palette.clone(), weak, id, cx)
             {
                 let title = SharedString::from("terminal 1");
-                let pane = TerminalPane::new(
+                let mut pane = TerminalPane::new(
                     id,
                     generation,
                     terminal,
@@ -649,6 +704,7 @@ impl AppState {
                     pid,
                     self.kathamo_bottom_input,
                 );
+                pane.terminal_subscription = Some(terminal_subscription);
                 let session = Session {
                     id,
                     title: title.clone(),
@@ -677,6 +733,21 @@ impl AppState {
                 .and_then(|s| s.panes.first())
                 .map(|p| p.id);
         }
+        // Manual scroll-stress hook: inject synthetic blocks after the first
+        // pane exists so 5,000+ block scrolling can be exercised without
+        // running 5,000 commands.
+        if let Ok(value) = std::env::var("KATHAMO_BLOCK_STRESS")
+            && let Ok(count) = value.parse::<usize>()
+            && let Some(pane) = self
+                .projects
+                .first_mut()
+                .and_then(|project| project.sessions.first_mut())
+                .and_then(|session| session.panes.first_mut())
+        {
+            pane.block_pane.inject_synthetic_blocks(count);
+            pane.block_pane.cards_dirty = true;
+        }
+
         self.rebuild_session_index();
         cx.notify();
     }
@@ -802,8 +873,13 @@ impl AppState {
         window_title_target: gpui::WeakEntity<Self>,
         pane_id: usize,
         cx: &mut Context<Self>,
-    ) -> Result<(Entity<TerminalView>, Option<u32>, String)> {
-        let (shell_cmd, _) = detect_shell();
+    ) -> Result<(
+        Entity<TerminalView>,
+        Option<u32>,
+        String,
+        gpui::Subscription,
+    )> {
+        let (shell_cmd, shell_name) = detect_shell();
         #[cfg(unix)]
         let generation = status_bus::new_generation();
         #[cfg(not(unix))]
@@ -822,6 +898,7 @@ impl AppState {
         if let Some(d) = dir {
             cmd.cwd(d);
         }
+        blocks::shell_integration::configure_shell(&mut cmd, &shell_name);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "kathamo");
@@ -904,6 +981,7 @@ impl AppState {
             line_height_multiplier: 1.2,
             padding: Edges::all(px(8.0)),
             colors: palette,
+            shell_token: blocks::shell_integration::shell_token().to_string(),
             cursor_blink: true,
             copy_on_select: true,
             right_click_paste: false,
@@ -938,7 +1016,18 @@ impl AppState {
             // Exit status is intentionally not set here: the status poller
             // derives Done/Error from the real exit code (see poll_sessions_status).
         });
-        Ok((terminal, pid, generation))
+
+        // Shell-integration events arrive on the UI thread from the reader task.
+        // The subscription is stored on the pane so it survives until the pane
+        // is closed.
+        let terminal_subscription = cx.subscribe(
+            &terminal,
+            move |state, _terminal, event: &ShellEvent, cx| {
+                state.on_shell_event(pane_id, event, cx);
+            },
+        );
+
+        Ok((terminal, pid, generation, terminal_subscription))
     }
 
     fn update_pane_title(&mut self, pane_id: usize, title: &str, cx: &mut Context<Self>) {
@@ -2054,7 +2143,7 @@ impl AppState {
         let Some(dir) = self.projects.get(project_idx).map(|p| p.path.clone()) else {
             return;
         };
-        if let Ok((terminal, pid, generation)) =
+        if let Ok((terminal, pid, generation, terminal_subscription)) =
             Self::spawn_terminal_view(Some(&dir), self.palette.clone(), self_weak, next_id, cx)
         {
             let session_count = self
@@ -2073,6 +2162,7 @@ impl AppState {
                 pid,
                 self.kathamo_bottom_input,
             );
+            pane.terminal_subscription = Some(terminal_subscription);
             let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             if self.kathamo_bottom_input {
                 input_state.update(cx, |state, cx| {
@@ -2281,7 +2371,7 @@ impl AppState {
         let next_id = self.next_id;
         self.next_id += 1;
 
-        if let Ok((terminal, pid, generation)) =
+        if let Ok((terminal, pid, generation, terminal_subscription)) =
             Self::spawn_terminal_view(Some(&folder), self.palette.clone(), self_weak, next_id, cx)
         {
             let title = SharedString::from("terminal 1");
@@ -2294,6 +2384,7 @@ impl AppState {
                 pid,
                 self.kathamo_bottom_input,
             );
+            pane.terminal_subscription = Some(terminal_subscription);
             let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             if self.kathamo_bottom_input {
                 input_state.update(cx, |state, cx| {
@@ -2377,7 +2468,7 @@ impl AppState {
             .and_then(|p| p.sessions.get(s_idx))
             .map(|s| s.panes.len())
             .unwrap_or(0);
-        if let Ok((terminal, pid, generation)) =
+        if let Ok((terminal, pid, generation, terminal_subscription)) =
             Self::spawn_terminal_view(dir.as_ref(), self.palette.clone(), self_weak, next_id, cx)
         {
             let title = SharedString::from(format!("terminal {}", pane_count + 1));
@@ -2391,6 +2482,7 @@ impl AppState {
                 pid,
                 self.kathamo_bottom_input,
             );
+            pane.terminal_subscription = Some(terminal_subscription);
             let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             if self.kathamo_bottom_input {
                 input_state.update(cx, |state, cx| {
@@ -3018,6 +3110,40 @@ impl AppState {
         cx.notify();
     }
 
+    /// Ctrl+G in an integrated pane switches between the block UI and the
+    /// classic scrolling grid (the editor bar keeps its existing toggle).
+    fn toggle_pane_classic_mode(
+        &mut self,
+        pane_id: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let detected = self
+            .pane_ref(pane_id)
+            .is_some_and(|pane| pane.block_pane.detected);
+        if !detected {
+            self.toggle_pane_bottom_input(pane_id, window, cx);
+            return;
+        }
+
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.block_pane.classic_mode = !pane.block_pane.classic_mode;
+            let should_show = pane.should_show_bottom_input(cx);
+            pane.terminal
+                .update(cx, |terminal, _| terminal.set_read_only(should_show));
+            if should_show {
+                if let Some(input_state) = &pane.input_state {
+                    input_state.update(cx, |state, cx| state.focus(window, cx));
+                } else {
+                    pane.terminal.read(cx).focus_handle().focus(window);
+                }
+            } else {
+                pane.terminal.read(cx).focus_handle().focus(window);
+            }
+        }
+        cx.notify();
+    }
+
     #[allow(dead_code)]
     fn clear_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
@@ -3129,6 +3255,9 @@ impl AppState {
 
         let raw = input_state.read(cx).value().to_string();
         let has_attachments = !pane.attachments.is_empty();
+        // The editor knows the exact command; the shell's C marker only tells
+        // us that one started. Keep it for the block header.
+        pane.block_pane.note_submitted(&raw);
 
         if raw.is_empty() && !has_attachments {
             pane.terminal.update(cx, |term, cx| {
@@ -3211,6 +3340,318 @@ impl AppState {
         });
         cx.notify();
     }
+
+    /// Map shell-integration events into the pane's block model.
+    ///
+    /// Output parsing happens here for normal-sized blocks and on the
+    /// background executor for large ones, so a giant `find /` cannot stall the
+    /// UI thread while its block is assembled.
+    fn on_shell_event(&mut self, pane_id: usize, event: &ShellEvent, cx: &mut Context<Self>) {
+        let palette = self.palette.clone();
+        let mut pending_parse: Option<(u64, Vec<u8>, usize, usize)> = None;
+
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        match event {
+            ShellEvent::PromptStart => {
+                pane.block_pane.handle(blocks::PaneEvent::PromptStart);
+            }
+            ShellEvent::PromptEnd => {}
+            ShellEvent::CommandStarted {
+                command_line, cwd, ..
+            } => {
+                pane.block_pane.handle(blocks::PaneEvent::CommandStarted {
+                    command_line: command_line.clone(),
+                    cwd: cwd.clone(),
+                });
+                // stdin belongs to the command now.
+                pane.terminal
+                    .update(cx, |terminal, _| terminal.set_read_only(false));
+            }
+            ShellEvent::CommandFinished {
+                exit_code,
+                duration,
+                raw,
+                truncated,
+                full_screen,
+                cols,
+                rows,
+            } => {
+                let parse_on_background = !*full_screen && raw.len() > blocks::SYNC_PARSE_LIMIT;
+                let snapshot = if *full_screen {
+                    terminal::BlockSnapshot::default()
+                } else if parse_on_background {
+                    terminal::BlockSnapshot::default()
+                } else {
+                    terminal::render_output_lines(raw, *cols, *rows, &palette)
+                };
+
+                pane.block_pane.handle(blocks::PaneEvent::CommandFinished {
+                    snapshot,
+                    exit_code: *exit_code,
+                    duration: *duration,
+                    full_screen: *full_screen,
+                    raw: raw.clone(),
+                    raw_truncated: *truncated,
+                    cols: *cols,
+                    rows: *rows,
+                });
+
+                if parse_on_background {
+                    if let Some(block) = pane.block_pane.list.last() {
+                        let id = block.id;
+                        pane.block_pane.list.mark_pending(id);
+                        pane.block_pane.cards_dirty = true;
+                        pending_parse = Some((id, raw.clone(), *cols, *rows));
+                    }
+                }
+
+                let should_show = pane.should_show_bottom_input(cx);
+                pane.terminal
+                    .update(cx, |terminal, _| terminal.set_read_only(should_show));
+            }
+            ShellEvent::CwdChanged(path) => {
+                pane.block_pane
+                    .handle(blocks::PaneEvent::CwdChanged(path.clone()));
+            }
+            ShellEvent::Metadata(_) => {}
+        }
+        cx.notify();
+
+        if let Some((block_id, raw, cols, rows)) = pending_parse {
+            let weak = cx.entity().downgrade();
+            App::spawn(cx, async move |cx: &mut gpui::AsyncApp| {
+                let snapshot = cx
+                    .background_executor()
+                    .spawn(async move { terminal::render_output_lines(&raw, cols, rows, &palette) })
+                    .await;
+                let _ = weak.update(cx, |state, cx| {
+                    state.finish_block_parse(pane_id, block_id, snapshot, cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    fn finish_block_parse(
+        &mut self,
+        pane_id: usize,
+        block_id: u64,
+        snapshot: terminal::BlockSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            if pane.block_pane.list.set_snapshot(block_id, snapshot) {
+                pane.block_pane.cards_dirty = true;
+                pane.block_pane.wrap_cache.borrow_mut().remove(&block_id);
+                pane.block_pane.list_state.reset(pane.block_pane.list.len());
+            }
+        }
+        cx.notify();
+    }
+
+    fn select_block(&mut self, pane_id: usize, block_id: u64, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            if let Some(index) = pane
+                .block_pane
+                .list
+                .blocks()
+                .iter()
+                .position(|block| block.id == block_id)
+            {
+                pane.block_pane.list.select(index);
+                pane.block_pane.cards_dirty = true;
+            }
+        }
+        cx.notify();
+    }
+
+    fn select_block_relative(
+        &mut self,
+        pane_id: usize,
+        delta: i32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            let index = if delta < 0 {
+                pane.block_pane.list.select_prev()
+            } else {
+                pane.block_pane.list.select_next()
+            };
+            if let Some(index) = index {
+                pane.block_pane.list_state.scroll_to_reveal_item(index);
+                pane.block_pane.cards_dirty = true;
+            }
+        }
+        cx.notify();
+    }
+
+    fn block_action_for_selected(
+        &mut self,
+        pane_id: usize,
+        action: blocks::BlockAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let block_id = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.block_pane.list.selected().map(|block| block.id));
+        if let Some(block_id) = block_id {
+            self.block_action(pane_id, block_id, action, window, cx);
+        }
+    }
+
+    pub(crate) fn block_action(
+        &mut self,
+        pane_id: usize,
+        block_id: u64,
+        action: blocks::BlockAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let Some(index) = pane
+            .block_pane
+            .list
+            .blocks()
+            .iter()
+            .position(|block| block.id == block_id)
+        else {
+            return;
+        };
+
+        match action {
+            blocks::BlockAction::CopyCommand => {
+                let text = pane
+                    .block_pane
+                    .list
+                    .get(index)
+                    .map(|block| block.command.clone())
+                    .unwrap_or_default();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            blocks::BlockAction::CopyOutput => {
+                let text = pane
+                    .block_pane
+                    .list
+                    .get(index)
+                    .map(|block| block.plain_output())
+                    .unwrap_or_default();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            blocks::BlockAction::CopyMarkdown => {
+                let text = pane
+                    .block_pane
+                    .list
+                    .get(index)
+                    .map(|block| block.to_markdown())
+                    .unwrap_or_default();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            blocks::BlockAction::Rerun => {
+                let command = pane
+                    .block_pane
+                    .list
+                    .get(index)
+                    .map(|block| block.command.clone())
+                    .unwrap_or_default();
+                if let Some(input_state) = pane.input_state.clone() {
+                    input_state.update(cx, |state, cx| {
+                        state.set_value(command, window, cx);
+                        state.focus(window, cx);
+                    });
+                }
+            }
+            blocks::BlockAction::ToggleCollapse => {
+                pane.block_pane.list.toggle_collapse(index);
+                let len = pane.block_pane.list.len();
+                pane.block_pane.list_state.reset(len);
+                pane.block_pane.cards_dirty = true;
+            }
+            blocks::BlockAction::ToggleBookmark => {
+                pane.block_pane.list.toggle_bookmark(index);
+                pane.block_pane.cards_dirty = true;
+            }
+            blocks::BlockAction::ShowFullOutput => {
+                if let Some(block) = pane.block_pane.list.get_mut(index) {
+                    block.show_full_output = !block.show_full_output;
+                    pane.block_pane.wrap_cache.borrow_mut().remove(&block_id);
+                }
+                let len = pane.block_pane.list.len();
+                pane.block_pane.list_state.reset(len);
+                pane.block_pane.cards_dirty = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Re-parse a block's captured bytes at a new width on the background
+    /// executor. Called lazily by the visible card when its width is stale.
+    pub(crate) fn request_reflow(
+        &mut self,
+        pane_id: usize,
+        block_id: u64,
+        cols: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let palette = self.palette.clone();
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        if !pane.block_pane.reflowing.insert(block_id) {
+            return;
+        }
+        let Some(block) = pane
+            .block_pane
+            .list
+            .blocks()
+            .iter()
+            .find(|block| block.id == block_id)
+        else {
+            pane.block_pane.reflowing.remove(&block_id);
+            return;
+        };
+        // The background executor needs a Send payload; the Rc stays with the
+        // block and is only cloned once per reflow.
+        let raw = (*block.raw).clone();
+        let rows = block.capture_rows;
+        let weak = cx.entity().downgrade();
+        App::spawn(cx, async move |cx: &mut gpui::AsyncApp| {
+            let snapshot = cx
+                .background_executor()
+                .spawn(async move { terminal::render_output_lines(&raw, cols, rows, &palette) })
+                .await;
+            let _ = weak.update(cx, |state, cx| {
+                state.finish_block_reflow(pane_id, block_id, cols, snapshot, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_block_reflow(
+        &mut self,
+        pane_id: usize,
+        block_id: u64,
+        cols: usize,
+        snapshot: terminal::BlockSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.block_pane.reflowing.remove(&block_id);
+            if pane.block_pane.list.set_reflowed(block_id, cols, snapshot) {
+                pane.block_pane.cards_dirty = true;
+                pane.block_pane.wrap_cache.borrow_mut().remove(&block_id);
+                let len = pane.block_pane.list.len();
+                pane.block_pane.list_state.reset(len);
+            }
+        }
+        cx.notify();
+    }
+
     fn handle_pane_ctrl_c(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
             return;
@@ -3358,14 +3799,14 @@ impl AppState {
             return;
         }
 
-        // Ctrl+G: toggle the input editor.
+        // Ctrl+G: toggle the block UI / input editor.
         if (key == "g" || key == "G")
             && (modifiers.control || modifiers.platform)
             && !modifiers.shift
             && !modifiers.alt
         {
             cx.stop_propagation();
-            self.toggle_pane_bottom_input(pane_id, window, cx);
+            self.toggle_pane_classic_mode(pane_id, window, cx);
             return;
         }
 
@@ -3678,6 +4119,34 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Rebuild the immutable block card cache for panes whose model changed and
+    /// consume the "scroll to newest" flag. Runs once per frame before render.
+    fn refresh_block_caches(&mut self, cx: &App) {
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                for pane in &mut session.panes {
+                    let cols = pane.terminal.read(cx).dimensions().0.max(2);
+                    if pane.block_pane.last_cols != cols {
+                        pane.block_pane.cards_dirty = true;
+                        pane.block_pane.wrap_cache.borrow_mut().clear();
+                    }
+                    pane.block_pane.refresh_cards(cols);
+                }
+            }
+        }
+    }
+
+    fn scroll_blocks_to_bottom(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            let len = pane.block_pane.list.len();
+            if len > 0 {
+                pane.block_pane.list_state.scroll_to_reveal_item(len - 1);
+            }
+            pane.block_pane.follow_tail.set(true);
+        }
+        cx.notify();
     }
 
     fn open_terminal_context_menu(
@@ -4906,6 +5375,18 @@ impl AppState {
         let tokens = self.tokens(cx);
         let cwd_display = self.pane_cwd_display(pane);
         let git_branch = self.pane_git_branch(pane);
+        let block_debug = std::env::var_os("KATHAMO_BLOCK_DEBUG").map(|_| {
+            let (cols, rows) = pane.terminal.read(cx).dimensions();
+            format!(
+                "L{} D{} R{} S{} {}x{}",
+                pane.block_pane.list.len(),
+                pane.block_pane.detected as u8,
+                pane.block_pane.running as u8,
+                pane.shows_blocks(cx) as u8,
+                cols,
+                rows
+            )
+        });
 
         let bar_border: Hsla = if tokens.is_dark {
             rgba(0x1d1d1dff).into()
@@ -4966,6 +5447,67 @@ impl AppState {
                 .on_action(cx.listener(|_, _: &IgnoreKey, _, cx| {
                     cx.stop_propagation();
                 }))
+                .on_action(cx.listener(move |this, _: &BlockPrev, window, cx| {
+                    cx.stop_propagation();
+                    this.select_block_relative(pane_id, -1, window, cx);
+                }))
+                .on_action(cx.listener(move |this, _: &BlockNext, window, cx| {
+                    cx.stop_propagation();
+                    this.select_block_relative(pane_id, 1, window, cx);
+                }))
+                .on_action(cx.listener(move |this, _: &BlockCopyCommand, window, cx| {
+                    cx.stop_propagation();
+                    this.block_action_for_selected(
+                        pane_id,
+                        blocks::BlockAction::CopyCommand,
+                        window,
+                        cx,
+                    );
+                }))
+                .on_action(cx.listener(move |this, _: &BlockCopyOutput, window, cx| {
+                    cx.stop_propagation();
+                    this.block_action_for_selected(
+                        pane_id,
+                        blocks::BlockAction::CopyOutput,
+                        window,
+                        cx,
+                    );
+                }))
+                .on_action(cx.listener(move |this, _: &BlockCopyMarkdown, window, cx| {
+                    cx.stop_propagation();
+                    this.block_action_for_selected(
+                        pane_id,
+                        blocks::BlockAction::CopyMarkdown,
+                        window,
+                        cx,
+                    );
+                }))
+                .on_action(cx.listener(move |this, _: &BlockRerun, window, cx| {
+                    cx.stop_propagation();
+                    this.block_action_for_selected(pane_id, blocks::BlockAction::Rerun, window, cx);
+                }))
+                .on_action(
+                    cx.listener(move |this, _: &BlockToggleCollapse, window, cx| {
+                        cx.stop_propagation();
+                        this.block_action_for_selected(
+                            pane_id,
+                            blocks::BlockAction::ToggleCollapse,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+                .on_action(
+                    cx.listener(move |this, _: &BlockToggleBookmark, window, cx| {
+                        cx.stop_propagation();
+                        this.block_action_for_selected(
+                            pane_id,
+                            blocks::BlockAction::ToggleBookmark,
+                            window,
+                            cx,
+                        );
+                    }),
+                )
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                     this.handle_pane_input_key(pane_id, event, window, cx);
                 }))
@@ -5200,12 +5742,14 @@ impl AppState {
                     .justify_between()
                     .text_size(px(10.0))
                     .text_color(tokens.text_muted)
+                    .child(div().child(
+                        "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images",
+                    ))
                     .child(
-                        div().child(
-                            "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images",
-                        ),
-                    )
-                    .child(div().font_family(MONO_FONT).child("Ctrl+G")),
+                        div()
+                            .font_family(MONO_FONT)
+                            .child(block_debug.unwrap_or_else(|| "Ctrl+G".to_string())),
+                    ),
             )
     }
 
@@ -5333,6 +5877,275 @@ impl AppState {
         )
     }
 
+    /// Virtualized block list with a hidden-grid resize hook.
+    fn render_block_list(&self, pane: &TerminalPane, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let pane_id = pane.id;
+        let tokens = self.tokens(cx);
+        let (cell_width, cell_height) = pane.terminal.read(cx).cell_metrics();
+        let target_cols = pane.terminal.read(cx).dimensions().0.max(2);
+        let terminal_config = pane.terminal.read(cx).config().clone();
+        let padding = terminal_config.padding;
+        let cards = pane.block_pane.cards.clone().unwrap_or_default();
+        let weak = cx.entity().downgrade();
+
+        let style = blocks::render::CardStyle {
+            tokens,
+            font_size: terminal_config.font_size,
+            cell_width,
+            cell_height,
+            mono_font: terminal_config.font_family.clone().into(),
+            target_cols,
+        };
+
+        // Block mode hides the terminal element, so its paint pass cannot keep
+        // the grid/PTY sized. Do it here, after layout, and notify the app.
+        let terminal = pane.terminal.clone();
+        let app = weak.clone();
+        let resize_canvas = gpui::canvas(
+            move |bounds, window, cx| {
+                let width = f32::from(bounds.size.width - padding.left - padding.right);
+                let height = f32::from(bounds.size.height - padding.top - padding.bottom);
+                let cols = ((width / f32::from(cell_width).max(1.0)) as usize).max(2);
+                let rows = ((height / f32::from(cell_height).max(1.0)) as usize).max(1);
+                if terminal.read(cx).dimensions() != (cols, rows) {
+                    let terminal = terminal.clone();
+                    let app = app.clone();
+                    window.defer(cx, move |_window, cx| {
+                        let _ = terminal.update(cx, |term, cx| {
+                            term.resize(cols, rows);
+                            cx.notify();
+                        });
+                        let _ = app.update(cx, |_state, cx| cx.notify());
+                    });
+                }
+                bounds
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
+        let empty = cards.is_empty();
+        let wrap_cache = pane.block_pane.wrap_cache.clone();
+        let list = gpui::list(pane.block_pane.list_state.clone(), {
+            let cards = cards.clone();
+            let weak = weak.clone();
+            let style = style.clone();
+            move |index, window, cx| {
+                let Some(card) = cards.get(index) else {
+                    return div().into_any_element();
+                };
+                if card.rendered_cols != style.target_cols
+                    && !card.full_screen
+                    && !card.raw.is_empty()
+                    && !card.snapshot_pending
+                {
+                    let weak = weak.clone();
+                    let id = card.id;
+                    let cols = style.target_cols;
+                    window.defer(cx, move |_window, cx| {
+                        let _ = weak.update(cx, |state, cx| {
+                            state.request_reflow(pane_id, id, cols, cx);
+                        });
+                    });
+                }
+
+                // Wrapping is lazy: only cards the list actually renders pay
+                // for it, and the result is cached until the width or output
+                // changes.
+                let (wrapped, total_rows, display_capped) = {
+                    let mut cache = wrap_cache.borrow_mut();
+                    match cache.get(&card.id) {
+                        Some(entry) if entry.cols == style.target_cols => {
+                            (entry.rows.clone(), entry.total_rows, entry.display_capped)
+                        }
+                        _ => {
+                            let limit = if card.show_full_output {
+                                blocks::render::MAX_RENDER_LINES_EXPANDED
+                            } else {
+                                blocks::render::MAX_RENDER_LINES
+                            };
+                            let (rows, total, capped) = blocks::render::wrap_snapshot(
+                                &card.snapshot,
+                                style.target_cols,
+                                limit,
+                            );
+                            cache.insert(
+                                card.id,
+                                blocks::WrapEntry {
+                                    cols: style.target_cols,
+                                    rows: rows.clone(),
+                                    total_rows: total,
+                                    display_capped: capped,
+                                },
+                            );
+                            (rows, total, capped)
+                        }
+                    }
+                };
+
+                div()
+                    .w_full()
+                    .px(px(6.0))
+                    .py(px(4.0))
+                    .child(blocks::render::render_card(
+                        card,
+                        &style,
+                        &weak,
+                        pane_id,
+                        &wrapped,
+                        total_rows,
+                        display_capped,
+                    ))
+                    .into_any_element()
+            }
+        });
+
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(tokens.pane_bg)
+            .key_context(KATHAMO_BLOCKS_CONTEXT)
+            .on_action(cx.listener(move |this, _: &BlockPrev, window, cx| {
+                cx.stop_propagation();
+                this.select_block_relative(pane_id, -1, window, cx);
+            }))
+            .on_action(cx.listener(move |this, _: &BlockNext, window, cx| {
+                cx.stop_propagation();
+                this.select_block_relative(pane_id, 1, window, cx);
+            }))
+            .on_action(cx.listener(move |this, _: &BlockCopyCommand, window, cx| {
+                cx.stop_propagation();
+                this.block_action_for_selected(
+                    pane_id,
+                    blocks::BlockAction::CopyCommand,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(move |this, _: &BlockCopyOutput, window, cx| {
+                cx.stop_propagation();
+                this.block_action_for_selected(
+                    pane_id,
+                    blocks::BlockAction::CopyOutput,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(move |this, _: &BlockCopyMarkdown, window, cx| {
+                cx.stop_propagation();
+                this.block_action_for_selected(
+                    pane_id,
+                    blocks::BlockAction::CopyMarkdown,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(move |this, _: &BlockRerun, window, cx| {
+                cx.stop_propagation();
+                this.block_action_for_selected(pane_id, blocks::BlockAction::Rerun, window, cx);
+            }))
+            .on_action(
+                cx.listener(move |this, _: &BlockToggleCollapse, window, cx| {
+                    cx.stop_propagation();
+                    this.block_action_for_selected(
+                        pane_id,
+                        blocks::BlockAction::ToggleCollapse,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .on_action(
+                cx.listener(move |this, _: &BlockToggleBookmark, window, cx| {
+                    cx.stop_propagation();
+                    this.block_action_for_selected(
+                        pane_id,
+                        blocks::BlockAction::ToggleBookmark,
+                        window,
+                        cx,
+                    );
+                }),
+            )
+            .child(resize_canvas)
+            .when(empty, |this| {
+                this.child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .text_color(tokens.text_muted)
+                        .child("Run a command to create your first block"),
+                )
+            })
+            .when(!empty, |this| {
+                // The list itself must be the flex-growing child: gpui::list
+                // measures against its own bounds, and a zero-height box means
+                // no item is ever prepainted.
+                this.child(list.flex_1().w_full().min_h(px(0.0)))
+                    .when(cfg!(test), |this| {
+                        this.child(
+                            div()
+                                .id("kathamo-block-list-probe")
+                                .debug_selector(|| "kathamo-block-list-probe".to_string())
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size(px(4.0)),
+                        )
+                    })
+                    .child(
+                        // Keep the scrollbar in a narrow right strip. The
+                        // component installs a full-size hitbox, so as a
+                        // sibling of the list it swallowed every wheel event.
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(14.0))
+                            .child(
+                                Scrollbar::vertical(&pane.block_pane.list_state)
+                                    .id(("block-scrollbar", pane_id)),
+                            ),
+                    )
+                    .when(!pane.block_pane.follow_tail.get(), {
+                        let weak = weak.clone();
+                        move |this| {
+                            this.child(
+                                div()
+                                    .id(("block-jump-bottom", pane_id))
+                                    .absolute()
+                                    .bottom(px(14.0))
+                                    .right(px(22.0))
+                                    .px(px(10.0))
+                                    .py(px(5.0))
+                                    .rounded(px(999.0))
+                                    .bg(tokens.block_bg)
+                                    .border_1()
+                                    .border_color(tokens.card_border)
+                                    .text_size(px(10.0))
+                                    .text_color(tokens.text_primary)
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(|style| style.bg(tokens.block_bg_hover))
+                                    .child("↓ newest")
+                                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                                        cx.stop_propagation();
+                                        let _ = weak.update(cx, |state, cx| {
+                                            state.scroll_blocks_to_bottom(pane_id, cx);
+                                        });
+                                    }),
+                            )
+                        }
+                    })
+            })
+            .into_any_element()
+    }
+
     fn render_terminal_pane(
         &self,
         pane: &TerminalPane,
@@ -5342,6 +6155,7 @@ impl AppState {
         let pane_id = pane.id;
         let is_focused = self.focused_pane_id == Some(pane_id);
         let tokens = self.tokens(cx);
+        let show_blocks = pane.shows_blocks(cx);
 
         div()
             .id(("terminal-pane", pane_id))
@@ -5402,7 +6216,7 @@ impl AppState {
                                         cx.new(|_| {
                                             gpui_component::tooltip::Tooltip::new(
                                                 SharedString::from(
-                                                    "Toggle Kathamo input editor (Ctrl+G)",
+                                                    "Toggle block UI / input editor (Ctrl+G)",
                                                 ),
                                             )
                                         })
@@ -5561,7 +6375,10 @@ impl AppState {
                             this.open_terminal_context_menu(pane_id, event.position, window, cx);
                         }),
                     )
-                    .child(pane.terminal.clone()),
+                    .when(show_blocks, |this| {
+                        this.child(self.render_block_list(pane, cx))
+                    })
+                    .when(!show_blocks, |this| this.child(pane.terminal.clone())),
             )
             .when(pane.should_show_bottom_input(cx), |this| {
                 this.child(self.render_kathamo_input_bar(pane, is_focused, cx))
@@ -5693,7 +6510,7 @@ impl AppState {
             && (keystroke.key == "g" || keystroke.key == "G")
         {
             if let Some(pane_id) = self.focused_pane_id {
-                self.toggle_pane_bottom_input(pane_id, _window, cx);
+                self.toggle_pane_classic_mode(pane_id, _window, cx);
                 cx.stop_propagation();
                 return;
             }
@@ -7057,6 +7874,7 @@ impl Render for AppState {
         // "Looking" needs an active window: a visible but backgrounded window
         // has not been seen, so a finish there must still become Done.
         self.window_active = _window.is_window_active();
+        self.refresh_block_caches(cx);
         self.ensure_panes_input_state(_window, cx);
 
         if self.theme_preference == ThemePreference::System {
@@ -7506,9 +8324,12 @@ fn build_pane_input(
     cx: &mut Context<AppState>,
 ) -> (Entity<InputState>, gpui::Subscription) {
     let input = cx.new(|cx| {
-        InputState::new(window, cx)
+        let mut state = InputState::new(window, cx)
             .placeholder("Run commands")
-            .auto_grow(1, 8)
+            .auto_grow(1, 8);
+        // Shell syntax highlighting, matching the block command language.
+        state.set_highlighter("bash", cx);
+        state
     });
     let subscription = cx.subscribe_in(
         &input,
@@ -7707,6 +8528,7 @@ fn main() -> Result<()> {
             let window_icon = gpui::WindowIcon::from_png_bytes(APP_ICON_PNG).ok();
             gpui_component::init(cx);
             init_kathamo_input_bindings(cx);
+            init_block_bindings(cx);
             let initial_mode = ThemePreference::System.resolve_mode(cx.window_appearance());
             gpui_component::Theme::change(initial_mode, None, cx);
             load_embedded_fonts(cx);
@@ -7929,7 +8751,7 @@ mod resize_tests {
         let palette = ColorPalette::default();
         let dir = std::env::current_dir().expect("current dir");
         let weak = cx.entity().downgrade();
-        let (terminal, pid, generation) =
+        let (terminal, pid, generation, terminal_subscription) =
             AppState::spawn_terminal_view(Some(&dir), palette.clone(), weak, 1, cx)
                 .expect("terminal view");
         let title = SharedString::from("terminal 1");
@@ -7943,6 +8765,7 @@ mod resize_tests {
             pid,
             true,
         );
+        pane.terminal_subscription = Some(terminal_subscription);
         // Tests assert exact history indices; the developer machine's real
         // shell history must not leak into that.
         pane.shell_history = Arc::new(Vec::new());
@@ -8002,6 +8825,7 @@ mod resize_tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             init_kathamo_input_bindings(cx);
+            init_block_bindings(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
@@ -9665,6 +10489,200 @@ mod kathamo_bottom_input_tests {
             after_second_ctrl_g,
             "Ctrl+G must toggle bottom input back on"
         );
+    }
+
+    #[test]
+    fn block_mode_renders_cards_and_handles_navigation() {
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        let palette = app_state.read_with(&cx, |state, _| state.palette.clone());
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            let pane = state.pane_mut(1).expect("pane");
+            pane.block_pane.detected = true;
+            pane.block_pane.handle(blocks::PaneEvent::PromptStart);
+            for (command, exit) in [("ls -la", Some(0)), ("false", Some(3))] {
+                pane.block_pane.note_submitted(command);
+                pane.block_pane.handle(blocks::PaneEvent::CommandStarted {
+                    command_line: None,
+                    cwd: Some("/tmp".into()),
+                });
+                let raw = b"\x1b[32mgreen\x1b[0m plain\r\nsecond\r\n".to_vec();
+                let snapshot = terminal::render_output_lines(&raw, 80, 24, &palette);
+                pane.block_pane.handle(blocks::PaneEvent::CommandFinished {
+                    snapshot,
+                    exit_code: exit,
+                    duration: std::time::Duration::from_millis(25),
+                    full_screen: false,
+                    raw,
+                    raw_truncated: false,
+                    cols: 80,
+                    rows: 24,
+                });
+            }
+            pane.block_pane.cards_dirty = true;
+            cx.notify();
+        });
+
+        // Exercises gpui::list, the card canvas, the hidden-grid resize hook
+        // and the output painter.
+        cx.draw_frame().expect("block frame");
+        let list_probe = cx.debug_bounds("kathamo-block-list-probe");
+        let card_probe = cx.debug_bounds("kathamo-block-card-probe");
+        let list_probe = list_probe.expect("block list root has no layout");
+        let card_probe = card_probe.expect("block card was not laid out");
+        assert!(card_probe.size.height > px(0.0));
+        assert!(
+            card_probe.origin.y > list_probe.origin.y + px(300.0),
+            "blocks should be anchored at the bottom: list={list_probe:?} first_card={card_probe:?}"
+        );
+        cx.draw_frame().expect("second block frame");
+
+        app_state.read_with(&cx, |state, _| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.block_pane.list.len(), 2);
+            assert!(
+                pane.block_pane
+                    .cards
+                    .as_ref()
+                    .is_some_and(|cards| cards.len() == 2)
+            );
+            assert_eq!(pane.block_pane.list.get(1).unwrap().command, "false");
+            assert_eq!(
+                pane.block_pane.list.get(1).unwrap().status,
+                blocks::BlockStatus::Failed(3)
+            );
+            assert!(!pane.block_pane.list.get(0).unwrap().snapshot.is_empty());
+        });
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.select_block_relative(1, -1, window, cx);
+        });
+        cx.draw_frame().expect("frame with selection moved");
+
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let block_id = state.projects[0].sessions[0].panes[0]
+                .block_pane
+                .list
+                .selected()
+                .expect("selected block")
+                .id;
+            state.block_action(1, block_id, blocks::BlockAction::ToggleCollapse, window, cx);
+        });
+        cx.draw_frame().expect("frame with a collapsed block");
+
+        app_state.read_with(&cx, |state, _| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.block_pane.list.selected_index(), Some(0));
+            assert!(pane.block_pane.list.get(0).unwrap().collapsed);
+        });
+
+        // Re-run puts the selected block's command back in the editor instead
+        // of executing it immediately.
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            let block_id = state.projects[0].sessions[0].panes[0]
+                .block_pane
+                .list
+                .selected()
+                .expect("selected block")
+                .id;
+            state.block_action(1, block_id, blocks::BlockAction::Rerun, window, cx);
+        });
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let value = pane
+                .input_state
+                .as_ref()
+                .expect("editor")
+                .read(cx)
+                .value()
+                .to_string();
+            assert_eq!(value, "ls -la");
+        });
+
+        // Background reflow at a new width updates the snapshot and the
+        // rendered column count.
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            let block_id = state.projects[0].sessions[0].panes[0]
+                .block_pane
+                .list
+                .get(0)
+                .expect("block")
+                .id;
+            state.request_reflow(1, block_id, 120, cx);
+        });
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+        app_state.read_with(&cx, |state, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let cols = pane.terminal.read(cx).dimensions().0.max(2);
+            let block = pane.block_pane.list.get(0).expect("block");
+            assert_eq!(block.rendered_cols, cols);
+            assert!(!block.raw.is_empty());
+        });
+    }
+
+    #[test]
+    fn shell_integration_produces_a_block_end_to_end() {
+        let (_, shell_name) = detect_shell();
+        if !matches!(shell_name.as_str(), "bash" | "zsh" | "fish") {
+            return;
+        }
+        if std::env::var_os("KATHAMO_NO_SHELL_INTEGRATION").is_some() {
+            return;
+        }
+
+        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
+            .expect("headless renderer");
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.draw_frame().expect("draw initial frame");
+
+        // Feed a real command through the PTY, exactly like the editor does.
+        cx.update_window_entity(&app_state, |state, _window, cx| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            pane.terminal.update(cx, |term, cx| {
+                term.send_text("echo kathamo-e2e", cx);
+                term.send_bytes(b"\r", cx);
+            });
+        });
+
+        let mut found = false;
+        for _ in 0..80 {
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(50));
+            cx.run_until_parked();
+            let _ = cx.draw_frame();
+            found = app_state.read_with(&cx, |state, _| {
+                !state.projects[0].sessions[0].panes[0]
+                    .block_pane
+                    .list
+                    .is_empty()
+            });
+            if found {
+                break;
+            }
+        }
+
+        assert!(found, "shell integration should have produced a block");
+        app_state.read_with(&cx, |state, _| {
+            let pane = &state.projects[0].sessions[0].panes[0];
+            let block = pane.block_pane.list.last().expect("block");
+            assert_eq!(
+                block.command.trim(),
+                "echo kathamo-e2e",
+                "command header must exclude the shell prompt"
+            );
+            assert_eq!(
+                block.plain_output().trim(),
+                "kathamo-e2e",
+                "output must exclude the command echo and the next prompt"
+            );
+            assert_eq!(block.status, blocks::BlockStatus::Success);
+            assert!(block.capture_cols > 0);
+        });
     }
 
     #[test]

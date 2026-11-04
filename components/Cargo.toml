@@ -43,7 +43,6 @@ inspector = [
     "wry/devtools",
 ]
 tree-sitter-languages = [
-    "dep:tree-sitter-bash",
     "dep:tree-sitter-c",
     "dep:tree-sitter-c-sharp",
     "dep:tree-sitter-cmake",
@@ -176,7 +175,6 @@ version = "0.25.4"
 
 [dependencies.tree-sitter-bash]
 version = "0.23.3"
-optional = true
 
 [dependencies.tree-sitter-c]
 version = "0.24.1"

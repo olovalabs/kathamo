@@ -12,7 +12,6 @@ use crate::input::{RopeExt as _, TabSize};
 
 #[derive(Clone)]
 pub(crate) enum InputMode {
-
     PlainText {
         multi_line: bool,
         tab: TabSize,
@@ -23,6 +22,8 @@ pub(crate) enum InputMode {
         rows: usize,
         min_rows: usize,
         max_rows: usize,
+        language: Option<SharedString>,
+        highlighter: Rc<RefCell<Option<SyntaxHighlighter>>>,
     },
 
     CodeEditor {
@@ -46,7 +47,6 @@ impl Default for InputMode {
 
 #[allow(unused)]
 impl InputMode {
-
     pub(super) fn plain_text() -> Self {
         InputMode::PlainText {
             multi_line: false,
@@ -73,6 +73,8 @@ impl InputMode {
             rows: min_rows,
             min_rows,
             max_rows,
+            language: None,
+            highlighter: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -121,6 +123,7 @@ impl InputMode {
                 rows,
                 min_rows,
                 max_rows,
+                ..
             } => {
                 *rows = new_rows.clamp(*min_rows, *max_rows);
             }
@@ -191,49 +194,54 @@ impl InputMode {
         force: bool,
         cx: &mut App,
     ) {
-        match &self {
+        let (language, highlighter) = match &self {
             InputMode::CodeEditor {
                 language,
                 highlighter,
                 ..
-            } => {
-                if !force && highlighter.borrow().is_some() {
-                    return;
-                }
+            } => (language, highlighter),
+            InputMode::AutoGrow {
+                language: Some(language),
+                highlighter,
+                ..
+            } => (language, highlighter),
+            _ => return,
+        };
 
-                let mut highlighter = highlighter.borrow_mut();
-                if highlighter.is_none() {
-                    let new_highlighter = SyntaxHighlighter::new(language);
-                    highlighter.replace(new_highlighter);
-                }
-
-                let Some(highlighter) = highlighter.as_mut() else {
-                    return;
-                };
-
-                let mut selected_range = selected_range.clone();
-                selected_range.end = selected_range.end.min(text.len());
-
-                let changed_len = new_text.len() as isize - selected_range.len() as isize;
-                let new_end = (selected_range.end as isize + changed_len) as usize;
-
-                let start_pos = text.offset_to_point(selected_range.start);
-                let old_end_pos = text.offset_to_point(selected_range.end);
-                let new_end_pos = text.offset_to_point(new_end);
-
-                let edit = InputEdit {
-                    start_byte: selected_range.start,
-                    old_end_byte: selected_range.end,
-                    new_end_byte: new_end,
-                    start_position: start_pos,
-                    old_end_position: old_end_pos,
-                    new_end_position: new_end_pos,
-                };
-
-                highlighter.update(Some(edit), text);
-            }
-            _ => {}
+        if !force && highlighter.borrow().is_some() {
+            return;
         }
+
+        let mut highlighter = highlighter.borrow_mut();
+        if highlighter.is_none() {
+            let new_highlighter = SyntaxHighlighter::new(language);
+            highlighter.replace(new_highlighter);
+        }
+
+        let Some(highlighter) = highlighter.as_mut() else {
+            return;
+        };
+
+        let mut selected_range = selected_range.clone();
+        selected_range.end = selected_range.end.min(text.len());
+
+        let changed_len = new_text.len() as isize - selected_range.len() as isize;
+        let new_end = (selected_range.end as isize + changed_len) as usize;
+
+        let start_pos = text.offset_to_point(selected_range.start);
+        let old_end_pos = text.offset_to_point(selected_range.end);
+        let new_end_pos = text.offset_to_point(new_end);
+
+        let edit = InputEdit {
+            start_byte: selected_range.start,
+            old_end_byte: selected_range.end,
+            new_end_byte: new_end,
+            start_position: start_pos,
+            old_end_position: old_end_pos,
+            new_end_position: new_end_pos,
+        };
+
+        highlighter.update(Some(edit), text);
     }
 
     #[allow(unused)]

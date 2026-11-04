@@ -5,7 +5,9 @@
 //! the UI thread can share it.
 
 use crate::agent_status::{AgentOscScanner, AgentStatusReport};
+use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalNotifierHandle};
+use crate::shell_integration::{BlockSnapshot, ShellEvent, ShellIntegrationScanner, snapshot_term};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -82,6 +84,9 @@ pub struct TerminalState {
     /// Kept so protocol passthroughs (XTGETTCAP) can reply into the PTY.
     notifier: TerminalNotifierHandle,
     agent_osc: AgentOscScanner,
+    shell: ShellIntegrationScanner,
+    /// Current palette, used when snapshotting output into blocks.
+    palette: ColorPalette,
 }
 
 impl TerminalState {
@@ -111,6 +116,8 @@ impl TerminalState {
             config,
             notifier,
             agent_osc: AgentOscScanner::default(),
+            shell: ShellIntegrationScanner::default(),
+            palette: ColorPalette::default(),
         }
     }
 
@@ -132,11 +139,73 @@ impl TerminalState {
         }
     }
 
-    pub fn process_bytes(&mut self, bytes: &[u8]) {
+    /// Parse PTY bytes and return shell-integration events found in the chunk.
+    ///
+    /// The stream is split at marker boundaries so cursor positions captured at
+    /// `OSC 133;B/C/D` are accurate, and so output bytes between `C` and `D` can
+    /// be captured for the block model.
+    pub fn process_bytes(&mut self, bytes: &[u8]) -> Vec<ShellEvent> {
         self.answer_xtgettcap(bytes);
         self.agent_osc.scan(bytes);
+
+        let hits = self.shell.scan(bytes);
+        let mut events = Vec::new();
+        let mut consumed = 0usize;
+        let mut term = self.term.lock();
+
+        for hit in hits {
+            let end = hit.end.min(bytes.len());
+            if end > consumed {
+                let slice = &bytes[consumed..end];
+                self.shell.capture_bytes(slice);
+                self.parser.advance(&mut *term, slice);
+                consumed = end;
+            }
+            self.shell
+                .apply(hit.kind, &term, std::time::Instant::now(), &mut events);
+            self.shell
+                .note_mode(term.mode().contains(TermMode::ALT_SCREEN));
+        }
+
+        if consumed < bytes.len() {
+            let slice = &bytes[consumed..];
+            self.shell.capture_bytes(slice);
+            self.parser.advance(&mut *term, slice);
+        }
+        self.shell
+            .note_mode(term.mode().contains(TermMode::ALT_SCREEN));
+
+        events
+    }
+
+    /// Feed bytes to the emulator without shell-integration scanning. Used by
+    /// the throw-away terminal that re-parses captured block output.
+    pub fn feed_raw(&mut self, bytes: &[u8]) {
         let mut term = self.term.lock();
         self.parser.advance(&mut *term, bytes);
+    }
+
+    pub fn set_palette(&mut self, palette: ColorPalette) {
+        self.palette = palette;
+    }
+
+    /// Only accept OSC 133 markers stamped with this token.
+    pub fn set_shell_token(&mut self, token: String) {
+        self.shell.set_token(token);
+    }
+
+    pub fn palette(&self) -> &ColorPalette {
+        &self.palette
+    }
+
+    /// Snapshot the terminal buffer into immutable, styled block lines.
+    pub fn snapshot_buffer_lines(&self, palette: &ColorPalette, truncated: bool) -> BlockSnapshot {
+        self.with_term(|term| snapshot_term(term, palette, truncated))
+    }
+
+    /// Most recent cwd reported by the shell (OSC 7 / OSC 7502).
+    pub fn shell_cwd(&self) -> Option<&str> {
+        self.shell.cwd()
     }
 
     /// Current highest-priority status reported over OSC 7501.
@@ -432,7 +501,7 @@ impl TerminalState {
             term.selection = None;
         }
         // `ESC c` (RIS) resets the emulator; `CSI 3 J` drops the scrollback.
-        self.process_bytes(b"\x1b[H\x1b[2J\x1b[3J");
+        let _ = self.process_bytes(b"\x1b[H\x1b[2J\x1b[3J");
     }
 
     /// Text of a single terminal line, trailing whitespace trimmed.

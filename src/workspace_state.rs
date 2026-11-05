@@ -1,4 +1,4 @@
-use crate::theme::ThemePreference;
+use crate::theme::{PaletteScheme, ThemePreference};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -28,6 +28,8 @@ pub struct SavedWorkspace {
     pub sidebar_width: f32,
     #[serde(default)]
     pub theme: ThemePreference,
+    #[serde(default)]
+    pub palette_scheme: PaletteScheme,
     #[serde(default = "default_bottom_input", alias = "warp_bottom_input")]
     pub bottom_input: bool,
 }
@@ -40,6 +42,7 @@ impl Default for SavedWorkspace {
             sidebar_visible: default_visible(),
             sidebar_width: default_width(),
             theme: ThemePreference::default(),
+            palette_scheme: PaletteScheme::default(),
             bottom_input: default_bottom_input(),
         }
     }
@@ -147,5 +150,23 @@ mod tests {
                 serde_json::from_str(&serialized).expect("deserialize");
             assert_eq!(deserialized.theme, pref);
         }
+    }
+
+    #[test]
+    fn saved_workspace_palette_scheme_roundtrip() {
+        for scheme in [PaletteScheme::Warp, PaletteScheme::Github] {
+            let workspace = SavedWorkspace {
+                palette_scheme: scheme,
+                ..Default::default()
+            };
+            let serialized = serde_json::to_string(&workspace).expect("serialize");
+            let deserialized: SavedWorkspace =
+                serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(deserialized.palette_scheme, scheme);
+        }
+        // Older workspace files without the field default to Warp.
+        let legacy = r#"{"projects":[],"theme":"dark","bottom_input":true}"#;
+        let deserialized: SavedWorkspace = serde_json::from_str(legacy).expect("deserialize");
+        assert_eq!(deserialized.palette_scheme, PaletteScheme::Warp);
     }
 }

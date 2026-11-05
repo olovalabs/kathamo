@@ -44,7 +44,7 @@ mod status_bus;
 mod theme;
 mod workspace_state;
 
-use theme::{ThemePreference, ThemeTokens, load_github_palette};
+use theme::{PaletteScheme, ThemePreference, ThemeTokens, load_palette};
 
 /// Key context of the Kathamo input bar.
 ///
@@ -510,6 +510,8 @@ struct AppState {
     focused_pane_id: Option<usize>,
     pub active_view: ActiveView,
     pub theme_preference: ThemePreference,
+    /// Terminal color palette / block chrome (Warp by default).
+    pub palette_scheme: PaletteScheme,
     pub sidebar_visible: bool,
     pub kathamo_bottom_input: bool,
     integration_panel_visible: bool,
@@ -584,6 +586,7 @@ impl AppState {
             sidebar_visible: self.sidebar_visible,
             sidebar_width: f32::from(self.sidebar_width),
             theme: self.theme_preference,
+            palette_scheme: self.palette_scheme,
             bottom_input: self.kathamo_bottom_input,
         }
     }
@@ -626,9 +629,10 @@ impl AppState {
         self.sidebar_visible = saved.sidebar_visible;
         self.sidebar_width = SIDEBAR_WIDTH;
         self.theme_preference = saved.theme;
+        self.palette_scheme = saved.palette_scheme;
         self.kathamo_bottom_input = saved.bottom_input;
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
-        self.palette = load_github_palette(mode.is_dark());
+        self.palette = load_palette(self.palette_scheme, mode.is_dark());
         gpui_component::Theme::change(mode, None, cx);
         self.projects.clear();
         self.active_project_idx = 0;
@@ -754,13 +758,28 @@ impl AppState {
 
     pub fn tokens(&self, cx: &App) -> ThemeTokens {
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
-        ThemeTokens::from_mode(mode)
+        ThemeTokens::from_mode_with_scheme(mode, self.palette_scheme)
     }
 
     #[allow(dead_code)]
     pub fn tokens_with_appearance(&self, appearance: gpui::WindowAppearance) -> ThemeTokens {
         let mode = self.theme_preference.resolve_mode(appearance);
-        ThemeTokens::from_mode(mode)
+        ThemeTokens::from_mode_with_scheme(mode, self.palette_scheme)
+    }
+
+    /// Switch the terminal palette / block chrome scheme (Warp / GitHub).
+    pub fn set_palette_scheme(
+        &mut self,
+        scheme: PaletteScheme,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.palette_scheme == scheme {
+            return;
+        }
+        self.palette_scheme = scheme;
+        self.apply_theme_preference(window, cx);
+        self.schedule_workspace_save(cx);
     }
 
     pub fn set_theme_preference(
@@ -784,7 +803,7 @@ impl AppState {
             .unwrap_or_else(|| cx.window_appearance());
         let mode = self.theme_preference.resolve_mode(appearance);
         let is_dark = mode.is_dark();
-        self.palette = load_github_palette(is_dark);
+        self.palette = load_palette(self.palette_scheme, is_dark);
         gpui_component::Theme::change(mode, window, cx);
 
         for project in &mut self.projects {
@@ -6984,9 +7003,118 @@ impl AppState {
                                             .child("Choose how Kathamo looks."),
                                     ),
                             )
-                            .child(div().flex().gap(px(12.0)).children(cards)),
+                            .child(div().flex().gap(px(12.0)).children(cards))
+                            .child(self.render_palette_scheme_picker(cx)),
                     ),
             )
+    }
+
+    /// Warp / GitHub terminal palette selector shown under the theme cards.
+    fn render_palette_scheme_picker(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let tokens = self.tokens(cx);
+        let current = self.palette_scheme;
+        let options = [
+            (PaletteScheme::Warp, "palette-scheme-warp"),
+            (PaletteScheme::Github, "palette-scheme-github"),
+        ];
+        let pills = options
+            .into_iter()
+            .map(|(scheme, id)| {
+                let selected = current == scheme;
+                div()
+                    .id(id)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(if selected {
+                        tokens.ring
+                    } else {
+                        tokens.card_border
+                    })
+                    .bg(if selected {
+                        tokens.card_bg
+                    } else {
+                        tokens.pill_inactive_bg
+                    })
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(move |style| {
+                        if selected {
+                            style
+                        } else {
+                            style.bg(tokens.card_hover)
+                        }
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.set_palette_scheme(scheme, Some(window), cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.0))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(tokens.text_primary)
+                                            .child(scheme.label()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(tokens.text_secondary)
+                                            .child(scheme.description()),
+                                    ),
+                            )
+                            .when(selected, |this| {
+                                this.child(
+                                    svg()
+                                        .path("icons/status-check.svg")
+                                        .size(px(14.0))
+                                        .text_color(tokens.ring),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(15.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(tokens.text_primary)
+                            .child("Terminal palette"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(tokens.text_secondary)
+                            .child("Warp reproduces the Warp terminal's colors and block style."),
+                    ),
+            )
+            .child(div().flex().gap(px(12.0)).children(pills))
     }
 
     fn render_sidebar_toolbar(&self, cx: &mut Context<Self>) -> gpui::Div {
@@ -7881,7 +8009,7 @@ impl Render for AppState {
             let sys_mode = self.theme_preference.resolve_mode(_window.appearance());
             let current_is_dark = self.palette.background().l < 0.5;
             if sys_mode.is_dark() != current_is_dark {
-                self.palette = load_github_palette(sys_mode.is_dark());
+                self.palette = load_palette(self.palette_scheme, sys_mode.is_dark());
                 let palette = self.palette.clone();
                 gpui_component::Theme::change(sys_mode, Some(_window), cx);
                 for project in &mut self.projects {
@@ -8539,7 +8667,7 @@ fn main() -> Result<()> {
                 let _ = shell_history::cached();
             });
 
-            let palette = load_github_palette(initial_mode.is_dark());
+            let palette = load_palette(PaletteScheme::default(), initial_mode.is_dark());
             let persistence_path = workspace_state::state_path();
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
@@ -8565,6 +8693,7 @@ fn main() -> Result<()> {
                         kathamo_bottom_input: true,
                         active_view: ActiveView::Workspace,
                         theme_preference: ThemePreference::System,
+                        palette_scheme: PaletteScheme::default(),
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
                         sidebar_width: SIDEBAR_WIDTH,
@@ -8798,6 +8927,7 @@ mod resize_tests {
             kathamo_bottom_input: true,
             active_view: ActiveView::Workspace,
             theme_preference: ThemePreference::System,
+            palette_scheme: PaletteScheme::default(),
             integration_panel_visible: false,
             integration_feedback: SharedString::from(
                 "Setup is opt-in. Status becomes Reporting only after a live event arrives.",

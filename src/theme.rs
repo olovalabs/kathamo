@@ -3,6 +3,35 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use terminal::ColorPalette;
 
+/// Which terminal color palette / block chrome to use.
+///
+/// `Warp` reproduces the default theme of the Warp terminal (near-black
+/// background, white foreground, cyan accent and Warp's ANSI palette) and is
+/// the default. `GitHub` keeps the previous GitHub Dark / Light palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PaletteScheme {
+    #[default]
+    Warp,
+    Github,
+}
+
+impl PaletteScheme {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Warp => "Warp",
+            Self::Github => "GitHub",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Warp => "Warp's default dark terminal",
+            Self::Github => "GitHub Dark / Light palette",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemePreference {
@@ -119,10 +148,188 @@ pub struct ThemeTokens {
 
 impl ThemeTokens {
     pub fn from_mode(mode: gpui_component::ThemeMode) -> Self {
-        if mode.is_dark() {
+        Self::from_mode_with_scheme(mode, PaletteScheme::default())
+    }
+
+    /// Build tokens for a mode and palette scheme. The Warp scheme reproduces
+    /// Warp's default terminal chrome: near-black surfaces, white text, a cyan
+    /// accent and block colors derived from Warp's ANSI palette.
+    pub fn from_mode_with_scheme(mode: gpui_component::ThemeMode, scheme: PaletteScheme) -> Self {
+        let mut tokens = if mode.is_dark() {
             Self::dark()
         } else {
             Self::light()
+        };
+        if scheme == PaletteScheme::Warp {
+            tokens.apply_warp(mode.is_dark());
+        }
+        tokens
+    }
+
+    /// Override surfaces, accents and block chrome with Warp's default theme.
+    ///
+    /// Colors come from Warp's `default_themes.rs` (background `#050505`,
+    /// foreground `#FFFFFF`, accent `#19AAD8`) and its derived UI colors
+    /// (`warp_core::ui::theme::color`): surfaces are the background blended
+    /// with low-opacity foreground, outlines are foreground at ~4% alpha, and
+    /// block selection is the accent at ~10% alpha.
+    fn apply_warp(&mut self, dark: bool) {
+        if dark {
+            let bg = rgba(0x050505ff);
+            let fg = rgba(0xffffffff);
+            let accent = rgba(0x19aad8ff);
+            // neutral_1 / neutral_2: background blended with foreground at
+            // ~2% / ~4% alpha (Warp `internal_colors::neutral_1/2`).
+            let surface_1 = rgba(0x0a0a0aff);
+            let surface_2 = rgba(0x0f0f0fff);
+            let surface_3 = rgba(0x141414ff);
+            // outline: foreground at ~4% alpha (Warp `fg_overlay_2`).
+            let outline = rgba(0xffffff1a);
+            let text_sub = rgba(0xffffffb3);
+            let text_disabled = rgba(0xffffff66);
+
+            self.window_bg = bg.into();
+            self.text_primary = fg.into();
+            self.text_secondary = text_sub.into();
+            self.text_muted = text_disabled.into();
+            self.border = outline.into();
+            self.border_subtle = rgba(0xffffff0d).into();
+
+            self.titlebar_bg = bg.into();
+            self.titlebar_border = rgba(0xffffff0d).into();
+            self.titlebar_fg = text_sub.into();
+            self.titlebar_btn_hover = surface_2.into();
+
+            self.sidebar_bg = bg.into();
+            self.sidebar_bg_start = bg.into();
+            self.sidebar_bg_end = bg.into();
+            self.sidebar_border = rgba(0xffffff0d).into();
+            self.sidebar_fg = fg.into();
+            self.sidebar_muted = text_disabled.into();
+            self.sidebar_item_hover = rgba(0xffffff0d).into();
+            self.sidebar_item_active = rgba(0xffffff1a).into();
+            self.sidebar_item_active_fg = fg.into();
+            self.sidebar_section_header = text_disabled.into();
+            self.sidebar_icon_btn_hover = rgba(0xffffff1a).into();
+            self.sidebar_icon = text_disabled.into();
+            self.sidebar_icon_hover = fg.into();
+            self.sidebar_footer_bg = bg.into();
+            self.sidebar_footer_border = rgba(0xffffff0d).into();
+
+            self.pane_bg = bg.into();
+            self.pane_border = rgba(0xffffff0d).into();
+            self.pane_border_focused = rgba(0x19aad866).into();
+            self.pane_header_bg = bg.into();
+            self.pane_header_fg = text_disabled.into();
+            self.pane_header_btn_hover = surface_2.into();
+            self.pane_header_icon = text_disabled.into();
+            self.pane_header_icon_hover = fg.into();
+
+            self.primary_btn_bg = accent.into();
+            self.primary_btn_hover = rgba(0x3fb9e4ff).into();
+            self.primary_btn_fg = rgba(0x050505ff).into();
+            self.secondary_btn_bg = surface_2.into();
+            self.secondary_btn_hover = surface_3.into();
+            self.secondary_btn_fg = fg.into();
+
+            self.card_bg = surface_1.into();
+            self.card_border = outline.into();
+            self.card_hover = surface_2.into();
+            self.pill_active_bg = accent.into();
+            self.pill_active_fg = rgba(0x050505ff).into();
+            self.pill_inactive_bg = surface_2.into();
+            self.pill_inactive_fg = text_sub.into();
+            self.ring = accent.into();
+
+            // Warp blocks sit on the terminal background, delineated by
+            // dividers rather than card fills. Selection is the accent at
+            // ~10% alpha; failure is Warp's ANSI red.
+            self.block_bg = rgba(0x00000000).into();
+            self.block_bg_hover = rgba(0xffffff08).into();
+            self.block_border = outline.into();
+            self.block_border_selected = accent.into();
+            self.block_success = rgba(0xb4fa72ff).into();
+            self.block_failure = rgba(0xff8272ff).into();
+            self.block_warning = rgba(0xfefdc2ff).into();
+            self.block_separator = outline.into();
+            self.block_status_bg = rgba(0x00000000).into();
+            self.editor_bar_bg = bg.into();
+            self.editor_bar_border = outline.into();
+        } else {
+            let bg = rgba(0xffffffff);
+            let fg = rgba(0x111111ff);
+            let accent = rgba(0x00c2ffff);
+            let surface_1 = rgba(0xf7f7f7ff);
+            let surface_2 = rgba(0xefefefff);
+            let surface_3 = rgba(0xe7e7e7ff);
+            let outline = rgba(0x1111111a);
+            let text_sub = rgba(0x111111b3);
+            let text_disabled = rgba(0x11111166);
+
+            self.window_bg = bg.into();
+            self.text_primary = fg.into();
+            self.text_secondary = text_sub.into();
+            self.text_muted = text_disabled.into();
+            self.border = outline.into();
+            self.border_subtle = rgba(0x1111110d).into();
+
+            self.titlebar_bg = bg.into();
+            self.titlebar_border = rgba(0x1111110d).into();
+            self.titlebar_fg = text_sub.into();
+            self.titlebar_btn_hover = surface_2.into();
+
+            self.sidebar_bg = bg.into();
+            self.sidebar_bg_start = bg.into();
+            self.sidebar_bg_end = bg.into();
+            self.sidebar_border = rgba(0x1111110d).into();
+            self.sidebar_fg = fg.into();
+            self.sidebar_muted = text_disabled.into();
+            self.sidebar_item_hover = rgba(0x1111110d).into();
+            self.sidebar_item_active = rgba(0x1111111a).into();
+            self.sidebar_item_active_fg = fg.into();
+            self.sidebar_section_header = text_disabled.into();
+            self.sidebar_icon_btn_hover = rgba(0x1111111a).into();
+            self.sidebar_icon = text_disabled.into();
+            self.sidebar_icon_hover = fg.into();
+            self.sidebar_footer_bg = bg.into();
+            self.sidebar_footer_border = rgba(0x1111110d).into();
+
+            self.pane_bg = bg.into();
+            self.pane_border = rgba(0x1111110d).into();
+            self.pane_border_focused = rgba(0x00c2ff66).into();
+            self.pane_header_bg = bg.into();
+            self.pane_header_fg = text_disabled.into();
+            self.pane_header_btn_hover = surface_2.into();
+            self.pane_header_icon = text_disabled.into();
+            self.pane_header_icon_hover = fg.into();
+
+            self.primary_btn_bg = accent.into();
+            self.primary_btn_hover = rgba(0x00a8e0ff).into();
+            self.primary_btn_fg = rgba(0xffffffff).into();
+            self.secondary_btn_bg = surface_2.into();
+            self.secondary_btn_hover = surface_3.into();
+            self.secondary_btn_fg = fg.into();
+
+            self.card_bg = surface_1.into();
+            self.card_border = outline.into();
+            self.card_hover = surface_2.into();
+            self.pill_active_bg = accent.into();
+            self.pill_active_fg = rgba(0xffffffff).into();
+            self.pill_inactive_bg = surface_2.into();
+            self.pill_inactive_fg = text_sub.into();
+            self.ring = accent.into();
+
+            self.block_bg = rgba(0x00000000).into();
+            self.block_bg_hover = rgba(0x11111108).into();
+            self.block_border = outline.into();
+            self.block_border_selected = accent.into();
+            self.block_success = rgba(0x10a778ff).into();
+            self.block_failure = rgba(0xc30771ff).into();
+            self.block_warning = rgba(0xa89c14ff).into();
+            self.block_separator = outline.into();
+            self.block_status_bg = rgba(0x00000000).into();
+            self.editor_bar_bg = bg.into();
+            self.editor_bar_border = outline.into();
         }
     }
 
@@ -397,6 +604,73 @@ pub fn load_github_palette(dark: bool) -> ColorPalette {
     }
 }
 
+/// Load the terminal palette for a scheme and light/dark mode.
+pub fn load_palette(scheme: PaletteScheme, dark: bool) -> ColorPalette {
+    match scheme {
+        PaletteScheme::Warp => load_warp_palette(dark),
+        PaletteScheme::Github => load_github_palette(dark),
+    }
+}
+
+/// Warp's default terminal palette, transcribed from the open-source Warp
+/// repository (`app/src/themes/default_themes.rs`).
+///
+/// Dark: background `#050505`, foreground `#FFFFFF`, cursor/accent `#19AAD8`.
+/// Light: background `#FFFFFF`, foreground `#111111`, accent `#00C2FF`.
+/// The 16 ANSI colors match Warp's `DARK_MODE_*` / `LIGHT_MODE_*` constants.
+pub fn load_warp_palette(dark: bool) -> ColorPalette {
+    let builder = ColorPalette::builder();
+    if dark {
+        builder
+            .background(0x05, 0x05, 0x05)
+            .foreground(0xff, 0xff, 0xff)
+            .cursor(0x19, 0xaa, 0xd8)
+            // normal
+            .black(0x61, 0x61, 0x61)
+            .red(0xff, 0x82, 0x72)
+            .green(0xb4, 0xfa, 0x72)
+            .yellow(0xfe, 0xfd, 0xc2)
+            .blue(0xa5, 0xd5, 0xfe)
+            .magenta(0xff, 0x8f, 0xfd)
+            .cyan(0xd0, 0xd1, 0xfe)
+            .white(0xf1, 0xf1, 0xf1)
+            // bright
+            .bright_black(0x8e, 0x8e, 0x8e)
+            .bright_red(0xff, 0xc4, 0xbd)
+            .bright_green(0xd6, 0xfc, 0xb9)
+            .bright_yellow(0xfe, 0xfd, 0xd5)
+            .bright_blue(0xc1, 0xe3, 0xfe)
+            .bright_magenta(0xff, 0xb1, 0xfe)
+            .bright_cyan(0xe5, 0xe6, 0xfe)
+            .bright_white(0xfe, 0xff, 0xff)
+            .build()
+    } else {
+        builder
+            .background(0xff, 0xff, 0xff)
+            .foreground(0x11, 0x11, 0x11)
+            .cursor(0x00, 0xc2, 0xff)
+            // normal
+            .black(0x21, 0x21, 0x21)
+            .red(0xc3, 0x07, 0x71)
+            .green(0x10, 0xa7, 0x78)
+            .yellow(0xa8, 0x9c, 0x14)
+            .blue(0x00, 0x8e, 0xc4)
+            .magenta(0x52, 0x3c, 0x79)
+            .cyan(0x20, 0xa5, 0xba)
+            .white(0xe0, 0xe0, 0xe0)
+            // bright
+            .bright_black(0x21, 0x21, 0x21)
+            .bright_red(0xfb, 0x00, 0x7a)
+            .bright_green(0x5f, 0xd7, 0xaf)
+            .bright_yellow(0xf3, 0xe4, 0x30)
+            .bright_blue(0x20, 0xbb, 0xfc)
+            .bright_magenta(0x68, 0x55, 0xde)
+            .bright_cyan(0x4f, 0xb8, 0xcc)
+            .bright_white(0xf1, 0xf1, 0xf1)
+            .build()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +702,47 @@ mod tests {
         // Dark background should be very dark, light background very light
         assert!(dark_palette.background().l < 0.2);
         assert!(light_palette.background().l > 0.8);
+    }
+
+    #[test]
+    fn warp_palette_matches_upstream_colors() {
+        let dark = load_warp_palette(true);
+        // Warp dark background is #050505, foreground #FFFFFF.
+        assert!(dark.background().l < 0.05);
+        assert!(dark.foreground().l > 0.95);
+        // ANSI red is Warp's #FF8272 and green #B4FA72.
+        let ansi = dark.ansi_colors();
+        let red = terminal::hsla_to_rgb(ansi[1]);
+        assert_eq!((red.r, red.g, red.b), (0xff, 0x82, 0x72));
+        let green = terminal::hsla_to_rgb(ansi[2]);
+        assert_eq!((green.r, green.g, green.b), (0xb4, 0xfa, 0x72));
+
+        let light = load_warp_palette(false);
+        assert!(light.background().l > 0.95);
+        assert!(light.foreground().l < 0.2);
+    }
+
+    #[test]
+    fn warp_scheme_is_default_and_overrides_tokens() {
+        assert_eq!(PaletteScheme::default(), PaletteScheme::Warp);
+        let mode = gpui_component::ThemeMode::Dark;
+        let warp = ThemeTokens::from_mode_with_scheme(mode, PaletteScheme::Warp);
+        let github = ThemeTokens::from_mode_with_scheme(mode, PaletteScheme::Github);
+        // Warp pane background is near-black; GitHub's is a blue-grey.
+        assert!(warp.pane_bg.l < 0.05);
+        assert_ne!(warp.pane_bg, github.pane_bg);
+        // Warp selection accent is the cyan #19AAD8.
+        let accent = terminal::hsla_to_rgb(warp.block_border_selected);
+        assert_eq!((accent.r, accent.g, accent.b), (0x19, 0xaa, 0xd8));
+        // `from_mode` defaults to the Warp scheme.
+        assert_eq!(ThemeTokens::from_mode(mode).pane_bg, warp.pane_bg);
+    }
+
+    #[test]
+    fn load_palette_dispatches_by_scheme() {
+        let warp = load_palette(PaletteScheme::Warp, true);
+        let github = load_palette(PaletteScheme::Github, true);
+        assert_eq!(warp.background(), load_warp_palette(true).background());
+        assert_eq!(github.background(), load_github_palette(true).background());
     }
 }

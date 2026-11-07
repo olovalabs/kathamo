@@ -17,6 +17,7 @@ pub mod render;
 pub mod search;
 pub mod shell_integration;
 pub mod terminal;
+mod theme_protocol;
 pub mod view;
 
 pub use agent_status::{AgentReportState, AgentStatusReport};

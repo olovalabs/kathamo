@@ -50,7 +50,7 @@ impl Render for TerminalApp {
 }
 
 fn main() -> Result<()> {
-    let app = gpui::Application::new();
+    let app = gpui_platform::application();
 
     app.run(move |cx| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());

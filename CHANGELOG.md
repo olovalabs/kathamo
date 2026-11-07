@@ -19,8 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Migrated the application and terminal renderer to GPUI Fast.
 - The terminal displays a plain grid without block UI. The Warp-style bottom input is always available when the shell is idle and temporarily hides while a command runs or the alternate screen is active.
 - Removed the bottom input toggle; a previously saved `bottom_input` preference no longer disables the input.
+
+### Fixed
+- System appearance changes now update existing terminal panes and application chrome; theme changes preserve the configured component fonts.
+- Notify compatible running terminal applications when the terminal palette changes, so their light and dark themes can update without a restart.
 
 ---
 

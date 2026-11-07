@@ -8,14 +8,15 @@ use std::{
 
 use crate::{ActiveTheme, AxisExt};
 use gpui::{
-    App, Axis, BorderStyle, Bounds, ContentMask, Corner, CursorStyle, Edges, Element, ElementId,
+    App, Axis, BorderStyle, Bounds, ContentMask, Anchor, CursorStyle, Edges, Element, ElementId,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, IsZero,
     LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    Position, ScrollHandle, ScrollWheelEvent, Size, Style, Timer, UniformListScrollHandle, Window,
+    Position, ScrollEvent, ScrollHandle, Size, Style, UniformListScrollHandle, Window,
     fill, point, px, relative, size,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use smol::Timer;
 
 const WIDTH: Pixels = px(4. * 2. + 8.);
 const MIN_THUMB_SIZE: f32 = 48.;
@@ -75,7 +76,7 @@ impl ScrollbarHandle for ScrollHandle {
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        self.max_offset() + self.bounds().size
+        Size::from(self.max_offset()) + self.bounds().size
     }
 }
 
@@ -90,7 +91,7 @@ impl ScrollbarHandle for UniformListScrollHandle {
 
     fn content_size(&self) -> Size<Pixels> {
         let base_handle = &self.0.borrow().base_handle;
-        base_handle.max_offset() + base_handle.bounds().size
+        Size::from(base_handle.max_offset()) + base_handle.bounds().size
     }
 }
 
@@ -104,7 +105,7 @@ impl ScrollbarHandle for ListState {
     }
 
     fn content_size(&self) -> Size<Pixels> {
-        self.viewport_bounds().size + self.max_offset_for_scrollbar()
+        self.viewport_bounds().size + Size::from(self.max_offset_for_scrollbar())
     }
 
     fn start_drag(&self) {
@@ -653,28 +654,28 @@ impl Element for Scrollbar {
 
             let thumb_length = thumb_end - thumb_start - inset * 2;
             let thumb_bounds = if is_vertical {
-                Bounds::from_corner_and_size(
-                    Corner::TopRight,
+                Bounds::from_anchor_and_size(
+                    Anchor::TopRight,
                     bounds.top_right() + point(-inset, inset + thumb_start),
                     size(WIDTH, thumb_length),
                 )
             } else {
-                Bounds::from_corner_and_size(
-                    Corner::BottomLeft,
+                Bounds::from_anchor_and_size(
+                    Anchor::BottomLeft,
                     bounds.bottom_left() + point(inset + thumb_start, -inset),
                     size(thumb_length, WIDTH),
                 )
             };
 
             let thumb_fill_bounds = if is_vertical {
-                Bounds::from_corner_and_size(
-                    Corner::TopRight,
+                Bounds::from_anchor_and_size(
+                    Anchor::TopRight,
                     bounds.top_right() + point(-inset, inset + thumb_start),
                     size(thumb_width, thumb_length),
                 )
             } else {
-                Bounds::from_corner_and_size(
-                    Corner::BottomLeft,
+                Bounds::from_anchor_and_size(
+                    Anchor::BottomLeft,
                     bounds.bottom_left() + point(inset + thumb_start, -inset),
                     size(thumb_length, thumb_width),
                 )
@@ -790,7 +791,7 @@ impl Element for Scrollbar {
                         let state = scrollbar_state.clone();
                         let scroll_handle = self.scroll_handle.clone();
 
-                        move |event: &ScrollWheelEvent, phase, _, cx| {
+                        move |event: &ScrollEvent, phase, _, cx| {
                             if phase.bubble() && hitbox_bounds.contains(&event.position) {
                                 if scroll_handle.offset() != state.get().last_scroll_offset {
                                     state.set(state.get().with_last_scroll(

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Application, Bounds, ClipboardEntry, Context,
+    Animation, AnimationExt as _, App, AppContext, Bounds, ClipboardEntry, Context,
     CursorStyle, Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
     Point, Render, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _,
@@ -584,6 +584,7 @@ impl AppState {
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
         self.palette = load_palette(self.palette_scheme, mode.is_dark());
         gpui_component::Theme::change(mode, None, cx);
+        sync_component_fonts(cx);
         self.projects.clear();
         self.active_project_idx = 0;
         for project in saved.projects {
@@ -679,7 +680,7 @@ impl AppState {
     }
 
     pub fn tokens(&self, cx: &App) -> ThemeTokens {
-        let mode = self.theme_preference.resolve_mode(cx.window_appearance());
+        let mode = gpui_component::Theme::global(cx).mode;
         ThemeTokens::from_mode_with_scheme(mode, self.palette_scheme)
     }
 
@@ -718,6 +719,15 @@ impl AppState {
         self.schedule_workspace_save(cx);
     }
 
+    fn observe_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe_window_appearance(window, |state, window, cx| {
+            if state.theme_preference == ThemePreference::System {
+                state.apply_theme_preference(Some(window), cx);
+            }
+        })
+        .detach();
+    }
+
     pub fn apply_theme_preference(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let appearance = window
             .as_ref()
@@ -727,6 +737,7 @@ impl AppState {
         let is_dark = mode.is_dark();
         self.palette = load_palette(self.palette_scheme, is_dark);
         gpui_component::Theme::change(mode, window, cx);
+        sync_component_fonts(cx);
 
         for project in &mut self.projects {
             for session in &mut project.sessions {
@@ -2039,7 +2050,7 @@ impl AppState {
             .get(session_idx)
             .and_then(|s| s.panes.first());
         if let Some(pane) = first_pane {
-            pane.terminal.read(cx).focus_handle().focus(window);
+            pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
         }
         self.focused_pane_id = first_pane.map(|pane| pane.id);
         cx.notify();
@@ -2510,10 +2521,10 @@ impl AppState {
                                     state.focus(window, cx);
                                 });
                             } else {
-                                pane.terminal.read(cx).focus_handle().focus(window);
+                                pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
                             }
                         } else {
-                            pane.terminal.read(cx).focus_handle().focus(window);
+                            pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
                         }
                     }
                 }
@@ -3632,7 +3643,7 @@ impl AppState {
                                     let is_term_focused =
                                         pane.terminal.read(cx).focus_handle().is_focused(window);
                                     if !is_term_focused {
-                                        pane.terminal.read(cx).focus_handle().focus(window);
+                                        pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
                                     }
                                 }
                             }
@@ -3785,7 +3796,7 @@ impl AppState {
     ) -> bool {
         if let Some(image) = item.entries().iter().find_map(|entry| match entry {
             ClipboardEntry::Image(image) => Some(image),
-            ClipboardEntry::String(_) => None,
+            ClipboardEntry::String(_) | ClipboardEntry::ExternalPaths(_) => None,
         }) {
             if let Some(attachment) = attachments::from_clipboard_image(image) {
                 return self.attach_image(pane_id, attachment, window, cx);
@@ -7070,27 +7081,6 @@ impl Render for AppState {
         self.window_active = _window.is_window_active();
         self.ensure_panes_input_state(_window, cx);
 
-        if self.theme_preference == ThemePreference::System {
-            let sys_mode = self.theme_preference.resolve_mode(_window.appearance());
-            let current_is_dark = self.palette.background().l < 0.5;
-            if sys_mode.is_dark() != current_is_dark {
-                self.palette = load_palette(self.palette_scheme, sys_mode.is_dark());
-                let palette = self.palette.clone();
-                gpui_component::Theme::change(sys_mode, Some(_window), cx);
-                for project in &mut self.projects {
-                    for session in &mut project.sessions {
-                        for pane in &mut session.panes {
-                            let mut config = pane.terminal.read(cx).config().clone();
-                            config.colors = palette.clone();
-                            pane.terminal.update(cx, |term, cx| {
-                                term.update_config(config, cx);
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
         let tokens = self.tokens(cx);
         // Track which pane owns keyboard focus each frame; the poller uses
         // this for Active-state resolution and for clearing sticky Done/Error.
@@ -7713,12 +7703,12 @@ fn main() -> Result<()> {
         Some(command) => anyhow::bail!("unsupported Kathamo command: {command}"),
         None => {}
     }
-    Application::new()
+    gpui_platform::application()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
             #[cfg(target_os = "linux")]
             ensure_linux_desktop_entry();
-            let window_icon = gpui::WindowIcon::from_png_bytes(APP_ICON_PNG).ok();
+            let window_icon = image::load_from_memory(APP_ICON_PNG).ok().map(|image| Arc::new(image.into_rgba8()));
             gpui_component::init(cx);
             init_kathamo_input_bindings(cx);
             let initial_mode = ThemePreference::System.resolve_mode(cx.window_appearance());
@@ -7741,7 +7731,7 @@ fn main() -> Result<()> {
                     titlebar: Some(TitleBar::title_bar_options()),
                     window_decorations: Some(WindowDecorations::Client),
                     app_id: Some("kathamo".to_string()),
-                    window_icon,
+                    icon: window_icon,
                     ..Default::default()
                 },
                 |window, cx| {
@@ -7775,6 +7765,7 @@ fn main() -> Result<()> {
                         history_search: None,
                         image_viewer: None,
                     });
+                    app_state.update(cx, |state, cx| state.observe_appearance(window, cx));
 
                     let weak_state = app_state.downgrade();
                     let load_path = persistence_path.clone();
@@ -7935,8 +7926,68 @@ mod resize_tests {
     //! after every resize step.
 
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualTestContext, point, size};
-    use std::ops::Deref as _;
+    use gpui::{HeadlessAppContext, Modifiers, VisualTestContext, point, size};
+    use std::ops::{Deref, DerefMut};
+
+    // VisualTestContext supplies input simulation, while HeadlessAppContext is
+    // the public constructor that installs a real renderer. Point the visual
+    // context at the headless app and its executors; keep the owner alive for
+    // the duration of each test so it can shut the app down afterward.
+    pub(crate) struct TestAppContext {
+        visual: gpui::TestAppContext,
+        _headless: HeadlessAppContext,
+    }
+
+    impl TestAppContext {
+        pub(crate) fn new() -> Self {
+            let text = gpui_platform::current_platform(true).text_system();
+            assert!(
+                !text.all_font_names().is_empty(),
+                "headless visual tests require a real text system and installed fonts; enable gpui-platform's x11 or wayland feature on Linux"
+            );
+            let headless = HeadlessAppContext::with_platform(text.clone(), Arc::new(()), || {
+                let renderer = gpui_platform::current_headless_renderer()?
+                    .ok_or_else(|| anyhow::anyhow!("headless GPU renderer unavailable"))?;
+                Ok(Some(renderer))
+            });
+            let mut visual = gpui::TestAppContext::build_with_text_system(
+                gpui::TestDispatcher::new(0),
+                None,
+                text,
+            );
+            visual.app = headless.app.clone();
+            visual.background_executor = headless.background_executor.clone();
+            visual.foreground_executor = headless.foreground_executor.clone();
+            Self { visual, _headless: headless }
+        }
+    }
+
+    impl Deref for TestAppContext {
+        type Target = gpui::TestAppContext;
+
+        fn deref(&self) -> &Self::Target {
+            &self.visual
+        }
+    }
+
+    impl DerefMut for TestAppContext {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.visual
+        }
+    }
+
+    pub(crate) trait DrawFrame {
+        fn draw_frame(&mut self) -> anyhow::Result<()>;
+    }
+
+    impl DrawFrame for VisualTestContext {
+        fn draw_frame(&mut self) -> anyhow::Result<()> {
+            self.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.render_to_image().map(drop)
+            })
+        }
+    }
 
     /// One project with one live session, built exactly like `main` does.
     fn build_app_state(cx: &mut Context<AppState>) -> AppState {
@@ -8025,10 +8076,13 @@ mod resize_tests {
                         titlebar: Some(TitleBar::title_bar_options()),
                         window_decorations: Some(WindowDecorations::Client),
                         app_id: Some("kathamo".to_string()),
-                        window_icon: gpui::WindowIcon::from_png_bytes(APP_ICON_PNG).ok(),
+                        icon: image::load_from_memory(APP_ICON_PNG).ok().map(|image| Arc::new(image.into_rgba8())),
                         ..Default::default()
                     },
-                    |window, cx| cx.new(|cx| Root::new(state.clone(), window, cx)),
+                    |window, cx| {
+                        state.update(cx, |state, cx| state.observe_appearance(window, cx));
+                        cx.new(|cx| Root::new(state.clone(), window, cx))
+                    },
                 )
             })
             .expect("open window");
@@ -8040,8 +8094,7 @@ mod resize_tests {
 
     #[test]
     fn window_resizes_without_panicking() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         let terminal = app_state.read_with(&cx, |state, _| {
             state.active_session().expect("a session").panes[0]
@@ -8091,8 +8144,7 @@ mod resize_tests {
     /// grid for rows that no longer exist.
     #[test]
     fn status_poll_between_resize_frames_does_not_panic() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         // A frame at the large size: the grid is laid out big while the cached
@@ -8114,8 +8166,7 @@ mod resize_tests {
     /// stay panic-free.
     #[test]
     fn dragging_the_sidebar_handle_does_not_panic() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, _) = open_app(&mut cx);
         cx.draw_frame().expect("a frame at the opening size");
 
@@ -8128,16 +8179,15 @@ mod resize_tests {
                 Some(MouseButton::Left),
                 Modifiers::none(),
             );
-            let _ = cx.draw_frame();
+            cx.draw_frame().expect("frame while dragging sidebar");
         }
         cx.simulate_mouse_up(grab, MouseButton::Left, Modifiers::none());
-        let _ = cx.draw_frame();
+        cx.draw_frame().expect("frame after dragging sidebar");
     }
 
     #[test]
     fn sidebar_toggle_and_resize_without_panicking() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         for visible in [false, true, false, true] {
@@ -8157,8 +8207,7 @@ mod resize_tests {
 
     #[test]
     fn fixed_sidebar_width_stays_constant_on_resize() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         for new_size in [
@@ -8288,8 +8337,8 @@ mod xtgettcap_tests {
 #[cfg(test)]
 mod pane_tests {
     use super::*;
-    use gpui::{Modifiers, TestAppContext, VisualContext, point};
-    use resize_tests::open_app;
+    use gpui::{Modifiers, VisualContext, point};
+    use resize_tests::{DrawFrame, TestAppContext, open_app};
     #[test]
     fn pane_node_split_and_contains() {
         let mut tree = PaneNode::Leaf(1);
@@ -8329,8 +8378,7 @@ mod pane_tests {
 
     #[test]
     fn visual_split_maximize_close_flow() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8378,8 +8426,7 @@ mod pane_tests {
 
     #[test]
     fn dragging_split_terminal_divider_resizes_without_panic() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8398,16 +8445,15 @@ mod pane_tests {
                 Some(MouseButton::Left),
                 Modifiers::none(),
             );
-            let _ = cx.draw_frame();
+            cx.draw_frame().expect("frame while dragging divider");
         }
         cx.simulate_mouse_up(grab, MouseButton::Left, Modifiers::none());
-        let _ = cx.draw_frame();
+        cx.draw_frame().expect("frame after dragging divider");
     }
 
     #[test]
     fn reproduce_nested_split_bounds() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8441,8 +8487,7 @@ mod pane_tests {
 
     #[test]
     fn horizontal_then_vertical_nested_split_does_not_collapse() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8479,8 +8524,7 @@ mod pane_tests {
         // The Kathamo-style isolation contract: creating a second session must
         // not touch the first session's pane tree, and each tab renders its
         // own screen.
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8530,8 +8574,7 @@ mod pane_tests {
 
     #[test]
     fn opening_a_second_project_keeps_the_first_one_alive() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8560,8 +8603,7 @@ mod pane_tests {
 
     #[test]
     fn sessions_are_created_in_the_project_that_asks_for_them() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8593,8 +8635,7 @@ mod pane_tests {
 
     #[test]
     fn closing_a_session_or_project_leaves_the_others_intact() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8641,8 +8682,7 @@ mod pane_tests {
 
     #[test]
     fn sidebar_renders_collapsed_and_expanded_projects() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8676,8 +8716,7 @@ mod pane_tests {
 
     #[test]
     fn sidebar_renders_with_agent_and_worker() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         cx.update_window_entity(&app_state, |state, _window, cx| {
@@ -8716,8 +8755,7 @@ mod pane_tests {
 
     #[test]
     fn sidebar_new_session_and_remove_session_icons_align() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, _) = open_app(&mut cx);
         cx.draw_frame()
             .expect("initial frame with project and session");
@@ -8752,8 +8790,7 @@ mod pane_tests {
 
     #[test]
     fn project_rename_flow() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("initial frame");
 
@@ -8788,8 +8825,7 @@ mod pane_tests {
 
     #[test]
     fn project_menu_and_remove_flow() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         let dir = scratch_project_dir("kathamo-menu-remove");
@@ -8826,13 +8862,12 @@ mod pane_tests {
 #[cfg(test)]
 mod settings_and_theme_tests {
     use super::*;
-    use gpui::{KeyDownEvent, Modifiers, TestAppContext, VisualContext, point};
-    use resize_tests::open_app;
+    use gpui::{KeyDownEvent, Modifiers, VisualContext, point};
+    use resize_tests::{DrawFrame, TestAppContext, open_app};
 
     #[test]
     fn settings_close_button_returns_to_workspace() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         cx.update_window_entity(&app_state, |state, _window, cx| {
@@ -8860,8 +8895,7 @@ mod settings_and_theme_tests {
 
     #[test]
     fn settings_page_toggle_and_render() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         // Initially on workspace
@@ -8889,8 +8923,7 @@ mod settings_and_theme_tests {
 
     #[test]
     fn settings_keyboard_shortcuts() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         // Ctrl+, opens settings
@@ -8905,6 +8938,7 @@ mod settings_and_theme_tests {
                     key_char: Some(",".to_string()),
                 },
                 is_held: false,
+                prefer_character_input: false,
             };
             state.on_key_down(&ev, window, cx);
         });
@@ -8920,6 +8954,7 @@ mod settings_and_theme_tests {
                     key_char: None,
                 },
                 is_held: false,
+                prefer_character_input: false,
             };
             state.on_key_down(&ev, window, cx);
         });
@@ -8928,72 +8963,72 @@ mod settings_and_theme_tests {
     }
 
     #[test]
-    fn theme_switching_updates_palette_and_terminals() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+    fn terminal_pixels_follow_theme_after_returning_from_settings() {
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
-
-        // Default preference is System
-        let pref = app_state.read_with(&cx, |state, _| state.theme_preference);
-        assert_eq!(pref, ThemePreference::System);
-
-        // Switch to Light
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.set_theme_preference(ThemePreference::Light, Some(window), cx);
+            state.split_pane(1, gpui::Axis::Horizontal, window, cx);
         });
-        cx.draw_frame().expect("draw light theme frame");
-
-        app_state.read_with(&cx, |state, cx| {
-            assert_eq!(state.theme_preference, ThemePreference::Light);
-            assert!(
-                state.palette.background().l > 0.8,
-                "Light terminal background should be bright"
-            );
-            let pane_term_palette = state.projects[0].sessions[0].panes[0]
-                .terminal
-                .read(cx)
-                .config()
-                .colors
-                .clone();
-            assert_eq!(pane_term_palette.background(), state.palette.background());
-        });
-
-        // Switch to Dark
-        cx.update_window_entity(&app_state, |state, window, cx| {
-            state.set_theme_preference(ThemePreference::Dark, Some(window), cx);
-        });
-        cx.draw_frame().expect("draw dark theme frame");
-
-        app_state.read_with(&cx, |state, cx| {
-            assert_eq!(state.theme_preference, ThemePreference::Dark);
-            assert!(
-                state.palette.background().l < 0.2,
-                "Dark terminal background should be dark"
-            );
-            let pane_term_palette = state.projects[0].sessions[0].panes[0]
-                .terminal
-                .read(cx)
-                .config()
-                .colors
-                .clone();
-            assert_eq!(pane_term_palette.background(), state.palette.background());
-        });
-
-        // Switch back to System
-        cx.update_window_entity(&app_state, |state, window, cx| {
-            state.set_theme_preference(ThemePreference::System, Some(window), cx);
-        });
-        cx.draw_frame().expect("draw system theme frame");
-        assert_eq!(
-            app_state.read_with(&cx, |state, _| state.theme_preference),
-            ThemePreference::System
-        );
+        for (preference, light) in [
+            (ThemePreference::Dark, false),
+            (ThemePreference::Light, true),
+            (ThemePreference::Dark, false),
+            (ThemePreference::System, true),
+        ] {
+            cx.update_window_entity(&app_state, |state, window, cx| {
+                state.active_view = ActiveView::Settings;
+                state.set_theme_preference(preference, Some(window), cx);
+            });
+            cx.draw_frame().expect("draw settings");
+            cx.update_window_entity(&app_state, |state, _, cx| {
+                state.active_view = ActiveView::Workspace;
+                cx.notify();
+            });
+            cx.draw_frame().expect("draw terminal");
+            let bounds = app_state.read_with(&cx, |state, cx| {
+                state.projects[0].sessions[0]
+                    .panes
+                    .iter()
+                    .map(|pane| pane.terminal.read(cx).last_bounds())
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(bounds.len(), 2);
+            let pixels = cx.update(|window, _| {
+                let image = window.render_to_image().expect("capture terminal");
+                let scale = window.scale_factor();
+                bounds
+                    .iter()
+                    .map(|bounds| {
+                        let x = ((f32::from(bounds.origin.x)
+                            + f32::from(bounds.size.width) / 2.0)
+                            * scale) as u32;
+                        let y = ((f32::from(bounds.origin.y)
+                            + f32::from(bounds.size.height)
+                            - 12.0)
+                            * scale) as u32;
+                        *image.get_pixel(x, y)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for pixel in pixels {
+                if light {
+                    assert!(
+                        pixel[0] > 200 && pixel[1] > 200 && pixel[2] > 200,
+                        "light terminal pixel: {pixel:?}"
+                    );
+                } else {
+                    assert!(
+                        pixel[0] < 60 && pixel[1] < 60 && pixel[2] < 60,
+                        "dark terminal pixel: {pixel:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn session_or_pane_selection_resets_settings_view() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
 
         // In settings, selecting session switches to workspace
@@ -9021,13 +9056,12 @@ mod settings_and_theme_tests {
 #[cfg(test)]
 mod kathamo_bottom_input_tests {
     use super::*;
-    use gpui::{TestAppContext, VisualContext, point};
-    use resize_tests::open_app;
+    use gpui::{VisualContext, point};
+    use resize_tests::{DrawFrame, TestAppContext, open_app};
 
     #[test]
     fn kathamo_bottom_input_history_and_execution() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9126,8 +9160,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn kathamo_bottom_input_clear_and_cancel() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9159,8 +9192,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn terminal_is_read_only_and_cannot_be_written_directly() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9184,8 +9216,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn plus_menu_and_message_placeholder() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9223,8 +9254,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn terminal_shortcuts_work_in_read_only() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9238,6 +9268,7 @@ mod kathamo_bottom_input_tests {
                 let ev = gpui::KeyDownEvent {
                     keystroke: gpui::Keystroke::parse("ctrl-a").unwrap(),
                     is_held: false,
+                    prefer_character_input: false,
                 };
                 term.dispatch_key(&ev, window, cx);
             });
@@ -9251,6 +9282,7 @@ mod kathamo_bottom_input_tests {
                 let ev = gpui::KeyDownEvent {
                     keystroke: gpui::Keystroke::parse("ctrl-c").unwrap(),
                     is_held: false,
+                    prefer_character_input: false,
                 };
                 term.dispatch_key(&ev, window, cx);
             });
@@ -9261,12 +9293,14 @@ mod kathamo_bottom_input_tests {
             let ev_z = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("ctrl-z").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev_z, window, cx);
 
             let ev_l = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("ctrl-l").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev_l, window, cx);
         });
@@ -9274,8 +9308,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn git_branch_detection_and_badges() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9306,8 +9339,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn dynamic_auto_focus() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9341,8 +9373,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn terminal_right_click_copy_and_paste() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9419,8 +9450,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn input_yields_to_command_and_returns_at_prompt() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
         let pane_id =
@@ -9465,8 +9495,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn prompt_submission_sends_text_and_enter_without_manual_intervention() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9501,8 +9530,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn image_attachments_stage_send_and_open_viewer() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9566,8 +9594,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn copied_image_path_attaches_only_inside_an_agent() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9600,8 +9627,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn ctrl_c_cancels_draft_and_interrupts_running_process() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9618,6 +9644,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("ctrl-c").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9655,8 +9682,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn native_terminal_readline_shortcuts_in_input() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9673,6 +9699,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("ctrl-u").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9697,6 +9724,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("ctrl-w").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9714,8 +9742,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn autosuggestion_tab_and_right_arrow_completion() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9739,6 +9766,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("tab").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9756,8 +9784,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn input_auto_grow_height_increases_with_characters_and_newlines() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9797,6 +9824,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("shift-enter").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9815,8 +9843,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn enter_executes_command_and_does_not_insert_newline() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9834,6 +9861,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("enter").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9882,8 +9910,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn typing_shows_ghost_history_suggestion_and_right_accepts_it() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9917,6 +9944,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("right").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9932,8 +9960,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn completion_menu_opens_navigates_and_accepts_with_tab() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -9949,6 +9976,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("tab").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9967,11 +9995,13 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("down").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("tab").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
@@ -9990,8 +10020,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn right_and_ctrl_c_flow_through_the_action_pipeline() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -10034,8 +10063,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn ctrl_r_palette_accepts_with_enter_through_dispatch() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -10064,8 +10092,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn history_and_readline_keys_flow_through_the_action_pipeline() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -10115,8 +10142,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn enter_key_executes_once_through_the_action_pipeline() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -10146,8 +10172,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn tab_key_dispatches_completion_not_indentation() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -10183,8 +10208,7 @@ mod kathamo_bottom_input_tests {
 
     #[test]
     fn ctrl_r_history_search_filters_and_inserts() {
-        let mut cx = TestAppContext::with_headless_renderer_allowing_software(true)
-            .expect("headless renderer");
+        let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
         cx.draw_frame().expect("draw initial frame");
 
@@ -10199,6 +10223,7 @@ mod kathamo_bottom_input_tests {
             let ev = gpui::KeyDownEvent {
                 keystroke: gpui::Keystroke::parse("ctrl-r").unwrap(),
                 is_held: false,
+                prefer_character_input: false,
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
             assert!(

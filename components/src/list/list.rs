@@ -26,10 +26,18 @@ use smol::Timer;
 
 pub(crate) fn init(cx: &mut App) {
     let context: Option<&str> = Some("List");
+    let secondary_enter = KeyBinding::load(
+        "secondary-enter",
+        Box::new(Confirm { secondary: true }),
+        context.map(|context| gpui::KeyBindingContextPredicate::parse(context).expect("valid list context").into()),
+        false,
+        None,
+        cx,
+    ).expect("valid secondary-enter binding");
     cx.bind_keys([
         KeyBinding::new("escape", Cancel, context),
         KeyBinding::new("enter", Confirm { secondary: false }, context),
-        KeyBinding::new("secondary-enter", Confirm { secondary: true }, context),
+        secondary_enter,
         KeyBinding::new("up", SelectUp, context),
         KeyBinding::new("down", SelectDown, context),
     ]);
@@ -146,7 +154,7 @@ where
     }
 
     pub fn focus(&mut self, window: &mut Window, cx: &mut App) {
-        self.focus_handle(cx).focus(window);
+        self.focus_handle(cx).focus(window, cx);
     }
 
     pub(crate) fn is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -437,7 +445,7 @@ where
                     this.selected_index = Some(ix);
                     this.on_action_confirm(
                         &Confirm {
-                            secondary: e.modifiers().secondary(),
+                            secondary: e.modifiers().secondary(cx),
                         },
                         window,
                         cx,
@@ -464,8 +472,7 @@ where
         let scrollbar_visible = self.options.scrollbar_visible;
         let scroll_handle = self.scroll_handle.clone();
 
-        v_flex()
-            .flex_grow()
+        v_flex().flex_grow(1.0)
             .relative()
             .size_full()
             .when_some(self.options.max_height, |this, h| this.max_h(h))

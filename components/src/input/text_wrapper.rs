@@ -128,7 +128,7 @@ impl TextWrapper {
             new_text,
             &mut |line_str, wrap_width| {
                 line_wrapper
-                    .wrap_line(&[LineFragment::text(line_str)], wrap_width)
+                    .wrap_line(&[LineFragment::text(line_str)], wrap_width, gpui::IndentAdjustment::NoIndent)
                     .collect()
             },
         );
@@ -441,6 +441,8 @@ impl LineLayout {
             _ = line.paint(
                 pos + point(px(0.), ix * line_height),
                 line_height,
+                gpui::TextAlign::Left,
+                None,
                 window,
                 cx,
             );

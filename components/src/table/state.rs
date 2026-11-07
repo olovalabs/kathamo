@@ -1268,13 +1268,13 @@ where
                     this.children(empty_view)
                 } else {
                     this.child(
-                        h_flex().id("table-body").flex_grow().size_full().child(
+                        h_flex().id("table-body").flex_grow(1.0).size_full().child(
                             uniform_list(
                                 "table-uniform-list",
                                 render_rows_count,
                                 cx.processor(
                                     move |table, visible_range: Range<usize>, window, cx| {
-
+                            
                                         let col_sizes: Rc<Vec<gpui::Size<Pixels>>> = Rc::new(
                                             table
                                                 .col_groups
@@ -1283,7 +1283,7 @@ where
                                                 .map(|col| col.bounds.size)
                                                 .collect(),
                                         );
-
+                            
                                         table.load_more_if_need(
                                             rows_count,
                                             visible_range.end,
@@ -1296,7 +1296,7 @@ where
                                             window,
                                             cx,
                                         );
-
+                            
                                         if visible_range.end > rows_count {
                                             table.scroll_to_row(
                                                 std::cmp::min(
@@ -1306,13 +1306,13 @@ where
                                                 cx,
                                             );
                                         }
-
+                            
                                         let mut items = Vec::with_capacity(
                                             visible_range.end.saturating_sub(visible_range.start),
                                         );
-
+                            
                                         visible_range.for_each(|row_ix| {
-
+                            
                                             items.push(table.render_table_row(
                                                 row_ix,
                                                 rows_count,
@@ -1324,15 +1324,14 @@ where
                                                 cx,
                                             ));
                                         });
-
+                            
                                         items
                                     },
                                 ),
-                            )
-                            .flex_grow()
+                            ).flex_grow(1.0)
                             .size_full()
                             .with_sizing_behavior(ListSizingBehavior::Auto)
-                            .track_scroll(self.vertical_scroll_handle.clone())
+                            .track_scroll(&self.vertical_scroll_handle)
                             .into_any_element(),
                         ),
                     )

@@ -250,8 +250,7 @@ impl RenderOnce for ResizablePanel {
 
         div()
             .id(("resizable-panel", self.panel_ix))
-            .flex()
-            .flex_grow()
+            .flex().flex_grow(1.0)
             .size_full()
             .relative()
             .when(self.axis.is_vertical(), |this| {
@@ -261,7 +260,7 @@ impl RenderOnce for ResizablePanel {
                 this.min_w(size_range.start).max_w(size_range.end)
             })
 
-            .when(self.initial_size.is_none(), |this| this.flex_shrink())
+            .when(self.initial_size.is_none(), |this| this.flex_shrink(1.0))
             .when_some(self.initial_size, |this, initial_size| {
 
                 this.when(

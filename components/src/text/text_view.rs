@@ -9,9 +9,10 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, Element, ElementId, Entity,
     EntityId, FocusHandle, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement,
     KeyBinding, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Pixels, Point, RenderOnce, SharedString, Size, StyleRefinement, Styled, Timer, Window, div, px,
+    Pixels, Point, RenderOnce, SharedString, Size, StyleRefinement, Styled, Window, div, px,
 };
 use smol::stream::StreamExt;
+use smol::Timer;
 
 use crate::highlighter::HighlightTheme;
 use crate::scroll::ScrollableElement;

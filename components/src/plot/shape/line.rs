@@ -3,10 +3,7 @@ use gpui::{
     Point, Window,
 };
 
-use crate::{
-    plot::{origin_point, StrokeStyle},
-    PixelsExt,
-};
+use crate::plot::{origin_point, StrokeStyle};
 
 #[allow(clippy::type_complexity)]
 pub struct Line<T> {

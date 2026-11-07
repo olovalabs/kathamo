@@ -205,7 +205,7 @@ impl RenderOnce for ButtonGroup {
                         } else {
 
                             child
-                                .border_corners(Corners::all(false))
+                                .border_corners(Corners::default())
                                 .border_edges(Edges {
                                     left: vertical,
                                     top: !vertical,

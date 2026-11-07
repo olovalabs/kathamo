@@ -10,7 +10,7 @@ use ropey::Rope;
 use smallvec::SmallVec;
 
 use crate::{
-    ActiveTheme as _, Colorize, PixelsExt, Root,
+    ActiveTheme as _, Colorize, Root,
     input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, text_wrapper::LineLayout},
 };
 
@@ -1268,7 +1268,7 @@ impl Element for TextElement {
                     );
                     window.paint_quad(fill(ghost_bounds, cx.theme().editor_background()));
 
-                    _ = ghost_line.paint(ghost_p, line_height, window, cx);
+                    _ = ghost_line.paint(ghost_p, line_height, gpui::TextAlign::Left, None, window, cx);
                     offset_y += line_height;
                 }
             }
@@ -1313,7 +1313,7 @@ impl Element for TextElement {
                 }
 
                 for line in lines {
-                    _ = line.paint(p, line_height, window, cx);
+                    _ = line.paint(p, line_height, gpui::TextAlign::Left, None, window, cx);
                     offset_y += line_height;
                 }
 
@@ -1349,7 +1349,7 @@ impl Element for TextElement {
                     let bg_bounds = Bounds::new(p, size(first_line.width + px(4.), line_height));
                     window.paint_quad(fill(bg_bounds, cx.theme().editor_background()));
 
-                    _ = first_line.paint(p, line_height, window, cx);
+                    _ = first_line.paint(p, line_height, gpui::TextAlign::Left, None, window, cx);
                 }
             }
         }

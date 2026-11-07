@@ -19,15 +19,19 @@ use crate::{
 
 const CONTEXT: &str = "Select";
 pub(crate) fn init(cx: &mut App) {
+    let secondary_enter = KeyBinding::load(
+        "secondary-enter",
+        Box::new(Confirm { secondary: true }),
+        Some(gpui::KeyBindingContextPredicate::parse(CONTEXT).expect("valid select context").into()),
+        false,
+        None,
+        cx,
+    ).expect("valid secondary-enter binding");
     cx.bind_keys([
         KeyBinding::new("up", SelectUp, Some(CONTEXT)),
         KeyBinding::new("down", SelectDown, Some(CONTEXT)),
         KeyBinding::new("enter", Confirm { secondary: false }, Some(CONTEXT)),
-        KeyBinding::new(
-            "secondary-enter",
-            Confirm { secondary: true },
-            Some(CONTEXT),
-        ),
+        secondary_enter,
         KeyBinding::new("escape", Cancel, Some(CONTEXT)),
     ])
 }
@@ -633,8 +637,8 @@ where
         self.selected_value.as_ref()
     }
 
-    pub fn focus(&self, window: &mut Window, _: &mut App) {
-        self.focus_handle.focus(window);
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.focus_handle.focus(window, cx);
     }
 
     fn update_selected_value(&mut self, _: &Window, cx: &App) {
@@ -667,7 +671,7 @@ where
             self.open = true;
         }
 
-        self.list.focus_handle(cx).focus(window);
+        self.list.focus_handle(cx).focus(window, cx);
         cx.propagate();
     }
 
@@ -676,7 +680,7 @@ where
             self.open = true;
         }
 
-        self.list.focus_handle(cx).focus(window);
+        self.list.focus_handle(cx).focus(window, cx);
         cx.propagate();
     }
 
@@ -689,7 +693,7 @@ where
             cx.notify();
         }
 
-        self.list.focus_handle(cx).focus(window);
+        self.list.focus_handle(cx).focus(window, cx);
     }
 
     fn toggle_menu(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -697,7 +701,7 @@ where
 
         self.open = !self.open;
         if self.open {
-            self.list.focus_handle(cx).focus(window);
+            self.list.focus_handle(cx).focus(window, cx);
         }
         cx.notify();
     }

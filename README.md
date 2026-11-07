@@ -2,7 +2,7 @@
 
 > A GPU-accelerated terminal emulator built for developers orchestrating AI coding agents across multiple projects.
 
-Kathamo combines ultra-fast native terminal rendering powered by [GPUI](https://gpui.rs) and [alacritty_terminal](https://github.com/alacritty/alacritty) with an intelligent **Agent Attention Model** and multi-project workspace management. It tracks the state of autonomous AI agents (Claude Code, OpenCode, Codex, Pi, OMP, Command Code) in real time—alerting you when an agent is blocked, waiting for input, or finished while you were away.
+Kathamo combines native terminal rendering powered by [GPUI Fast](https://github.com/longbridge/gpui-fast) and [alacritty_terminal](https://github.com/alacritty/alacritty) with an intelligent **Agent Attention Model** and multi-project workspace management. It tracks the state of autonomous AI agents (Claude Code, OpenCode, Codex, Pi, OMP, Command Code) in real time—alerting you when an agent is blocked, waiting for input, or finished while you were away.
 
 ---
 
@@ -12,7 +12,7 @@ Kathamo combines ultra-fast native terminal rendering powered by [GPUI](https://
 ## Key Features
 
 - **🚀 GPU-Accelerated Terminal Rendering**
-  - Powered by GPUI and Alacritty's VTE engine for 60+ FPS, tearing-free rendering with minimal latency.
+  - Powered by GPUI Fast and Alacritty's VTE engine.
   - Adaptive 1 ms stream coalescing with a 128 KiB parse cap handles intensive outputs (e.g., 40 MB/s compilation logs) without locking the UI thread.
   - Full support for ANSI colors (16 standard, 256-color, 24-bit true color), bold, italics, underlines, and custom font glyphs.
   - Displays a plain terminal grid without block UI, with a Warp-style bottom input whenever the shell is idle. The input temporarily hides while a command runs or the alternate screen is active.
@@ -39,7 +39,8 @@ Kathamo combines ultra-fast native terminal rendering powered by [GPUI](https://
 - **🖥️ Desktop Polish**
   - Native window decorations and custom title bar controls.
   - Bundled custom application icons for Linux (`.desktop` auto-registration), macOS, and Windows.
-  - Pre-configured GitHub Dark theme palette with embedded Mononoki monospace fonts.
+  - Light, dark, and system appearance modes with Warp and GitHub terminal palettes.
+  - Compatible terminal applications can follow light/dark changes while running using DEC mode 2031 and OSC 11.
 
 ---
 

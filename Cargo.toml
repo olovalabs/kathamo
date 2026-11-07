@@ -7,7 +7,8 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-gpui = "0.2.2"
+gpui = { package = "gpui-fast", version = "0.1.13" }
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.13", features = ["wayland", "x11"] }
 gpui-component = { version = "0.5.1" }
 gpui-component-assets = "0.5.1"
 terminal = { path = "terminal" }
@@ -29,10 +30,10 @@ unicode-width = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
 
 [dev-dependencies]
-gpui = { version = "0.2.2", features = ["test-support"] }
+gpui = { package = "gpui-fast", version = "0.1.13", features = ["test-support"] }
+gpui_platform = { package = "gpui-fast-platform", version = "0.1.13", features = ["test-support", "wayland", "x11"] }
 
 [patch.crates-io]
-gpui = { path = "components/gpui" }
 gpui-component = { path = "components" }
 
 [profile.dev]
@@ -48,7 +49,7 @@ debug = false
 [profile.dev.package.kathamo]
 opt-level = 2
 
-[profile.dev.package.gpui]
+[profile.dev.package.gpui-fast]
 opt-level = 3
 
 [profile.dev.package.gpui-component]

@@ -210,6 +210,8 @@ fn extension_for(format: ImageFormat) -> &'static str {
         ImageFormat::Svg => "svg",
         ImageFormat::Bmp => "bmp",
         ImageFormat::Tiff => "tiff",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Pnm => "pnm",
     }
 }
 

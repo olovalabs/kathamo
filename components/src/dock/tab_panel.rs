@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext, Context, Corner, DismissEvent, Div, DragMoveEvent, Empty, Entity,
+    App, AppContext, Context, Anchor, DismissEvent, Div, DragMoveEvent, Empty, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement,
     Pixels, Render, ScrollHandle, SharedString, StatefulInteractiveElement, StyleRefinement,
     Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, relative, rems,
@@ -507,7 +507,7 @@ impl TabPanel {
                             })
                         }
                     })
-                    .anchor(Corner::TopRight),
+                    .anchor(Anchor::TopRight),
             )
     }
 
@@ -776,8 +776,7 @@ impl TabPanel {
 
                 div()
                     .id("tab-bar-empty-space")
-                    .h_full()
-                    .flex_grow()
+                    .h_full().flex_grow(1.0)
                     .min_w_16()
                     .when(state.droppable, |this| {
                         this.drag_over::<DragPanel>(|this, _, _, cx| {
@@ -1071,7 +1070,7 @@ impl TabPanel {
 
     fn focus_active_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(active_panel) = self.active_panel(cx) {
-            active_panel.focus_handle(cx).focus(window);
+            active_panel.focus_handle(cx).focus(window, cx);
         }
     }
 

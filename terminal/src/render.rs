@@ -1421,7 +1421,14 @@ impl TerminalRenderer {
                 force_width,
             );
 
-            let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
+            let _ = shaped_line.paint(
+                Point { x, y },
+                self.cell_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                _cx,
+            );
         }
 
         for rect in decoration_rects.drain(..) {

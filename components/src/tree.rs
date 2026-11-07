@@ -333,7 +333,7 @@ impl Render for TreeState {
                         let entry = &state.entries[ix];
                         let selected = Some(ix) == state.selected_ix;
                         let item = (render_item)(ix, entry, selected, window, cx);
-
+            
                         let el = div()
                             .id(ix)
                             .child(item.disabled(entry.item().is_disabled()).selected(selected))
@@ -347,16 +347,15 @@ impl Render for TreeState {
                                     }),
                                 )
                             });
-
+            
                         items.push(el)
                     }
-
+            
                     items
                 })
-            })
-            .flex_grow()
+            }).flex_grow(1.0)
             .size_full()
-            .track_scroll(self.scroll_handle.clone())
+            .track_scroll(&self.scroll_handle)
             .with_sizing_behavior(ListSizingBehavior::Auto)
             .into_any_element(),
         )

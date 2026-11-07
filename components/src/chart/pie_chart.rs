@@ -9,7 +9,7 @@ use crate::{
         shape::{Arc, ArcData, Pie},
         Plot,
     },
-    ActiveTheme, PixelsExt,
+    ActiveTheme,
 };
 
 #[derive(IntoPlot)]

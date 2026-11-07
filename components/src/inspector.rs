@@ -1,4 +1,4 @@
-use std::{cell::OnceCell, collections::HashMap, fmt::Write as _, rc::Rc, sync::OnceLock};
+use std::{collections::HashMap, fmt::Write as _, rc::Rc, sync::OnceLock};
 
 use anyhow::Result;
 use gpui::{
@@ -46,13 +46,14 @@ pub(crate) fn init(cx: &mut App) {
         });
     });
 
-    let inspector_el = OnceCell::new();
-    cx.register_inspector_element(move |id, state: &DivInspectorState, window, cx| {
-        let el = inspector_el.get_or_init(|| cx.new(|cx| DivInspector::new(window, cx)));
-        el.update(cx, |this, cx| {
-            this.update_inspected_element(id, state.clone(), window, cx);
-            this.render(window, cx).into_any_element()
-        })
+    cx.register_inspector_element(|window, cx| {
+        let el = cx.new(|cx| DivInspector::new(window, cx));
+        move |id, state: &DivInspectorState, window, cx| {
+            el.update(cx, |this, cx| {
+                this.update_inspected_element(id, state.clone(), window, cx);
+                this.render(window, cx).into_any_element()
+            })
+        }
     });
 
     cx.set_inspector_renderer(Box::new(render_inspector));

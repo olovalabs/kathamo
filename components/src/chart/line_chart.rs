@@ -10,7 +10,7 @@ use crate::{
         shape::Line,
         AxisText, Grid, Plot, PlotAxis, StrokeStyle, AXIS_GAP,
     },
-    ActiveTheme, PixelsExt,
+    ActiveTheme,
 };
 
 #[derive(IntoPlot)]

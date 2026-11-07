@@ -340,7 +340,7 @@ impl RenderOnce for Input {
                 window.listener_for(&self.state, InputState::on_mouse_up),
             )
             .on_mouse_move(window.listener_for(&self.state, InputState::on_mouse_move))
-            .on_scroll_wheel(window.listener_for(&self.state, InputState::on_scroll_wheel))
+            .on_scroll(window.listener_for(&self.state, InputState::on_scroll_wheel))
             .size_full()
             .line_height(LINE_HEIGHT)
             .input_px(self.size)

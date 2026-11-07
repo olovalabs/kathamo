@@ -50,7 +50,9 @@ impl gpui::AssetSource for CombinedAssets {
                 }
             }
         }
-        gpui_component_assets::Assets.load(path)
+        gpui_component_assets::Assets::get(path)
+            .map(|file| Some(file.data))
+            .ok_or_else(|| anyhow::anyhow!("could not find asset at path \"{path}\""))
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<gpui::SharedString>> {
@@ -58,9 +60,11 @@ impl gpui::AssetSource for CombinedAssets {
         for file in AppAssets::iter() {
             list.push(gpui::SharedString::from(file.to_string()));
         }
-        if let Ok(other) = gpui_component_assets::Assets.list(path) {
-            list.extend(other);
-        }
+        list.extend(
+            gpui_component_assets::Assets::iter()
+                .filter(|asset| asset.starts_with(path))
+                .map(|asset| asset.into()),
+        );
         Ok(list)
     }
 }
@@ -117,9 +121,8 @@ mod tests {
         assert!(assets.load("icons/monitor.svg").unwrap().is_some());
         assert!(assets.load("icons/ellipsis.svg").unwrap().is_some());
         assert!(assets.load("logo/kathamo.png").unwrap().is_some());
-        let icon = gpui::WindowIcon::from_png_bytes(crate::APP_ICON_PNG).unwrap();
-        assert_eq!(icon.width, 1254);
-        assert_eq!(icon.height, 1254);
-        assert_eq!(icon.rgba.len(), (1254 * 1254 * 4) as usize);
+        let icon = image::load_from_memory(crate::APP_ICON_PNG).unwrap().into_rgba8();
+        assert_eq!(icon.width(), 1254);
+        assert_eq!(icon.height(), 1254);
     }
 }

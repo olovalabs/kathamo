@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use gpui::{
-    Context, Corner, DismissEvent, ElementId, Entity, Focusable, InteractiveElement, IntoElement,
+    Context, Anchor, DismissEvent, ElementId, Entity, Focusable, InteractiveElement, IntoElement,
     RenderOnce, SharedString, StyleRefinement, Styled, Window,
 };
 
@@ -13,12 +13,12 @@ pub trait DropdownMenu: Styled + Selectable + InteractiveElement + IntoElement +
         self,
         f: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     ) -> DropdownMenuPopover<Self> {
-        self.dropdown_menu_with_anchor(Corner::TopLeft, f)
+        self.dropdown_menu_with_anchor(Anchor::TopLeft, f)
     }
 
     fn dropdown_menu_with_anchor(
         mut self,
-        anchor: impl Into<Corner>,
+        anchor: impl Into<Anchor>,
         f: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     ) -> DropdownMenuPopover<Self> {
         let style = self.style().clone();
@@ -34,7 +34,7 @@ impl DropdownMenu for Button {}
 pub struct DropdownMenuPopover<T: Selectable + IntoElement + 'static> {
     id: ElementId,
     style: StyleRefinement,
-    anchor: Corner,
+    anchor: Anchor,
     trigger: T,
     builder: Rc<dyn Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu>,
 }
@@ -45,7 +45,7 @@ where
 {
     fn new(
         id: ElementId,
-        anchor: impl Into<Corner>,
+        anchor: impl Into<Anchor>,
         trigger: T,
         builder: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     ) -> Self {
@@ -58,7 +58,7 @@ where
         }
     }
 
-    pub fn anchor(mut self, anchor: impl Into<Corner>) -> Self {
+    pub fn anchor(mut self, anchor: impl Into<Anchor>) -> Self {
         self.anchor = anchor.into();
         self
     }
@@ -106,7 +106,7 @@ where
                         menu_state.update(cx, |state, _| {
                             state.menu = Some(menu.clone());
                         });
-                        menu.focus_handle(cx).focus(window);
+                        menu.focus_handle(cx).focus(window, cx);
 
                         // Listen for dismiss events from the PopupMenu to close the popover.
                         let popover_state = cx.entity();

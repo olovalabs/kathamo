@@ -1,5 +1,5 @@
 use gpui::{
-    div, prelude::FluentBuilder as _, px, AnyElement, App, Corner, Div, Edges, ElementId,
+    div, prelude::FluentBuilder as _, px, AnyElement, App, Anchor, Div, Edges, ElementId,
     InteractiveElement, IntoElement, ParentElement, Pixels, RenderOnce, ScrollHandle, Stateful,
     StatefulInteractiveElement as _, StyleRefinement, Styled, Window,
 };
@@ -288,7 +288,7 @@ impl RenderOnce for TabBar {
 
                             this
                         })
-                        .anchor(Corner::TopRight),
+                        .anchor(Anchor::TopRight),
                 )
             })
             .when_some(self.suffix, |this, suffix| this.child(suffix))

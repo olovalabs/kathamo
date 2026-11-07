@@ -1,5 +1,5 @@
 use gpui::{
-    div, prelude::FluentBuilder, App, Context, Corner, Corners, Edges, ElementId,
+    div, prelude::FluentBuilder, App, Context, Anchor, Corners, Edges, ElementId,
     InteractiveElement as _, IntoElement, ParentElement, RenderOnce, StyleRefinement, Styled,
     Window,
 };
@@ -27,7 +27,7 @@ pub struct DropdownButton {
     variant: ButtonVariant,
     size: Size,
     rounded: ButtonRounded,
-    anchor: Corner,
+    anchor: Anchor,
 }
 
 impl DropdownButton {
@@ -46,7 +46,7 @@ impl DropdownButton {
             variant: ButtonVariant::default(),
             size: Size::default(),
             rounded: ButtonRounded::default(),
-            anchor: Corner::TopRight,
+            anchor: Anchor::TopRight,
         }
     }
 
@@ -67,7 +67,7 @@ impl DropdownButton {
 
     pub fn dropdown_menu_with_anchor(
         mut self,
-        anchor: impl Into<Corner>,
+        anchor: impl Into<Anchor>,
         menu: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
     ) -> Self {
         self.menu = Some(Box::new(menu));

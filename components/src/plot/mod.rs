@@ -11,8 +11,6 @@ use std::{fmt::Debug, ops::Add};
 
 use gpui::{point, px, App, Bounds, IntoElement, Path, PathBuilder, Pixels, Point, Window};
 
-use crate::PixelsExt;
-
 pub use axis::{AxisText, PlotAxis, AXIS_GAP};
 pub use grid::Grid;
 pub use label::PlotLabel;

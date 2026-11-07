@@ -1136,7 +1136,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if !self.read_only {
-            window.focus(&self.focus_handle);
+            window.focus(&self.focus_handle, cx);
         }
         self.last_mouse_position = event.position;
 
@@ -1367,7 +1367,7 @@ impl TerminalView {
 
     fn on_scroll(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1763,6 +1763,7 @@ impl TerminalView {
         self.renderer.font_size = config.font_size;
         self.renderer.line_height_multiplier = config.line_height_multiplier;
         self.renderer.palette = config.colors.clone();
+        // Applications may query OSC 11 immediately after the palette report.
         *self.palette_handle.lock() = config.colors.clone();
         self.state.set_palette(config.colors.clone());
         self.state.set_shell_token(config.shell_token.clone());
@@ -1895,7 +1896,7 @@ impl Render for TerminalView {
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_scroll_wheel(cx.listener(Self::on_scroll))
+            .on_scroll(cx.listener(Self::on_scroll))
             .child(
                 canvas(
                     move |bounds, _window, _cx| bounds,

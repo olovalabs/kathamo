@@ -8,6 +8,7 @@ use crate::agent_status::{AgentOscScanner, AgentStatusReport};
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalNotifierHandle};
 use crate::shell_integration::{BlockSnapshot, ShellEvent, ShellIntegrationScanner, snapshot_term};
+use crate::theme_protocol::ThemeProtocol;
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Boundary, Column, Direction, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
@@ -80,8 +81,9 @@ impl Dimensions for TermDimensions {
 pub struct TerminalState {
     term: Arc<Mutex<Term<GpuiEventProxy>>>,
     parser: Processor,
+    theme_protocol: ThemeProtocol,
     config: Config,
-    /// Kept so protocol passthroughs (XTGETTCAP) can reply into the PTY.
+    /// Kept so protocol passthroughs can reply into the PTY.
     notifier: TerminalNotifierHandle,
     agent_osc: AgentOscScanner,
     shell: ShellIntegrationScanner,
@@ -113,6 +115,7 @@ impl TerminalState {
         Self {
             term: Arc::new(Mutex::new(term)),
             parser: Processor::new(),
+            theme_protocol: ThemeProtocol::default(),
             config,
             notifier,
             agent_osc: AgentOscScanner::default(),
@@ -158,7 +161,9 @@ impl TerminalState {
             if end > consumed {
                 let slice = &bytes[consumed..end];
                 self.shell.capture_bytes(slice);
-                self.parser.advance(&mut *term, slice);
+                self.theme_protocol.advance(
+                    &mut self.parser, &mut term, &self.notifier, &self.palette, slice,
+                );
                 consumed = end;
             }
             self.shell
@@ -170,7 +175,9 @@ impl TerminalState {
         if consumed < bytes.len() {
             let slice = &bytes[consumed..];
             self.shell.capture_bytes(slice);
-            self.parser.advance(&mut *term, slice);
+            self.theme_protocol.advance(
+                &mut self.parser, &mut term, &self.notifier, &self.palette, slice,
+            );
         }
         self.shell
             .note_mode(term.mode().contains(TermMode::ALT_SCREEN));
@@ -182,11 +189,24 @@ impl TerminalState {
     /// the throw-away terminal that re-parses captured block output.
     pub fn feed_raw(&mut self, bytes: &[u8]) {
         let mut term = self.term.lock();
-        self.parser.advance(&mut *term, bytes);
+        self.theme_protocol.advance(
+            &mut self.parser, &mut term, &self.notifier, &self.palette, bytes,
+        );
     }
 
+    /// Set the configured palette and notify subscribed applications if it changed.
+    /// The notifier's shared palette must already contain the new colors, so an
+    /// immediate OSC 11 query in response to the notification observes them.
     pub fn set_palette(&mut self, palette: ColorPalette) {
+        let changed = self.palette.ansi_colors() != palette.ansi_colors()
+            || self.palette.extended_colors() != palette.extended_colors()
+            || self.palette.foreground() != palette.foreground()
+            || self.palette.background() != palette.background()
+            || self.palette.cursor() != palette.cursor();
         self.palette = palette;
+        if changed {
+            self.theme_protocol.palette_changed(&self.notifier, &self.palette);
+        }
     }
 
     /// Only accept OSC 133 markers stamped with this token.
@@ -615,6 +635,141 @@ mod tests {
     fn state(cols: usize, rows: usize) -> TerminalState {
         let (tx, _rx) = channel();
         TerminalState::new(cols, rows, GpuiEventProxy::new(tx))
+    }
+
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Recorder {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Recorder {
+        fn take(&self) -> Vec<u8> {
+            std::mem::take(&mut *self.0.lock())
+        }
+    }
+
+    fn state_with_recorder() -> (TerminalState, Recorder, Arc<Mutex<ColorPalette>>) {
+        use crate::event::{PtyWriter, TerminalNotifier};
+        use alacritty_terminal::event::WindowSize;
+
+        let (tx, _rx) = channel();
+        let proxy = GpuiEventProxy::new(tx);
+        let recorder = Recorder::default();
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(recorder.clone())));
+        let palette = Arc::new(Mutex::new(ColorPalette::default()));
+        *proxy.notifier_slot().lock() = Some(TerminalNotifier::new(
+            writer,
+            Arc::new(Mutex::new(WindowSize {
+                num_lines: 24,
+                num_cols: 80,
+                cell_width: 8,
+                cell_height: 16,
+            })),
+            Arc::clone(&palette),
+        ));
+        (TerminalState::new(80, 24, proxy), recorder, palette)
+    }
+
+    #[test]
+    fn theme_queries_and_mode_work_across_all_fragment_boundaries() {
+        let input = b"\x1b[?2031$p\x1b[?2031h\x1b[?2031$p\x1b[?996n\x1b[?2031l\x1b[?2031$p";
+        let expected = b"\x1b[?2031;2$y\x1b[?2031;1$y\x1b[?997;1n\x1b[?2031;2$y";
+        for split in 0..=input.len() {
+            let (mut terminal, recorder, _) = state_with_recorder();
+            terminal.process_bytes(&input[..split]);
+            terminal.process_bytes(&input[split..]);
+            assert_eq!(recorder.take(), expected, "split at {split}");
+        }
+        let (mut terminal, recorder, _) = state_with_recorder();
+        for byte in input {
+            terminal.process_bytes(std::slice::from_ref(byte));
+        }
+        assert_eq!(recorder.take(), expected);
+    }
+
+    #[test]
+    fn theme_reports_follow_actual_palette_changes_and_subscription() {
+        let (mut terminal, recorder, shared_palette) = state_with_recorder();
+        let light = ColorPalette::builder().background(255, 255, 255).build();
+        *shared_palette.lock() = light.clone();
+        terminal.set_palette(light.clone());
+        assert!(recorder.take().is_empty());
+        terminal.process_bytes(b"\x1b[?996n\x1b[?2031h");
+        assert_eq!(recorder.take(), b"\x1b[?997;2n");
+        terminal.set_palette(light.clone());
+        assert!(recorder.take().is_empty());
+
+        let another_light = ColorPalette::builder()
+            .background(255, 255, 255)
+            .red(1, 2, 3)
+            .build();
+        *shared_palette.lock() = another_light.clone();
+        terminal.set_palette(another_light);
+        assert_eq!(recorder.take(), b"\x1b[?997;2n");
+        terminal.process_bytes(b"\x1b]11;?\x07");
+        assert_eq!(recorder.take(), b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+
+        *shared_palette.lock() = ColorPalette::default();
+        terminal.set_palette(ColorPalette::default());
+        assert_eq!(recorder.take(), b"\x1b[?997;1n");
+        terminal.process_bytes(b"\x1b[?2031l");
+        terminal.set_palette(light);
+        assert!(recorder.take().is_empty());
+    }
+
+    #[test]
+    fn theme_classification_uses_perceived_background_brightness() {
+        let (mut terminal, recorder, _) = state_with_recorder();
+        terminal.set_palette(ColorPalette::builder().background(0, 160, 0).build());
+        terminal.process_bytes(b"\x1b[?996n");
+        assert_eq!(recorder.take(), b"\x1b[?997;1n");
+        terminal.set_palette(ColorPalette::builder().background(255, 255, 0).build());
+        terminal.process_bytes(b"\x1b[?996n");
+        assert_eq!(recorder.take(), b"\x1b[?997;2n");
+    }
+
+    #[test]
+    fn theme_sequences_inside_control_strings_do_not_reply_or_subscribe() {
+        let (mut terminal, recorder, _) = state_with_recorder();
+        for byte in b"\x1b]0;ignored [?2031h [?2031$p [?996n\x07\
+                      \x1bPqignored [?2031h [?2031$p [?996n\x1b\\" {
+            terminal.process_bytes(std::slice::from_ref(byte));
+        }
+        assert!(recorder.take().is_empty());
+        terminal.set_palette(ColorPalette::builder().background(255, 255, 255).build());
+        assert!(recorder.take().is_empty());
+        terminal.process_bytes(b"\x1b[?2031$p\x1b[?996n");
+        assert_eq!(recorder.take(), b"\x1b[?2031;2$y\x1b[?997;2n");
+    }
+
+    #[test]
+    fn escape_interrupts_osc_before_theme_query() {
+        let (mut terminal, recorder, _) = state_with_recorder();
+        terminal.process_bytes(b"\x1b]0;unfinished\x1b[?2031h\x1b[?2031$p");
+        assert_eq!(recorder.take(), b"\x1b[?2031;1$y");
+    }
+
+    #[test]
+    fn combined_modes_and_alternate_screen_reset_preserve_subscription() {
+        let (mut terminal, recorder, _) = state_with_recorder();
+        terminal.process_bytes(b"\x1b[?1;2031;1049h\x1b[?1049l\x1b[?2031$p");
+        assert!(terminal.mode().contains(TermMode::APP_CURSOR));
+        assert!(!terminal.mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(recorder.take(), b"\x1b[?2031;1$y");
+        terminal.process_bytes(b"\x1b[?1;2031l\x1b[?2031$p");
+        assert!(!terminal.mode().contains(TermMode::APP_CURSOR));
+        assert_eq!(recorder.take(), b"\x1b[?2031;2$y");
+        terminal.process_bytes(b"\x1b[?2031h\x1bc\x1b[?2031$p");
+        assert_eq!(recorder.take(), b"\x1b[?2031;2$y");
     }
 
     #[test]

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Render streamed agent replies as Markdown, including headings, lists, links, and syntax-highlighted code blocks.
 - Redesigned agent tool calls into Zed-style collapsible cards with tool badges, inline argument summaries, status dots, line counts, bounded scrollable output blocks, and one-click output copying.
 - Collapsible thinking accordions that display live streaming thoughts while reasoning and automatically fold into compact headers when the response begins.
+- Dynamic autoscrolling for agent chat that stays pinned to the bottom across streaming updates and asynchronous Markdown layout changes, with smart user scroll-lock and a floating "Scroll to bottom" button.
 - Pre-warm agent bridge processes in the background upon switching to Agent mode or selecting a model.
 - Enable RPC idle cache warming and default to Fast mode (`low` thinking effort) for rapid responses, with an interactive `⚡ Fast`/`🧠 Deep` toggle and `/fast` / `/thinking` slash commands.
 - Model selector for rpi and Google Antigravity, with a persistent default provider/model for new panes.

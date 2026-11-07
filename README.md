@@ -112,6 +112,9 @@ Zed-style collapsible cards showing tool badges, argument summaries, status indi
 and output line counts. Expanding a tool card displays formatted arguments, a bounded
 scrollable output window, and a one-click output copy action. When the provider
 emits retry or compaction notices, these appear as clean activity updates.
+Chat autoscrolling dynamically stays pinned to the bottom during live streaming and
+asynchronous Markdown layout changes; scrolling up pauses autoscroll so you can read
+earlier history without being yanked down, showing a floating "Scroll to bottom" button.
 Agent processes are pre-warmed when entering Agent mode or choosing a model, and
 idle cache warming is enabled so prompts do not wait for cold starts. A **⚡ Fast**
 toggle in the bottom bar (or `/fast`, `/thinking <level>`) configures low reasoning

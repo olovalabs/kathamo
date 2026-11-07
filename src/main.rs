@@ -4,9 +4,9 @@ use gpui::{
     Animation, AnimationExt as _, App, AppContext, Bounds, ClipboardEntry, Context, CursorStyle,
     Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _, Transformation,
-    Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions, actions, deferred,
-    div, img, percentage, px, relative, rgba, size, svg,
+    ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _,
+    Transformation, Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
+    actions, deferred, div, img, percentage, px, relative, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
@@ -444,6 +444,7 @@ struct PaneChat {
     selected_model: Option<agent_auth::AgentModel>,
     models: HashMap<agent_auth::AgentModel, ModelChat>,
     fast_mode: bool,
+    pub autoscroll: bool,
 }
 
 impl Default for PaneChat {
@@ -462,6 +463,7 @@ impl Default for PaneChat {
             selected_model: None,
             models: HashMap::new(),
             fast_mode: true,
+            autoscroll: true,
         }
     }
 }
@@ -3858,7 +3860,7 @@ impl AppState {
                         let mut closed = false;
                         for event in bridge.poll() {
                             changed = true;
-                            if pane.chat.selected_model.is_none() {
+                            if pane.chat.selected_model.is_none() && pane.chat.autoscroll {
                                 pane.chat.scroll.scroll_to_bottom();
                             }
                             match event {
@@ -3885,7 +3887,9 @@ impl AppState {
                             let mut closed = false;
                             for event in bridge.poll() {
                                 changed = true;
-                                if pane.chat.selected_model.as_ref() == Some(model) {
+                                if pane.chat.selected_model.as_ref() == Some(model)
+                                    && pane.chat.autoscroll
+                                {
                                     pane.chat.scroll.scroll_to_bottom();
                                 }
                                 match event {
@@ -4072,6 +4076,7 @@ impl AppState {
                 }
                 Err(error) => chat.messages.push(ChatMessage::new(ChatRole::Error, error)),
             }
+            pane.chat.autoscroll = true;
             pane.chat.scroll.scroll_to_bottom();
             cx.notify();
             return;
@@ -4105,6 +4110,7 @@ impl AppState {
                 .messages
                 .push(ChatMessage::new(ChatRole::Error, error)),
         }
+        pane.chat.autoscroll = true;
         pane.chat.scroll.scroll_to_bottom();
         cx.notify();
     }
@@ -6766,6 +6772,17 @@ impl AppState {
         let tokens = self.tokens(cx);
         let conversation = format!("{:?}", pane.chat.selected_model);
         let pane_id = pane.id;
+        let is_autoscroll = pane.chat.autoscroll;
+        let offset_y = pane.chat.scroll.offset().y;
+        let max_height = pane.chat.scroll.max_offset().y;
+        let dist_from_bottom = max_height + offset_y;
+
+        if is_autoscroll {
+            if max_height <= px(48.0) || dist_from_bottom <= px(48.0) {
+                pane.chat.scroll.scroll_to_bottom();
+            }
+        }
+
         let messages = pane.chat.visible_messages().iter().enumerate().map(|(index, message)| {
             match message.role {
                 ChatRole::User => {
@@ -7211,11 +7228,32 @@ impl AppState {
                 }
             }
         }).collect::<Vec<_>>();
-        div()
-            .id(("agent-chat", pane.id))
+        let chat_view = div()
+            .id(("agent-chat", pane_id))
             .size_full()
             .track_scroll(&pane.chat.scroll)
             .overflow_y_scrollbar()
+            .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
+                if let Some(pane) = this.pane_mut(pane_id) {
+                    let line_height = window.line_height();
+                    let delta = event.delta.pixel_delta(line_height);
+                    let offset_y = pane.chat.scroll.offset().y;
+                    let max_height = pane.chat.scroll.max_offset().y;
+                    let dist = max_height + offset_y;
+                    if delta.y > px(0.0) && dist > px(24.0) {
+                        if pane.chat.autoscroll {
+                            pane.chat.autoscroll = false;
+                            cx.notify();
+                        }
+                    } else if dist <= px(24.0) || (delta.y < px(0.0) && dist <= px(48.0)) {
+                        if !pane.chat.autoscroll {
+                            pane.chat.autoscroll = true;
+                            pane.chat.scroll.scroll_to_bottom();
+                            cx.notify();
+                        }
+                    }
+                }
+            }))
             .p(px(16.0))
             .flex()
             .flex_col()
@@ -7245,9 +7283,59 @@ impl AppState {
                                 .child("Waiting for agent updates…"),
                         ),
                 )
-            })
-    }
+            });
 
+        let scroll_to_bottom_btn = if !is_autoscroll && dist_from_bottom > px(32.0) {
+            Some(
+                div()
+                    .id(("scroll-to-bottom-btn", pane_id))
+                    .absolute()
+                    .bottom(px(16.0))
+                    .right(px(24.0))
+                    .cursor(CursorStyle::PointingHand)
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded_full()
+                    .bg(tokens.pane_header_bg)
+                    .border_1()
+                    .border_color(tokens.border)
+                    .shadow_md()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(tokens.text_primary)
+                    .hover(|s| s.bg(tokens.sidebar_item_hover))
+                    .child(
+                        svg()
+                            .path("icons/chevron-down.svg")
+                            .size(px(11.0))
+                            .text_color(tokens.text_primary),
+                    )
+                    .child("Scroll to bottom")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(pane) = this.pane_mut(pane_id) {
+                                pane.chat.autoscroll = true;
+                                pane.chat.scroll.scroll_to_bottom();
+                                cx.notify();
+                            }
+                        }),
+                    ),
+            )
+        } else {
+            None
+        };
+
+        div()
+            .relative()
+            .size_full()
+            .child(chat_view)
+            .children(scroll_to_bottom_btn)
+    }
     fn render_terminal_pane(
         &self,
         pane: &TerminalPane,
@@ -11178,6 +11266,60 @@ mod kathamo_bottom_input_tests {
             let last_msg = pane.chat.visible_messages().last().unwrap();
             assert_eq!(last_msg.role, ChatRole::Status);
             assert!(last_msg.text.contains("low"));
+        });
+    }
+
+    #[test]
+    fn agent_dynamic_autoscroll_and_user_lock() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(id, true, window, cx);
+            let pane = s.pane_mut(id).unwrap();
+            assert!(pane.chat.autoscroll, "autoscroll must be true by default");
+            // Add several messages so the container has scrollable content
+            for i in 0..15 {
+                pane.chat.messages.push(ChatMessage::new(
+                    if i % 2 == 0 {
+                        ChatRole::User
+                    } else {
+                        ChatRole::Assistant
+                    },
+                    format!(
+                        "Message {i} with several lines of text to ensure vertical scrollability."
+                    ),
+                ));
+            }
+        });
+        cx.draw_frame()
+            .expect("draw chat frame with autoscroll pinned");
+
+        // User scrolls up to read history -> unpins autoscroll
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = s.pane_mut(id).unwrap();
+            pane.chat.autoscroll = false;
+            cx.notify();
+        });
+        cx.draw_frame()
+            .expect("draw chat frame with autoscroll unpinned");
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            assert!(!pane.chat.autoscroll, "autoscroll should be unpinned");
+        });
+
+        // Submitting a new prompt must re-pin autoscroll
+        cx.update_window_entity(&state, |s, window, cx| {
+            let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
+            input.update(cx, |input, cx| input.set_value("new prompt", window, cx));
+            s.execute_pane_input(id, window, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            assert!(
+                pane.chat.autoscroll,
+                "sending a new prompt must re-pin autoscroll to the bottom"
+            );
         });
     }
 

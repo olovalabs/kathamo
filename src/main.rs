@@ -7228,9 +7228,9 @@ impl AppState {
         }).collect::<Vec<_>>();
         let chat_view = div()
             .id(("agent-chat", pane_id))
+            .size_full()
             .track_scroll(&pane.chat.scroll)
             .overflow_y_scroll()
-            .vertical_scrollbar(&pane.chat.scroll)
             .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
                 if let Some(pane) = this.pane_mut(pane_id) {
                     let line_height = window.line_height();
@@ -7330,10 +7330,22 @@ impl AppState {
             None
         };
 
+        let scrollbar = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .child(
+                gpui_component::scroll::Scrollbar::vertical(&pane.chat.scroll)
+                    .id(("agent-chat-scrollbar", pane_id)),
+            );
+
         div()
             .relative()
             .size_full()
             .child(chat_view)
+            .child(scrollbar)
             .children(scroll_to_bottom_btn)
     }
     fn render_terminal_pane(
@@ -11275,6 +11287,7 @@ mod kathamo_bottom_input_tests {
         let (mut cx, state) = open_app(&mut app);
         let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
         cx.update_window_entity(&state, |s, window, cx| {
+            s.set_theme_preference(ThemePreference::Dark, Some(window), cx);
             s.set_chat_mode(id, true, window, cx);
             let pane = s.pane_mut(id).unwrap();
             assert!(pane.chat.autoscroll, "autoscroll must be true by default");
@@ -11331,6 +11344,10 @@ mod kathamo_bottom_input_tests {
         cx.update_window_entity(&state, |s, _, cx| {
             let pane = s.pane_mut(id).unwrap();
             pane.chat.autoscroll = false;
+            let max_y = pane.chat.scroll.max_offset().y;
+            pane.chat
+                .scroll
+                .set_offset(point(px(0.), -max_y + px(400.0)));
             cx.notify();
         });
         cx.draw_frame()
@@ -11353,6 +11370,7 @@ mod kathamo_bottom_input_tests {
                 "sending a new prompt must re-pin autoscroll to the bottom"
             );
         });
+        cx.draw_frame().unwrap();
     }
 
     #[test]

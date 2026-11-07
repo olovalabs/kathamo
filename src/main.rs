@@ -3,17 +3,18 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt as _, App, AppContext, Bounds, ClipboardEntry, Context, CursorStyle,
     Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
-    ScrollEvent, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _,
-    Transformation, Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
-    actions, deferred, div, img, percentage, px, relative, rgba, size, svg,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Rems,
+    Render, ScrollEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
+    StyledImage as _, Transformation, Window, WindowBounds, WindowControlArea, WindowDecorations,
+    WindowOptions, actions, deferred, div, img, percentage, px, relative, rems, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
+use gpui_component::highlighter::HighlightTheme;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::text::TextView;
+use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{ActiveTheme as _, Root, Sizable as _, TitleBar};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -164,21 +165,30 @@ impl ChatMessage {
     }
 }
 
+const TOOL_TEXT_PREVIEW_LIMIT: usize = 600;
+
+/// Unicode-safe clipping: never slices through a multi-byte character.
+fn clip_tool_text(text: &str, limit: usize) -> (String, bool) {
+    let mut chars = text.chars();
+    let mut shown: String = chars.by_ref().take(limit).collect();
+    let truncated = chars.next().is_some();
+    if truncated {
+        shown.push('…');
+    }
+    (shown, truncated)
+}
+
 fn format_tool_summary(_name: &str, input: &str) -> String {
     let input = input.trim();
     if input.is_empty() {
         return String::new();
     }
+    let clip = |text: &str| clip_tool_text(text, 60).0;
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
         if let Some(map) = value.as_object() {
             if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
                 let first_line = cmd.lines().next().unwrap_or("").trim();
-                let truncated = if first_line.len() > 60 {
-                    format!("{}…", &first_line[..60])
-                } else {
-                    first_line.to_string()
-                };
-                return format!("$ {truncated}");
+                return format!("$ {}", clip(first_line));
             }
             if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
                 if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
@@ -206,21 +216,11 @@ fn format_tool_summary(_name: &str, input: &str) -> String {
                 parts.push(format!("{k}: {val_str}"));
             }
             if !parts.is_empty() {
-                let joined = parts.join(", ");
-                return if joined.len() > 60 {
-                    format!("{}…", &joined[..60])
-                } else {
-                    joined
-                };
+                return clip(&parts.join(", "));
             }
         }
     }
-    let first = input.lines().next().unwrap_or("").trim();
-    if first.len() > 60 {
-        format!("{}…", &first[..60])
-    } else {
-        first.to_string()
-    }
+    clip(input.lines().next().unwrap_or("").trim())
 }
 
 fn update_chat_tool(
@@ -246,13 +246,8 @@ fn update_chat_tool(
     if let Some(tool) = existing {
         tool.output = output;
         tool.state = state;
-        if state == ToolState::Completed {
-            tool.expanded = false;
-        } else if state == ToolState::Failed {
-            tool.expanded = true;
-        }
+        tool.expanded = true;
     } else {
-        let expanded = state != ToolState::Completed;
         messages.push(ChatMessage {
             role: ChatRole::Tool,
             text: String::new(),
@@ -262,9 +257,9 @@ fn update_chat_tool(
                 input: String::new(),
                 output,
                 state,
-                expanded,
+                expanded: true,
             }),
-            expanded,
+            expanded: true,
         });
     }
 }
@@ -278,7 +273,7 @@ fn finish_chat_tools(messages: &mut [ChatMessage]) {
         .filter(|tool| tool.state == ToolState::Running)
     {
         tool.state = ToolState::Unknown;
-        tool.expanded = false;
+        tool.expanded = true;
     }
 }
 
@@ -3496,6 +3491,16 @@ impl AppState {
                 } else if msg.role == ChatRole::Thinking {
                     msg.expanded = !msg.expanded;
                     cx.notify();
+                }
+            }
+        }
+    }
+
+    fn copy_chat_tool_input(&self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_ref(pane_id) {
+            if let Some(msg) = pane.chat.visible_messages().get(index) {
+                if let Some(tool) = &msg.tool {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(tool.input.clone()));
                 }
             }
         }
@@ -7032,6 +7037,21 @@ impl AppState {
                                                             .child(tool.name.clone())
                                                     )
                                             )
+                                            .when_some(tool.id.as_ref(), |view, id| {
+                                                view.child(
+                                                    div()
+                                                        .px(px(5.0))
+                                                        .py(px(1.5))
+                                                        .rounded(px(3.0))
+                                                        .bg(tokens.titlebar_bg)
+                                                        .border_1()
+                                                        .border_color(tokens.border_subtle)
+                                                        .font_family(MONO_FONT)
+                                                        .text_size(px(10.0))
+                                                        .text_color(tokens.text_muted)
+                                                        .child(format!("#{id}")),
+                                                )
+                                            })
                                             .when(!summary.is_empty(), |view| {
                                                 view.child(
                                                     div()
@@ -7039,9 +7059,9 @@ impl AppState {
                                                         .text_size(px(11.0))
                                                         .text_color(tokens.text_secondary)
                                                         .truncate()
-                                                        .child(summary)
+                                                        .child(summary),
                                                 )
-                                            })
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -7049,31 +7069,44 @@ impl AppState {
                                             .items_center()
                                             .gap(px(8.0))
                                             .flex_shrink_0()
-                                            .when(line_count > 0 && !is_expanded, |view| {
+                                            .when(line_count > 0, |view| {
                                                 view.child(
                                                     div()
                                                         .text_size(px(11.0))
                                                         .text_color(tokens.text_muted)
-                                                        .child(format!("{line_count} {}", if line_count == 1 { "line" } else { "lines" }))
+                                                        .child(format!(
+                                                            "{line_count} {}",
+                                                            if line_count == 1 { "line" } else { "lines" }
+                                                        )),
                                                 )
                                             })
                                             .child(
                                                 div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(tokens.pane_bg)
+                                                    .border_1()
+                                                    .border_color(tokens.border_subtle)
                                                     .text_size(px(11.0))
+                                                    .font_weight(gpui::FontWeight::BOLD)
                                                     .text_color(match tool.state {
                                                         ToolState::Running => tokens.block_warning,
-                                                        ToolState::Completed => tokens.text_muted,
+                                                        ToolState::Completed => tokens.block_success,
                                                         ToolState::Failed => tokens.block_failure,
                                                         ToolState::Unknown => tokens.text_muted,
                                                     })
                                                     .child(match tool.state {
-                                                        ToolState::Running => "Running…",
-                                                        ToolState::Completed => "Completed",
-                                                        ToolState::Failed => "Failed",
+                                                        ToolState::Running => "● Running…",
+                                                        ToolState::Completed => "✓ Completed",
+                                                        ToolState::Failed => "✗ Failed",
                                                         ToolState::Unknown => "Done",
-                                                    })
-                                            )
-                                    )
+                                                    }),
+                                            ),
+                                    ),
                             )
                             .when(is_expanded, |card| {
                                 card
@@ -7087,14 +7120,49 @@ impl AppState {
                                             .flex_col()
                                             .gap(px(8.0))
                                             .when(!tool.input.is_empty(), |view| {
+                                                let display_input = serde_json::from_str::<serde_json::Value>(&tool.input)
+                                                    .ok()
+                                                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                                                    .unwrap_or_else(|| tool.input.clone());
                                                 view.child(
                                                     div().flex().flex_col().gap(px(4.0))
                                                         .child(
                                                             div()
-                                                                .text_size(px(10.0))
-                                                                .font_weight(gpui::FontWeight::BOLD)
-                                                                .text_color(tokens.text_muted)
-                                                                .child("ARGUMENTS")
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(10.0))
+                                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                                        .text_color(tokens.text_muted)
+                                                                        .child("ARGUMENTS / INPUT"),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .id(SharedString::from(format!("copy-tool-input-{pane_id}-{index}")))
+                                                                        .cursor(CursorStyle::PointingHand)
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .gap(px(4.0))
+                                                                        .text_size(px(11.0))
+                                                                        .text_color(tokens.text_muted)
+                                                                        .hover(move |s| s.text_color(tokens.text_primary))
+                                                                        .child(
+                                                                            svg()
+                                                                                .path("icons/copy.svg")
+                                                                                .size(px(11.0))
+                                                                                .text_color(tokens.text_muted),
+                                                                        )
+                                                                        .child("Copy")
+                                                                        .on_mouse_down(
+                                                                            MouseButton::Left,
+                                                                            cx.listener(move |this, _, _, cx| {
+                                                                                cx.stop_propagation();
+                                                                                this.copy_chat_tool_input(pane_id, index, cx);
+                                                                            }),
+                                                                        ),
+                                                                ),
                                                         )
                                                         .child(
                                                             div()
@@ -7105,10 +7173,10 @@ impl AppState {
                                                                 .border_1()
                                                                 .border_color(tokens.border_subtle)
                                                                 .font_family(MONO_FONT)
-                                                                .text_size(px(11.0))
+                                                                .text_size(px(11.5))
                                                                 .text_color(tokens.text_primary)
-                                                                .child(tool.input.clone())
-                                                        )
+                                                                .child(display_input),
+                                                        ),
                                                 )
                                             })
                                             .when(!tool.output.is_empty() || tool.state == ToolState::Running, |view| {
@@ -7161,7 +7229,7 @@ impl AppState {
                                                         .child(
                                                             div()
                                                                 .w_full()
-                                                                .max_h(px(260.0))
+                                                                .max_h(px(380.0))
                                                                 .overflow_y_scrollbar()
                                                                 .p(px(8.0))
                                                                 .rounded(px(4.0))
@@ -7169,7 +7237,7 @@ impl AppState {
                                                                 .border_1()
                                                                 .border_color(tokens.border_subtle)
                                                                 .font_family(MONO_FONT)
-                                                                .text_size(px(11.0))
+                                                                .text_size(px(11.5))
                                                                 .text_color(if tool.state == ToolState::Failed {
                                                                     tokens.block_failure
                                                                 } else {
@@ -7189,10 +7257,41 @@ impl AppState {
                     } else {
                         div()
                             .w_full()
-                            .font_family(MONO_FONT)
-                            .text_size(px(12.0))
-                            .text_color(tokens.text_secondary)
-                            .child(message.text.clone())
+                            .p(px(10.0))
+                            .rounded(px(6.0))
+                            .bg(tokens.pane_header_bg)
+                            .border_1()
+                            .border_color(tokens.border_subtle)
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .size(px(6.0))
+                                            .rounded_full()
+                                            .bg(tokens.text_muted),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(tokens.text_secondary)
+                                            .child("Tool Activity"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .font_family(MONO_FONT)
+                                    .text_size(px(12.0))
+                                    .text_color(tokens.text_primary)
+                                    .child(message.text.clone()),
+                            )
                             .into_any_element()
                     }
                 }

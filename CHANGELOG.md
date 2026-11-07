@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Render streamed agent replies as Markdown, including headings, lists, links, and syntax-highlighted code blocks.
-- Redesigned agent tool calls into Zed-style collapsible cards with tool badges, inline argument summaries, status dots, line counts, bounded scrollable output blocks, and one-click output copying.
+- Display all tool call details in rich Zed-style cards showing tool badges, call ID tags, inline argument summaries, status indicators, line counts, pretty-printed arguments with a copy button, and bounded scrollable outputs with one-click copying.
 - Collapsible thinking accordions that display live streaming thoughts while reasoning and automatically fold into compact headers when the response begins.
 - Dynamic autoscrolling for agent chat that stays pinned to the bottom across streaming updates and asynchronous Markdown layout changes, with smart user scroll-lock and a floating "Scroll to bottom" button.
 - Pre-warm agent bridge processes in the background upon switching to Agent mode or selecting a model.

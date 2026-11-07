@@ -107,10 +107,10 @@ Ctrl+C cancels a running request. Select **Terminal** to return to the shell;
 each pane keeps its own agent conversation while it remains open. Answer text
 and reasoning/thinking appear incrementally as the agent sends them, rendered as
 Markdown with syntax-highlighted code blocks. Thinking blocks fold into compact,
-clickable accordions once the agent begins answering. Tool calls are presented in
-Zed-style collapsible cards showing tool badges, argument summaries, status indicators,
-and output line counts. Expanding a tool card displays formatted arguments, a bounded
-scrollable output window, and a one-click output copy action. When the provider
+clickable accordions once the agent begins answering. Tool calls display all execution
+details by default in rich cards: tool badges, call IDs (`#id`), inline argument summaries,
+status badges, and line counts. Cards present pretty-printed input parameters and
+streaming output blocks with dedicated one-click copy buttons for both arguments and results.
 emits retry or compaction notices, these appear as clean activity updates.
 Chat autoscrolling dynamically stays pinned to the bottom during live streaming and
 asynchronous Markdown layout changes; scrolling up pauses autoscroll so you can read

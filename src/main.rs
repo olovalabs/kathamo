@@ -7053,6 +7053,18 @@ impl AppState {
         } else {
             rgba(0x0000000a).into()
         };
+        let mode_active_bg: Hsla = if tokens.is_dark {
+            rgba(0x1e1f22ff).into()
+        } else {
+            rgba(0xffffffff).into()
+        };
+        let mode_active_icon: Hsla = if tokens.is_dark {
+            rgba(0xe5e6fcff).into()
+        } else {
+            tokens.text_primary
+        };
+        let terminal_mode_active = !pane.chat.active;
+        let agent_mode_active = pane.chat.active;
         let dir_icon_color: Hsla = if tokens.is_dark {
             rgba(0xb2b2c3ff).into()
         } else {
@@ -7254,30 +7266,115 @@ impl AppState {
                     .items_center()
                     .gap(px(8.0))
                     .child(
-                        div().id(("input-mode-terminal", pane_id))
-                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
-                            .bg(if !pane.chat.active { badge_bg } else { bar_bg })
-                            .text_size(px(12.0))
-                            .text_color(if !pane.chat.active { tokens.text_primary } else { tokens.text_muted })
-                            .cursor(CursorStyle::PointingHand)
-                            .child("Terminal")
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.set_chat_mode(pane_id, false, window, cx);
-                            })),
-                    )
-                    .child(
-                        div().id(("input-mode-agent", pane_id))
-                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
-                            .bg(if pane.chat.active { badge_bg } else { bar_bg })
-                            .text_size(px(12.0))
-                            .text_color(if pane.chat.active { tokens.text_primary } else { tokens.text_muted })
-                            .cursor(CursorStyle::PointingHand)
-                            .child("Agent")
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.set_chat_mode(pane_id, true, window, cx);
-                            })),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .p(px(2.0))
+                            .rounded(px(7.0))
+                            .border_1()
+                            .border_color(badge_border)
+                            .bg(badge_bg)
+                            .child(
+                                div()
+                                    .id(("input-mode-terminal", pane_id))
+                                    .debug_selector(|| "input-mode-terminal-pill".to_string())
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .rounded(px(5.0))
+                                    .bg(if !pane.chat.active {
+                                        mode_active_bg
+                                    } else {
+                                        badge_bg
+                                    })
+                                    .text_size(px(12.0))
+                                    .text_color(if !pane.chat.active {
+                                        tokens.text_primary
+                                    } else {
+                                        tokens.text_muted
+                                    })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |style| {
+                                        if terminal_mode_active {
+                                            style
+                                        } else {
+                                            style.bg(tokens.pane_header_btn_hover)
+                                        }
+                                    })
+                                    .child(
+                                        svg()
+                                            .path("icons/terminal-bottom.svg")
+                                            .size(px(13.0))
+                                            .text_color(if !pane.chat.active {
+                                                mode_active_icon
+                                            } else {
+                                                tokens.text_muted
+                                            }),
+                                    )
+                                    .when(terminal_mode_active, |pill| {
+                                        pill.child(div().child("Terminal"))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.set_chat_mode(pane_id, false, window, cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id(("input-mode-agent", pane_id))
+                                    .debug_selector(|| "input-mode-agent-pill".to_string())
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .h(px(24.0))
+                                    .px(px(8.0))
+                                    .rounded(px(5.0))
+                                    .bg(if pane.chat.active {
+                                        mode_active_bg
+                                    } else {
+                                        badge_bg
+                                    })
+                                    .text_size(px(12.0))
+                                    .text_color(if pane.chat.active {
+                                        tokens.text_primary
+                                    } else {
+                                        tokens.text_muted
+                                    })
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |style| {
+                                        if agent_mode_active {
+                                            style
+                                        } else {
+                                            style.bg(tokens.pane_header_btn_hover)
+                                        }
+                                    })
+                                    .child(
+                                        svg()
+                                            .path("icons/sparkle.svg")
+                                            .size(px(13.0))
+                                            .text_color(if pane.chat.active {
+                                                mode_active_icon
+                                            } else {
+                                                tokens.text_muted
+                                            }),
+                                    )
+                                    .when(agent_mode_active, |pill| {
+                                        pill.child(div().child("Agent"))
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.set_chat_mode(pane_id, true, window, cx);
+                                        }),
+                                    ),
+                            ),
                     )
                     .when(pane.chat.active, |row| row.child(
                         div().id(("select-agent-model", pane_id))
@@ -12380,6 +12477,57 @@ mod kathamo_bottom_input_tests {
     use super::*;
     use gpui::{VisualContext, point};
     use resize_tests::{DrawFrame, TestAppContext, open_app};
+
+    #[test]
+    fn input_mode_pills_show_label_only_on_the_active_tab() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.draw_frame().expect("draw terminal mode");
+
+        let terminal_terminal_mode = cx
+            .debug_bounds("input-mode-terminal-pill")
+            .expect("terminal pill renders");
+        let agent_terminal_mode = cx
+            .debug_bounds("input-mode-agent-pill")
+            .expect("agent pill renders");
+        assert!(
+            terminal_terminal_mode.size.width > px(60.0),
+            "the active terminal pill shows its icon and label"
+        );
+        assert!(
+            agent_terminal_mode.size.width < px(40.0),
+            "the inactive agent pill is icon only"
+        );
+
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+        });
+        cx.draw_frame().expect("draw agent mode");
+
+        let terminal_agent_mode = cx
+            .debug_bounds("input-mode-terminal-pill")
+            .expect("terminal pill renders");
+        let agent_agent_mode = cx
+            .debug_bounds("input-mode-agent-pill")
+            .expect("agent pill renders");
+        assert!(
+            terminal_agent_mode.size.width < px(40.0),
+            "the inactive terminal pill is icon only"
+        );
+        assert!(
+            agent_agent_mode.size.width > px(60.0),
+            "the active agent pill shows its icon and label"
+        );
+        assert!(
+            terminal_terminal_mode.size.width > terminal_agent_mode.size.width,
+            "the terminal label appears only while terminal mode is active"
+        );
+        assert!(
+            agent_agent_mode.size.width > agent_terminal_mode.size.width,
+            "the agent label appears only while agent mode is active"
+        );
+    }
 
     #[test]
     fn streamed_thinking_and_answers_keep_their_boundaries() {

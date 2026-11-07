@@ -116,7 +116,6 @@ impl PartialEq for ImageNode {
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct InlineNode {
-
     pub(crate) text: SharedString,
     pub(crate) image: Option<ImageNode>,
 
@@ -313,7 +312,6 @@ impl PartialEq for CodeBlock {
 }
 
 impl CodeBlock {
-
     pub fn lang(&self) -> Option<SharedString> {
         self.lang.clone()
     }
@@ -365,10 +363,14 @@ impl CodeBlock {
         let style = &node_cx.style;
 
         div()
+            .w_full()
+            .min_w_0()
             .when(!options.is_last, |this| this.pb(style.paragraph_gap))
             .child(
                 div()
-                    .id("codeblock")
+                    .id(("codeblock", options.ix))
+                    .w_full()
+                    .min_w_0()
                     .p_3()
                     .rounded(cx.theme().radius)
                     .bg(cx.theme().muted)
@@ -414,7 +416,6 @@ impl NodeContext {
 impl PartialEq for NodeContext {
     fn eq(&self, other: &Self) -> bool {
         self.link_refs == other.link_refs && self.style == other.style
-
     }
 }
 
@@ -432,7 +433,6 @@ pub(crate) enum Node {
         children: Vec<Node>,
     },
     List {
-
         children: Vec<Node>,
         ordered: bool,
     },
@@ -677,6 +677,8 @@ impl Paragraph {
 
 #[derive(Default, Clone, Copy)]
 struct NodeRenderOptions {
+    /// Index of this block among its siblings; used to keep element IDs unique.
+    ix: usize,
     in_list: bool,
     todo: bool,
     ordered: bool,
@@ -736,7 +738,6 @@ impl Paragraph {
 }
 
 impl Node {
-
     #[allow(dead_code)]
     pub(crate) fn to_markdown(&self) -> String {
         match self {
@@ -868,6 +869,45 @@ impl Node {
 }
 
 impl Node {
+    fn render_list_item_row(
+        content: AnyElement,
+        ix: usize,
+        options: NodeRenderOptions,
+        checked: Option<bool>,
+        cx: &mut App,
+    ) -> Div {
+        h_flex()
+            .w_full()
+            .flex_1()
+            .min_w_0()
+            .relative()
+            .items_start()
+            .content_start()
+            .when(!options.todo && checked.is_none(), |this| {
+                this.child(list_item_prefix(ix, options.ordered, options.depth))
+            })
+            .when_some(checked, |this, checked| {
+                this.child(
+                    div()
+                        .flex()
+                        .mt(rems(0.4))
+                        .mr_1p5()
+                        .size(rems(0.875))
+                        .items_center()
+                        .justify_center()
+                        .rounded(cx.theme().radius.half())
+                        .border_1()
+                        .border_color(cx.theme().primary)
+                        .text_color(cx.theme().primary_foreground)
+                        .when(checked, |this| {
+                            this.bg(cx.theme().primary)
+                                .child(Icon::new(IconName::Check).size_2().text_xs())
+                        }),
+                )
+            })
+            .child(div().flex_1().min_w_0().overflow_hidden().child(content))
+    }
+
     fn render_list_item(
         item: &Node,
         ix: usize,
@@ -882,7 +922,9 @@ impl Node {
                 spread,
                 checked,
             } => v_flex()
-                .id("li")
+                .id(("li", options.ix))
+                .w_full()
+                .min_w_0()
                 .when(*spread, |this| this.child(div()))
                 .children({
                     let mut items: Vec<Div> = Vec::with_capacity(children.len());
@@ -895,6 +937,7 @@ impl Node {
 
                                 let text = child.render_block(
                                     NodeRenderOptions {
+                                        ix: child_ix,
                                         depth: options.depth + 1,
                                         todo: checked.is_some(),
                                         is_last: true,
@@ -905,57 +948,31 @@ impl Node {
                                     cx,
                                 );
 
+                                // Continuation paragraph: stack below the previous row,
+                                // indented to align with the text column past the marker.
                                 if last_not_list {
-                                    if let Some(item_item) = items.last_mut() {
-                                        item_item.extend(vec![
-                                            div().overflow_hidden().child(text).into_any_element(),
-                                        ]);
+                                    if let Some(preceding_row) = items.pop() {
+                                        items.push(
+                                            v_flex().child(preceding_row).child(
+                                                div()
+                                                    .w_full()
+                                                    .pl(rems(1.))
+                                                    .overflow_hidden()
+                                                    .child(text),
+                                            ),
+                                        );
                                         continue;
                                     }
                                 }
 
-                                items.push(
-                                    h_flex()
-                                        .flex_1()
-                                        .relative()
-                                        .items_start()
-                                        .content_start()
-                                        .when(!options.todo && checked.is_none(), |this| {
-                                            this.child(list_item_prefix(
-                                                ix,
-                                                options.ordered,
-                                                options.depth,
-                                            ))
-                                        })
-                                        .when_some(*checked, |this, checked| {
-
-                                            this.child(
-                                                div()
-                                                    .flex()
-                                                    .mt(rems(0.4))
-                                                    .mr_1p5()
-                                                    .size(rems(0.875))
-                                                    .items_center()
-                                                    .justify_center()
-                                                    .rounded(cx.theme().radius.half())
-                                                    .border_1()
-                                                    .border_color(cx.theme().primary)
-                                                    .text_color(cx.theme().primary_foreground)
-                                                    .when(checked, |this| {
-                                                        this.bg(cx.theme().primary).child(
-                                                            Icon::new(IconName::Check)
-                                                                .size_2()
-                                                                .text_xs(),
-                                                        )
-                                                    }),
-                                            )
-                                        })
-                                        .child(div().overflow_hidden().child(text)),
-                                );
+                                items.push(Self::render_list_item_row(
+                                    text, ix, options, *checked, cx,
+                                ));
                             }
                             Node::List { .. } => {
                                 items.push(div().ml(rems(1.)).child(child.render_block(
                                     NodeRenderOptions {
+                                        ix: child_ix,
                                         depth: options.depth + 1,
                                         todo: checked.is_some(),
                                         is_last: true,
@@ -965,6 +982,40 @@ impl Node {
                                     window,
                                     cx,
                                 )));
+                            }
+                            Node::Root { .. }
+                            | Node::Heading { .. }
+                            | Node::Blockquote { .. }
+                            | Node::CodeBlock(_)
+                            | Node::Table(_)
+                            | Node::Divider => {
+                                let block = child.render_block(
+                                    NodeRenderOptions {
+                                        ix: child_ix,
+                                        depth: options.depth + 1,
+                                        todo: checked.is_some(),
+                                        is_last: true,
+                                        ..options
+                                    },
+                                    node_cx,
+                                    window,
+                                    cx,
+                                );
+
+                                if child_ix == 0 {
+                                    items.push(Self::render_list_item_row(
+                                        block, ix, options, *checked, cx,
+                                    ));
+                                } else {
+                                    items.push(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .pl(rems(1.))
+                                            .overflow_hidden()
+                                            .child(block),
+                                    );
+                                }
                             }
                             _ => {}
                         }
@@ -1012,16 +1063,19 @@ impl Node {
                     div()
                         .id("table")
                         .w_full()
+                        .min_w_0()
                         .border_1()
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
+                        .overflow_hidden()
                         .children({
                             let mut rows = Vec::with_capacity(table.children.len());
                             for (row_ix, row) in table.children.iter().enumerate() {
                                 rows.push(
                                     div()
-                                        .id("row")
+                                        .id(("row", row_ix))
                                         .w_full()
+                                        .min_w_0()
                                         .when(row_ix < table.children.len() - 1, |this| {
                                             this.border_b_1()
                                         })
@@ -1041,8 +1095,11 @@ impl Node {
 
                                                 cells.push(
                                                     div()
-                                                        .id("cell")
+                                                        .id(("cell", row_ix * 64 + ix))
                                                         .flex()
+                                                        .min_w_0()
+                                                        .min_w_16()
+                                                        .overflow_hidden()
                                                         .when(
                                                             align == ColumnumnAlign::Center,
                                                             |this| this.justify_center(),
@@ -1058,7 +1115,6 @@ impl Node {
                                                             this.border_r_1()
                                                                 .border_color(cx.theme().border)
                                                         })
-                                                        .truncate()
                                                         .child(
                                                             cell.children
                                                                 .render(node_cx, window, cx),
@@ -1110,7 +1166,16 @@ impl Node {
         gpui::list(list_state, move |ix, window, cx| {
             let is_last = ix + 1 == children.len();
             children[ix]
-                .render_block(options.is_last(is_last), &node_cx, window, cx)
+                .render_block(
+                    NodeRenderOptions {
+                        ix,
+                        is_last,
+                        ..options
+                    },
+                    &node_cx,
+                    window,
+                    cx,
+                )
                 .into_any_element()
         })
         .size_full()
@@ -1133,14 +1198,14 @@ impl Node {
         match self {
             Node::Root { children } => div()
                 .id("div")
-                .children(
-                    children
-                        .into_iter()
-                        .map(move |node| node.render_block(options, node_cx, window, cx)),
-                )
+                .children(children.into_iter().enumerate().map(move |(ix, node)| {
+                    node.render_block(NodeRenderOptions { ix, ..options }, node_cx, window, cx)
+                }))
                 .into_any_element(),
             Node::Paragraph(paragraph) => div()
-                .id("p")
+                .id(("p", options.ix))
+                .w_full()
+                .min_w_0()
                 .pb(mb)
                 .child(paragraph.render(node_cx, window, cx))
                 .into_any_element(),
@@ -1160,8 +1225,10 @@ impl Node {
                     text_size = (f)(*level, node_cx.style.heading_base_font_size);
                 }
 
-                h_flex()
-                    .id(("h", *level as usize))
+                div()
+                    .id(SharedString::from(format!("h{}-{}", level, options.ix)))
+                    .w_full()
+                    .min_w_0()
                     .pb(rems(0.3))
                     .whitespace_normal()
                     .text_size(text_size)
@@ -1174,7 +1241,7 @@ impl Node {
                 .pb(mb)
                 .child(
                     div()
-                        .id("blockquote")
+                        .id(("blockquote", options.ix))
                         .w_full()
                         .text_color(cx.theme().muted_foreground)
                         .border_l_3()
@@ -1184,24 +1251,35 @@ impl Node {
                             let children_len = children.len();
                             children.into_iter().enumerate().map(move |(index, c)| {
                                 let is_last = index == children_len - 1;
-                                c.render_block(options.is_last(is_last), node_cx, window, cx)
+                                c.render_block(
+                                    NodeRenderOptions {
+                                        ix: index,
+                                        ..options.is_last(is_last)
+                                    },
+                                    node_cx,
+                                    window,
+                                    cx,
+                                )
                             })
                         }),
                 )
                 .into_any_element(),
             Node::List { children, ordered } => v_flex()
-                .id(if *ordered { "ol" } else { "ul" })
+                .id((if *ordered { "ol" } else { "ul" }, options.ix))
+                .w_full()
+                .min_w_0()
                 .pb(mb)
                 .children({
                     let mut items = Vec::with_capacity(children.len());
-                    let mut ix = 0;
-                    for item in children.into_iter() {
+                    let mut item_index = 0;
+                    for (child_ix, item) in children.into_iter().enumerate() {
                         let is_item = item.is_list_item();
 
                         items.push(Self::render_list_item(
                             item,
-                            ix,
+                            item_index,
                             NodeRenderOptions {
+                                ix: child_ix,
                                 ordered: *ordered,
                                 ..options
                             },
@@ -1211,7 +1289,7 @@ impl Node {
                         ));
 
                         if is_item {
-                            ix += 1;
+                            item_index += 1;
                         }
                     }
                     items
@@ -1221,9 +1299,14 @@ impl Node {
             Node::Table { .. } => Self::render_table(self, node_cx, window, cx).into_any_element(),
             Node::Divider => div()
                 .pb(mb)
-                .child(div().id("divider").bg(cx.theme().border).h(px(2.)))
+                .child(
+                    div()
+                        .id(("divider", options.ix))
+                        .bg(cx.theme().border)
+                        .h(px(2.)),
+                )
                 .into_any_element(),
-            Node::Break { .. } => div().id("break").into_any_element(),
+            Node::Break { .. } => div().id(("break", options.ix)).into_any_element(),
             Node::Unknown | Node::Definition { .. } => div().into_any_element(),
             _ => {
                 if cfg!(debug_assertions) {

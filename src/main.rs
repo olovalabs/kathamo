@@ -137,6 +137,10 @@ struct ChatMessage {
     text: String,
     tool: Option<ChatTool>,
     expanded: bool,
+    /// Assistant text that is still being appended to. Streaming text renders
+    /// settled markdown blocks eagerly and the live tail as plain text so each
+    /// token does not re-parse and re-shape the whole message.
+    streaming: bool,
 }
 
 struct ChatTool {
@@ -162,11 +166,125 @@ impl ChatMessage {
             text,
             tool: None,
             expanded: true,
+            streaming: false,
         }
     }
 }
 
 const TOOL_TEXT_PREVIEW_LIMIT: usize = 600;
+
+fn fence_open(line: &str) -> Option<(u8, usize)> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let marker = *line.as_bytes().first()?;
+    if marker != b'`' && marker != b'~' {
+        return None;
+    }
+    let len = line.bytes().take_while(|b| *b == marker).count();
+    if len < 3 {
+        return None;
+    }
+    if marker == b'`' && line[len..].contains('`') {
+        return None;
+    }
+    Some((marker, len))
+}
+
+fn fence_close(line: &str, marker: u8, len: usize) -> bool {
+    let line = line.trim_end_matches(['\r', '\n']).trim_end();
+    let count = line.bytes().take_while(|b| *b == marker).count();
+    count >= len && line[count..].trim().is_empty()
+}
+
+fn list_marker_len(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    match bytes.first()? {
+        b'-' | b'*' | b'+' if bytes.get(1) == Some(&b' ') => Some(1),
+        b'0'..=b'9' => {
+            let mut digits = 0;
+            while bytes.get(digits).is_some_and(u8::is_ascii_digit) {
+                digits += 1;
+            }
+            if (1..=9).contains(&digits)
+                && matches!(bytes.get(digits), Some(b'.') | Some(b')'))
+                && bytes.get(digits + 1) == Some(&b' ')
+            {
+                Some(digits + 1)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Split a streaming message into settled markdown and the single block that is
+/// still being written (Codex's stable/tail partitioning).
+///
+/// Everything before the boundary can be parsed once and cached. The tail is
+/// the only part re-parsed per token, so streaming stays O(tail) instead of
+/// O(document). Blank lines inside fences are not boundaries, and a list that
+/// is still being written stays whole in the tail so its numbering and nesting
+/// keep their context.
+fn split_streaming_markdown(text: &str) -> (&str, &str) {
+    let mut fence: Option<(u8, usize)> = None;
+    let mut boundary: Option<usize> = None;
+    let mut last_blank: Option<usize> = None;
+    let mut in_list = false;
+    let mut list_start: Option<usize> = None;
+    let mut offset = 0usize;
+
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+
+        let trimmed = line.trim_start_matches([' ', '\t']);
+        let indent = line.len() - trimmed.len();
+
+        if let Some((marker, len)) = fence {
+            if fence_close(trimmed, marker, len) {
+                fence = None;
+            }
+            continue;
+        }
+
+        if indent <= 3 {
+            if let Some(opened) = fence_open(trimmed) {
+                in_list = false;
+                list_start = None;
+                boundary = last_blank.or(boundary);
+                fence = Some(opened);
+                continue;
+            }
+        }
+
+        if line.trim().is_empty() {
+            last_blank = Some(start);
+            if !in_list {
+                boundary = Some(start);
+            }
+            continue;
+        }
+
+        if indent <= 3 && list_marker_len(trimmed).is_some() {
+            if !in_list {
+                in_list = true;
+                list_start = Some(boundary.or(last_blank).unwrap_or(0));
+            }
+        } else if in_list && indent >= 2 {
+            // Indented continuation of the current list item.
+        } else {
+            in_list = false;
+            list_start = None;
+            boundary = last_blank.or(boundary);
+        }
+    }
+
+    let at = if in_list { list_start } else { boundary };
+    match at {
+        Some(at) => (&text[..at], text[at..].trim_start_matches(['\r', '\n'])),
+        None => ("", text),
+    }
+}
 
 /// Unicode-safe clipping: never slices through a multi-byte character.
 fn clip_tool_text(text: &str, limit: usize) -> (String, bool) {
@@ -586,7 +704,20 @@ fn update_chat_tool(
                 expanded: false,
             }),
             expanded: false,
+            streaming: false,
         });
+    }
+}
+
+/// Assistant text stops streaming whenever the agent moves on to thinking,
+/// activity, a tool call, an error, or the end of the turn. The next text
+/// event starts a fresh streaming message, so completed text gets the full
+/// markdown render again.
+fn finish_chat_streaming(messages: &mut [ChatMessage]) {
+    for message in messages.iter_mut() {
+        if message.streaming {
+            message.streaming = false;
+        }
     }
 }
 
@@ -617,11 +748,14 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                     expanded: false,
                 }),
                 expanded: false,
+                streaming: false,
             });
+            finish_chat_streaming(messages);
             return;
         }
         agent_bridge::AgentEvent::ToolUpdate { id, name, output } => {
             update_chat_tool(messages, id, name, output, ToolState::Running);
+            finish_chat_streaming(messages);
             return;
         }
         agent_bridge::AgentEvent::ToolEnd {
@@ -641,6 +775,7 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                     ToolState::Completed
                 },
             );
+            finish_chat_streaming(messages);
             return;
         }
         agent_bridge::AgentEvent::Text(text) => (ChatRole::Assistant, text),
@@ -660,16 +795,24 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                 message.expanded = false;
             }
         }
+    } else {
+        finish_chat_streaming(messages);
     }
     if matches!(role, ChatRole::Assistant | ChatRole::Thinking) {
         if let Some(last) = messages.last_mut().filter(|message| message.role == role) {
             last.text.push_str(&text);
+            if role == ChatRole::Assistant {
+                last.streaming = true;
+            }
             return;
         }
     }
     let mut message = ChatMessage::new(role, text);
     if role == ChatRole::Thinking {
         message.expanded = false;
+    }
+    if role == ChatRole::Assistant {
+        message.streaming = true;
     }
     messages.push(message);
 }
@@ -4175,10 +4318,12 @@ impl AppState {
                                 agent_bridge::AgentEvent::Done => {
                                     pane.chat.running = false;
                                     finish_chat_tools(&mut pane.chat.messages);
+                                    finish_chat_streaming(&mut pane.chat.messages);
                                 }
                                 agent_bridge::AgentEvent::Closed => {
                                     pane.chat.running = false;
                                     finish_chat_tools(&mut pane.chat.messages);
+                                    finish_chat_streaming(&mut pane.chat.messages);
                                     closed = true;
                                 }
                                 other => push_chat_event(&mut pane.chat.messages, other),
@@ -4204,10 +4349,12 @@ impl AppState {
                                     agent_bridge::AgentEvent::Done => {
                                         chat.running = false;
                                         finish_chat_tools(&mut chat.messages);
+                                        finish_chat_streaming(&mut chat.messages);
                                     }
                                     agent_bridge::AgentEvent::Closed => {
                                         chat.running = false;
                                         finish_chat_tools(&mut chat.messages);
+                                        finish_chat_streaming(&mut chat.messages);
                                         closed = true;
                                     }
                                     other => push_chat_event(&mut chat.messages, other),
@@ -7123,23 +7270,64 @@ impl AppState {
                                 )),
                         )
                         .into_any_element(),
-                    ChatRole::Assistant => div()
-                        .w_full()
-                        .min_w_0()
-                        .text_size(px(13.0))
-                        .line_height(relative(1.9))
-                        .child(chat_markdown(
-                            SharedString::from(format!(
-                                "agent-markdown-{pane_id}-{conversation}-{index}"
-                            )),
-                            message.text.clone(),
-                            px(13.0),
-                            rems(0.6),
-                            tokens,
-                            window,
-                            cx,
-                        ))
-                        .into_any_element(),
+                    ChatRole::Assistant => {
+                        let id = SharedString::from(format!(
+                            "agent-markdown-{pane_id}-{conversation}-{index}"
+                        ));
+                        let mut body = div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .text_size(px(13.0))
+                            .line_height(relative(1.9))
+                            .text_color(tokens.text_primary);
+
+                        if message.streaming {
+                            // Re-parse only settled blocks while text is arriving; the live tail
+                            // stays plain so every token does not re-shape the whole message.
+                            let (settled, tail) = split_streaming_markdown(&message.text);
+                            if !settled.trim().is_empty() {
+                                body = body.child(chat_markdown(
+                                    id.clone(),
+                                    settled.to_string(),
+                                    px(13.0),
+                                    rems(0.6),
+                                    tokens,
+                                    window,
+                                    cx,
+                                ));
+                            }
+                            if !tail.is_empty() {
+                                // The live block gets its own TextView: only this block is
+                                // re-parsed per token, while settled blocks stay cached.
+                                body = body.child(chat_markdown(
+                                    SharedString::from(format!(
+                                        "agent-markdown-{pane_id}-{conversation}-{index}-live"
+                                    )),
+                                    tail.to_string(),
+                                    px(13.0),
+                                    rems(0.6),
+                                    tokens,
+                                    window,
+                                    cx,
+                                ));
+                            }
+                        } else {
+                            body = body.child(chat_markdown(
+                                id,
+                                message.text.clone(),
+                                px(13.0),
+                                rems(0.6),
+                                tokens,
+                                window,
+                                cx,
+                            ));
+                        }
+
+                        body.into_any_element()
+                    }
                     ChatRole::Thinking => {
                         let is_expanded = message.expanded;
                         let summary =
@@ -7292,12 +7480,7 @@ impl AppState {
                         .into_any_element(),
                 };
 
-                div()
-                    .w_full()
-                    .flex()
-                    .justify_center()
-                    .child(div().w_full().max_w(px(720.0)).min_w_0().child(inner))
-                    .into_any_element()
+                div().w_full().min_w_0().child(inner).into_any_element()
             })
             .collect::<Vec<_>>();
         let chat_view = div()
@@ -11254,6 +11437,40 @@ mod kathamo_bottom_input_tests {
         assert!(messages[1].role == ChatRole::Assistant && messages[1].text == "Found the issue");
         assert!(messages[2].role == ChatRole::Tool && messages[2].text == "read finished");
         assert!(messages[3].role == ChatRole::Assistant && messages[3].text == "Fixed it");
+    }
+
+    #[test]
+    fn streaming_split_keeps_fenced_blocks_whole() {
+        let text = "intro\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\ntail";
+        let (settled, tail) = split_streaming_markdown(text);
+        assert_eq!(
+            settled.trim_end(),
+            "intro\n\n```rust\nfn a() {}\n\nfn b() {}\n```"
+        );
+        assert_eq!(tail, "tail");
+
+        let (settled, tail) = split_streaming_markdown("first\n\nsecond");
+        assert_eq!(settled.trim_end(), "first");
+        assert_eq!(tail, "second");
+
+        // A list still being written stays whole so numbering/nesting keep context.
+        let (settled, tail) = split_streaming_markdown("Intro\n\n- one\n- two\n- three");
+        assert_eq!(settled.trim_end(), "Intro");
+        assert_eq!(tail, "- one\n- two\n- three");
+    }
+
+    #[test]
+    fn text_events_stream_until_the_next_boundary() {
+        use agent_bridge::AgentEvent;
+        let mut messages = Vec::new();
+        push_chat_event(&mut messages, AgentEvent::Text("Work".into()));
+        assert!(messages[0].streaming);
+        push_chat_event(&mut messages, AgentEvent::Tool("read".into()));
+        assert!(!messages[0].streaming);
+        push_chat_event(&mut messages, AgentEvent::Text("Done".into()));
+        assert!(messages[2].streaming);
+        finish_chat_streaming(&mut messages);
+        assert!(!messages[2].streaming);
     }
 
     #[test]

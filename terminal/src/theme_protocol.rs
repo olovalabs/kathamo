@@ -74,7 +74,9 @@ impl ThemeProtocol {
         let mut offset = 0;
         while offset < bytes.len() {
             let mut detector = Detector::default();
-            let count = self.parser.advance_until_terminated(&mut detector, &bytes[offset..]);
+            let count = self
+                .parser
+                .advance_until_terminated(&mut detector, &bytes[offset..]);
             let end = offset + count;
             if let Some(action) = detector.action {
                 // Forward everything before the final byte first. A DECRQM for
@@ -103,7 +105,11 @@ impl ThemeProtocol {
         }
     }
 
-    pub(crate) fn palette_changed(&self, notifier: &TerminalNotifierHandle, palette: &ColorPalette) {
+    pub(crate) fn palette_changed(
+        &self,
+        notifier: &TerminalNotifierHandle,
+        palette: &ColorPalette,
+    ) {
         if self.subscribed {
             notifier.write(theme_report(palette));
         }

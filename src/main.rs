@@ -1,12 +1,12 @@
 use anyhow::Result;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Bounds, ClipboardEntry, Context,
-    CursorStyle, Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
-    Point, Render, SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _,
-    Transformation, Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions,
-    actions, deferred, div, img, percentage, px, relative, rgba, size, svg,
+    Animation, AnimationExt as _, App, AppContext, Bounds, ClipboardEntry, Context, CursorStyle,
+    Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, StyledImage as _, Transformation,
+    Window, WindowBounds, WindowControlArea, WindowDecorations, WindowOptions, actions, deferred,
+    div, img, percentage, px, relative, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
@@ -2050,7 +2050,11 @@ impl AppState {
             .get(session_idx)
             .and_then(|s| s.panes.first());
         if let Some(pane) = first_pane {
-            pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
+            pane.terminal
+                .read(cx)
+                .focus_handle()
+                .clone()
+                .focus(window, cx);
         }
         self.focused_pane_id = first_pane.map(|pane| pane.id);
         cx.notify();
@@ -2521,10 +2525,18 @@ impl AppState {
                                     state.focus(window, cx);
                                 });
                             } else {
-                                pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
+                                pane.terminal
+                                    .read(cx)
+                                    .focus_handle()
+                                    .clone()
+                                    .focus(window, cx);
                             }
                         } else {
-                            pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
+                            pane.terminal
+                                .read(cx)
+                                .focus_handle()
+                                .clone()
+                                .focus(window, cx);
                         }
                     }
                 }
@@ -3643,7 +3655,11 @@ impl AppState {
                                     let is_term_focused =
                                         pane.terminal.read(cx).focus_handle().is_focused(window);
                                     if !is_term_focused {
-                                        pane.terminal.read(cx).focus_handle().clone().focus(window, cx);
+                                        pane.terminal
+                                            .read(cx)
+                                            .focus_handle()
+                                            .clone()
+                                            .focus(window, cx);
                                     }
                                 }
                             }
@@ -7958,7 +7974,10 @@ mod resize_tests {
             visual.app = headless.app.clone();
             visual.background_executor = headless.background_executor.clone();
             visual.foreground_executor = headless.foreground_executor.clone();
-            Self { visual, _headless: headless }
+            Self {
+                visual,
+                _headless: headless,
+            }
         }
     }
 
@@ -8076,7 +8095,9 @@ mod resize_tests {
                         titlebar: Some(TitleBar::title_bar_options()),
                         window_decorations: Some(WindowDecorations::Client),
                         app_id: Some("kathamo".to_string()),
-                        icon: image::load_from_memory(APP_ICON_PNG).ok().map(|image| Arc::new(image.into_rgba8())),
+                        icon: image::load_from_memory(APP_ICON_PNG)
+                            .ok()
+                            .map(|image| Arc::new(image.into_rgba8())),
                         ..Default::default()
                     },
                     |window, cx| {
@@ -8999,11 +9020,9 @@ mod settings_and_theme_tests {
                 bounds
                     .iter()
                     .map(|bounds| {
-                        let x = ((f32::from(bounds.origin.x)
-                            + f32::from(bounds.size.width) / 2.0)
+                        let x = ((f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0)
                             * scale) as u32;
-                        let y = ((f32::from(bounds.origin.y)
-                            + f32::from(bounds.size.height)
+                        let y = ((f32::from(bounds.origin.y) + f32::from(bounds.size.height)
                             - 12.0)
                             * scale) as u32;
                         *image.get_pixel(x, y)
@@ -9491,7 +9510,6 @@ mod kathamo_bottom_input_tests {
             assert!(pane.terminal.read(cx).is_read_only());
         });
     }
-
 
     #[test]
     fn prompt_submission_sends_text_and_enter_without_manual_intervention() {

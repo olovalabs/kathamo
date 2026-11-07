@@ -121,7 +121,9 @@ mod tests {
         assert!(assets.load("icons/monitor.svg").unwrap().is_some());
         assert!(assets.load("icons/ellipsis.svg").unwrap().is_some());
         assert!(assets.load("logo/kathamo.png").unwrap().is_some());
-        let icon = image::load_from_memory(crate::APP_ICON_PNG).unwrap().into_rgba8();
+        let icon = image::load_from_memory(crate::APP_ICON_PNG)
+            .unwrap()
+            .into_rgba8();
         assert_eq!(icon.width(), 1254);
         assert_eq!(icon.height(), 1254);
     }

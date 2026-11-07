@@ -162,7 +162,11 @@ impl TerminalState {
                 let slice = &bytes[consumed..end];
                 self.shell.capture_bytes(slice);
                 self.theme_protocol.advance(
-                    &mut self.parser, &mut term, &self.notifier, &self.palette, slice,
+                    &mut self.parser,
+                    &mut term,
+                    &self.notifier,
+                    &self.palette,
+                    slice,
                 );
                 consumed = end;
             }
@@ -176,7 +180,11 @@ impl TerminalState {
             let slice = &bytes[consumed..];
             self.shell.capture_bytes(slice);
             self.theme_protocol.advance(
-                &mut self.parser, &mut term, &self.notifier, &self.palette, slice,
+                &mut self.parser,
+                &mut term,
+                &self.notifier,
+                &self.palette,
+                slice,
             );
         }
         self.shell
@@ -190,7 +198,11 @@ impl TerminalState {
     pub fn feed_raw(&mut self, bytes: &[u8]) {
         let mut term = self.term.lock();
         self.theme_protocol.advance(
-            &mut self.parser, &mut term, &self.notifier, &self.palette, bytes,
+            &mut self.parser,
+            &mut term,
+            &self.notifier,
+            &self.palette,
+            bytes,
         );
     }
 
@@ -205,7 +217,8 @@ impl TerminalState {
             || self.palette.cursor() != palette.cursor();
         self.palette = palette;
         if changed {
-            self.theme_protocol.palette_changed(&self.notifier, &self.palette);
+            self.theme_protocol
+                .palette_changed(&self.notifier, &self.palette);
         }
     }
 
@@ -741,7 +754,8 @@ mod tests {
     fn theme_sequences_inside_control_strings_do_not_reply_or_subscribe() {
         let (mut terminal, recorder, _) = state_with_recorder();
         for byte in b"\x1b]0;ignored [?2031h [?2031$p [?996n\x07\
-                      \x1bPqignored [?2031h [?2031$p [?996n\x1b\\" {
+                      \x1bPqignored [?2031h [?2031$p [?996n\x1b\\"
+        {
             terminal.process_bytes(std::slice::from_ref(byte));
         }
         assert!(recorder.take().is_empty());

@@ -1365,12 +1365,7 @@ impl TerminalView {
         Some(GridPoint::new(GridLine(row as i32), GridColumn(col)))
     }
 
-    fn on_scroll(
-        &mut self,
-        event: &ScrollEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_scroll(&mut self, event: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let cell_height = self.renderer.cell_height;
         let pixel_y = f32::from(event.delta.pixel_delta(cell_height).y)
             * self.config.scroll_sensitivity.max(0.05);

@@ -258,6 +258,23 @@ impl TerminalView {
         W: Write + Send + 'static,
         R: Read + Send + 'static,
     {
+        Self::new_with_scrollback(stdin_writer, stdout_reader, config, None, cx)
+    }
+
+    /// Like [`Self::new`], but seeds the emulator with previously captured
+    /// output before the reader thread starts, so a restored pane shows its
+    /// old buffer above the fresh shell prompt.
+    pub fn new_with_scrollback<W, R>(
+        stdin_writer: W,
+        stdout_reader: R,
+        config: TerminalConfig,
+        scrollback: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self
+    where
+        W: Write + Send + 'static,
+        R: Read + Send + 'static,
+    {
         let (event_tx, event_rx) = mpsc::channel();
         let exit_event_tx = event_tx.clone();
 
@@ -273,6 +290,10 @@ impl TerminalView {
             TerminalState::with_config(config.cols, config.rows, alac_config, event_proxy);
         state.set_palette(config.colors.clone());
         state.set_shell_token(config.shell_token.clone());
+        if let Some(scrollback) = scrollback.filter(|text| !text.is_empty()) {
+            state.feed_raw(scrollback.as_bytes());
+            state.scroll_to_bottom();
+        }
 
         let renderer = TerminalRenderer::new(
             config.font_family.clone(),
@@ -1721,6 +1742,12 @@ impl TerminalView {
     /// Read bottom N lines of visible terminal text
     pub fn bottom_lines(&self, n: usize) -> Vec<String> {
         self.state.bottom_lines(n)
+    }
+
+    /// Snapshot the whole buffer (scrollback + visible screen) as plain text,
+    /// keeping the newest `max_lines` lines.
+    pub fn buffer_text(&self, max_lines: usize) -> String {
+        self.state.buffer_text(max_lines)
     }
 
     /// Like [`Self::bottom_lines`], but scrapes into a caller-provided buffer

@@ -43,7 +43,8 @@ graph TD
     end
 
     subgraph Persistence ["Persistence Layer"]
-        Disk[~/.config/kathamo/workspace.json]
+        Disk["<data>/workspace.json + sessions/ + conversations/"]
+        Settings["<config>/settings.json"]
     end
 
     App --> Sidebar
@@ -64,6 +65,7 @@ graph TD
     StateEngine --> Sound
     StateEngine --> Sidebar
     Sidebar <--> Disk
+    App <--> Settings
 ```
 
 ---
@@ -106,10 +108,34 @@ Kathamo provides automated one-command setup for developer agent ecosystems:
 - **Command Code**: Direct native compatibility via socket environment variables (`KATHAMO_SOCKET_PATH`, `KATHAMO_PANE_ID`).
 - **Screen Detection**: Embedded TOML manifests (`assets/agent-detection/*.toml`) evaluate regex patterns on visible terminal screen buffers to detect agent activity without requiring agent configuration.
 
-### 2.5 Workspace State & Persistence (`src/workspace_state.rs`)
+### 2.5 Workspace State & Persistence (`src/workspace_state.rs`, `src/settings.rs`, `src/conversations.rs`)
 
-- Open projects, active directories, and terminal session metadata are serialized to JSON in `~/.config/kathamo/workspace.json`.
-- On startup, Kathamo reads the workspace state and seamlessly restores the project sidebar tree and terminal panes.
+Kathamo follows Zed's per-platform directory convention (`src/paths.rs`):
+
+| Platform | Data dir | Config dir |
+|---|---|---|
+| Linux | `$XDG_DATA_HOME/kathamo` (`~/.local/share/kathamo`) | `$XDG_CONFIG_HOME/kathamo` (`~/.config/kathamo`) |
+| macOS | `~/Library/Application Support/Kathamo` | `~/.config/kathamo` |
+| Windows | `%LOCALAPPDATA%\Kathamo` | `%APPDATA%\Kathamo` |
+
+```
+<data>/
+  workspace.json              # v2: projects -> sessions (tabs) -> panes + split tree
+  sessions/<pane-uid>.txt     # captured terminal output per pane (2 000 lines / 256 KiB cap)
+  conversations/<pane-uid>/   # append-only JSONL agent transcripts
+  backups/                    # pre-v2 workspace backups
+  logs/
+<config>/settings.json        # theme, palette, sidebar, default model, window geometry, restore toggles
+```
+
+- `settings.json` is user-editable and parsed as JSONC (comments allowed). It stores app appearance, window bounds/state, and the `restore` toggles.
+- `workspace.json` is auto-managed and debounced (300 ms) with an atomic temp+rename write and a generation guard. It records project paths, tab titles/logos, the split tree, per-pane cwd, input drafts, command history, and selected agent models/session ids.
+- Scrollback is written separately (on close, quit, and every 30 s while dirty) so the debounced hot path stays small. Restored panes spawn a fresh shell in the saved cwd and seed the previous buffer above the new prompt.
+- Agent transcripts are appended as raw events and replayed through `push_chat_event`, so the restored UI matches the previous session exactly. rpi conversations resume with `rpi --session <id>`; OMP restores the transcript only.
+- Window geometry is loaded synchronously before `open_window`, validated against the current displays, and saved on close/quit.
+- Legacy v1 `workspace.json` files (including the old `com.Markup.Markup` location) are backed up to `<data>/backups/` and migrated automatically.
+
+Environment overrides: `KATHAMO_DATA_DIR=/absolute/path` (derives config/state/logs from it) and `KATHAMO_DISABLE_RESTORE=1` (clean launch without reading saved state).
 
 ---
 

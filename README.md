@@ -24,7 +24,8 @@ Kathamo combines native terminal rendering powered by [GPUI Fast](https://github
 
 - **📁 Multi-Project Sidebar & Session Persistence**
   - Group terminal sessions cleanly under collapsible project folders in the sidebar.
-  - Workspace state automatically persists to disk and restores your open projects and sessions across restarts.
+  - Restores the full workspace on relaunch: projects, tabs, split panes, focus, per-pane working directories, input drafts, command history, window geometry, and the previous terminal output.
+  - Agent conversations are saved to disk; rpi sessions resume on the next prompt.
   - Quick-action buttons to create new terminal sessions per project or open existing directories.
 
 - **🔌 First-Class Agent Integrations & CLI**
@@ -59,6 +60,22 @@ graph TD
     Attention --> Sidebar
     Attention --> UI
 ```
+
+---
+
+## Where Kathamo stores data
+
+Kathamo uses the platform-native application directories (the same convention as Zed):
+
+| Platform | Data | Settings |
+|---|---|---|
+| Linux | `~/.local/share/kathamo` | `~/.config/kathamo/settings.json` |
+| macOS | `~/Library/Application Support/Kathamo` | `~/.config/kathamo/settings.json` |
+| Windows | `%LOCALAPPDATA%\Kathamo` | `%APPDATA%\Kathamo\settings.json` |
+
+The data folder holds `workspace.json` (projects, tabs, split layout, cwd), `sessions/` (per-pane terminal output), `conversations/` (agent transcripts), and `backups/`. Manage or clear it from **Settings → Data & Sessions**, or override the location with `KATHAMO_DATA_DIR=/absolute/path`. Set `KATHAMO_DISABLE_RESTORE=1` for a clean launch without reading saved state.
+
+Processes are not resurrected: a restored pane starts a fresh shell in the saved working directory with the previous output shown above the new prompt.
 
 ---
 
@@ -241,9 +258,12 @@ kathamo/
 │   ├── cli.rs          # CLI parser and command handlers
 │   ├── integrations.rs # Automated agent hook configuration
 │   ├── main.rs         # Application entry point, window & view layout
+│   ├── conversations.rs # Append-only agent conversation history
+│   ├── paths.rs        # Per-platform data/config directories
+│   ├── settings.rs     # User settings & window geometry
 │   ├── status.rs       # Agent status schemas & state definitions
 │   ├── status_bus.rs   # Unix domain socket IPC bus
-│   └── workspace_state.rs # Workspace persistence & session restoration
+│   └── workspace_state.rs # Workspace/session/scrollback persistence
 └── tests/              # End-to-end and integration tests
 ```
 

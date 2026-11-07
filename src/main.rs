@@ -5,9 +5,9 @@ use gpui::{
     CursorStyle, Div, Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
     Point, Rems, Render, ScrollEvent, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled, StyledImage as _, Transformation, Window, WindowBounds,
-    WindowControlArea, WindowDecorations, WindowOptions, actions, deferred, div, img, percentage,
-    px, relative, rems, rgba, size, svg,
+    StyleRefinement, Styled, StyledImage as _, Transformation, Window, WindowControlArea,
+    WindowDecorations, WindowOptions, actions, deferred, div, img, percentage, px, relative, rems,
+    rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::highlighter::HighlightTheme;
@@ -34,12 +34,15 @@ mod attachments;
 mod attention;
 mod cli;
 mod completion;
+mod conversations;
 mod diagnostics;
 mod integrations;
 #[cfg(unix)]
 mod kathamo_compat;
 mod logos;
 mod omp_bridge;
+mod paths;
+mod settings;
 mod shell_history;
 #[path = "blocks/shell_integration.rs"]
 mod shell_integration;
@@ -122,7 +125,7 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ChatRole {
     User,
     Assistant,
@@ -132,6 +135,7 @@ enum ChatRole {
     Error,
 }
 
+#[derive(Clone)]
 struct ChatMessage {
     role: ChatRole,
     text: String,
@@ -143,6 +147,7 @@ struct ChatMessage {
     streaming: bool,
 }
 
+#[derive(Clone)]
 struct ChatTool {
     id: Option<String>,
     name: String,
@@ -152,7 +157,7 @@ struct ChatTool {
     expanded: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ToolState {
     Running,
     Completed,
@@ -895,6 +900,8 @@ struct ModelChat {
     messages: Vec<ChatMessage>,
     running: bool,
     auth_refresh_pending: bool,
+    rpi_session_id: Option<String>,
+    conversation: Option<conversations::Log>,
 }
 
 struct PaneChat {
@@ -912,6 +919,8 @@ struct PaneChat {
     models: HashMap<agent_auth::AgentModel, ModelChat>,
     fast_mode: bool,
     pub autoscroll: bool,
+    rpi_session_id: Option<String>,
+    conversation: Option<conversations::Log>,
 }
 
 impl Default for PaneChat {
@@ -931,6 +940,8 @@ impl Default for PaneChat {
             models: HashMap::new(),
             fast_mode: true,
             autoscroll: true,
+            rpi_session_id: None,
+            conversation: None,
         }
     }
 }
@@ -959,6 +970,16 @@ impl PaneChat {
             None => self.running,
         }
     }
+
+    fn visible_conversation(&mut self) -> Option<&mut conversations::Log> {
+        match self.selected_model.as_ref() {
+            Some(model) => self
+                .models
+                .get_mut(model)
+                .and_then(|chat| chat.conversation.as_mut()),
+            None => self.conversation.as_mut(),
+        }
+    }
 }
 
 /// One terminal inside a session's screen. A session (a sidebar tab) owns a
@@ -966,6 +987,10 @@ impl PaneChat {
 /// keeps running while another session's screen is shown.
 pub struct TerminalPane {
     pub id: usize,
+    /// Stable identity across restarts, used for scrollback and conversation files.
+    pub uid: String,
+    /// Last working directory reported by shell integration (OSC 7 / 7502).
+    pub cwd: Option<PathBuf>,
     pub generation: String,
     pub native_session_id: Option<String>,
     pub native_session_reporter: Option<String>,
@@ -1012,6 +1037,8 @@ pub struct TerminalPane {
     pub sub_agents: HashMap<String, attention::SubAgent>,
     chat: PaneChat,
     pub input_state: Option<Entity<InputState>>,
+    /// Text typed before the last quit, applied when the input is first built.
+    pub restore_draft: Option<String>,
     /// Drops the `InputEvent::Change` subscription that keeps ghost text and
     /// the completion menu in sync with what is typed.
     pub input_subscription: Option<gpui::Subscription>,
@@ -1064,6 +1091,8 @@ impl TerminalPane {
     ) -> Self {
         Self {
             id,
+            uid: paths::uid("p"),
+            cwd: None,
             generation,
             native_session_id: None,
             native_session_reporter: None,
@@ -1095,6 +1124,7 @@ impl TerminalPane {
             sub_agents: HashMap::new(),
             chat: PaneChat::default(),
             input_state: None,
+            restore_draft: None,
             input_subscription: None,
             shell_history: shell_history::cached(),
             command_history: Vec::new(),
@@ -1139,6 +1169,8 @@ impl TerminalPane {
 /// other sessions keep running in the background.
 pub struct Session {
     pub id: usize,
+    /// Stable identity across restarts.
+    pub uid: String,
     /// OSC title of the focus pane (synced in the poller / title callback).
     pub title: SharedString,
     /// Title as shown in the sidebar (truncated), cached.
@@ -1344,6 +1376,17 @@ struct AppState {
     history_search: Option<HistorySearchState>,
     /// Lightbox for an attached image, if open.
     image_viewer: Option<ImageViewerState>,
+    /// User-editable settings (also mirrored to `settings.json`).
+    settings: settings::AppSettings,
+    /// Set whenever durable state changes; the 30 s autosave drains it.
+    dirty: bool,
+    /// Last known window geometry, captured on close and while saving.
+    last_window_bounds: Option<settings::SavedWindow>,
+    /// False when launched with `KATHAMO_DISABLE_RESTORE`; the app then never
+    /// writes to the saved state (read-only troubleshooting mode).
+    persistence_enabled: bool,
+    /// Two-step confirmation state for "clear saved sessions".
+    clear_data_confirm: bool,
 }
 
 /// Full-window preview of one attached image.
@@ -1373,34 +1416,197 @@ struct RenamingProject {
     input: Entity<InputState>,
     _subscription: gpui::Subscription,
 }
-impl AppState {
-    fn saved_workspace(&self) -> workspace_state::SavedWorkspace {
-        workspace_state::SavedWorkspace {
-            projects: self
-                .projects
-                .iter()
-                .map(|p| workspace_state::SavedProject {
-                    path: p.path.clone(),
-                    name: p.name.to_string(),
-                    expanded: p.expanded,
-                })
-                .collect(),
-            active_project: self.active_project().map(|p| p.path.clone()),
-            sidebar_visible: self.sidebar_visible,
-            sidebar_width: f32::from(self.sidebar_width),
-            theme: self.theme_preference,
-            palette_scheme: self.palette_scheme,
-            default_agent_model: self.default_agent_model.clone(),
+/// Data read off the UI thread before restoring a workspace.
+struct RestoreData {
+    workspace: workspace_state::SavedWorkspace,
+    scrollbacks: HashMap<String, String>,
+    transcripts: HashMap<String, Vec<ChatMessage>>,
+}
+
+fn transcript_key(uid: &str, key: &str) -> String {
+    format!("{uid}|{key}")
+}
+
+fn save_pane_tree(node: &PaneNode) -> workspace_state::SavedPaneNode {
+    match node {
+        PaneNode::Leaf(pane) => workspace_state::SavedPaneNode::Leaf { pane: *pane },
+        PaneNode::Split {
+            id,
+            axis,
+            left,
+            right,
+        } => workspace_state::SavedPaneNode::Split {
+            id: *id,
+            axis: match axis {
+                gpui::Axis::Horizontal => workspace_state::SavedAxis::Horizontal,
+                gpui::Axis::Vertical => workspace_state::SavedAxis::Vertical,
+            },
+            left: Box::new(save_pane_tree(left)),
+            right: Box::new(save_pane_tree(right)),
+        },
+    }
+}
+
+fn restore_pane_tree(node: &workspace_state::SavedPaneNode) -> PaneNode {
+    match node {
+        workspace_state::SavedPaneNode::Leaf { pane } => PaneNode::Leaf(*pane),
+        workspace_state::SavedPaneNode::Split {
+            id,
+            axis,
+            left,
+            right,
+        } => PaneNode::Split {
+            id: *id,
+            axis: match axis {
+                workspace_state::SavedAxis::Horizontal => gpui::Axis::Horizontal,
+                workspace_state::SavedAxis::Vertical => gpui::Axis::Vertical,
+            },
+            left: Box::new(restore_pane_tree(left)),
+            right: Box::new(restore_pane_tree(right)),
+        },
+    }
+}
+
+/// True when every leaf refers to a pane that actually spawned.
+fn tree_matches_panes(node: &PaneNode, panes: &[TerminalPane]) -> bool {
+    match node {
+        PaneNode::Leaf(id) => panes.iter().any(|pane| pane.id == *id),
+        PaneNode::Split { left, right, .. } => {
+            tree_matches_panes(left, panes) && tree_matches_panes(right, panes)
         }
+    }
+}
+
+impl AppState {
+    fn saved_workspace(&self, cx: &App) -> workspace_state::SavedWorkspace {
+        let projects = self
+            .projects
+            .iter()
+            .map(|project| {
+                let sessions = project
+                    .sessions
+                    .iter()
+                    .map(|session| {
+                        let panes = session
+                            .panes
+                            .iter()
+                            .map(|pane| {
+                                let live = pane
+                                    .input_state
+                                    .as_ref()
+                                    .map(|input| input.read(cx).value().to_string())
+                                    .or_else(|| pane.restore_draft.clone())
+                                    .unwrap_or_default();
+                                let (draft, agent_draft) = if pane.chat.active {
+                                    (pane.chat.terminal_draft.clone(), live)
+                                } else {
+                                    (live, pane.chat.agent_draft.clone())
+                                };
+                                workspace_state::SavedPane {
+                                    id: pane.id,
+                                    uid: pane.uid.clone(),
+                                    title: pane.title.clone(),
+                                    display_title: pane.display_title.to_string(),
+                                    cwd: pane.cwd.clone().or_else(|| self.pane_cwd_path(pane)),
+                                    draft,
+                                    agent_draft,
+                                    command_history: pane
+                                        .command_history
+                                        .iter()
+                                        .rev()
+                                        .take(200)
+                                        .rev()
+                                        .cloned()
+                                        .collect(),
+                                    chat_active: pane.chat.active,
+                                    chat: workspace_state::SavedChat {
+                                        fast_mode: pane.chat.fast_mode,
+                                        selected_model: pane.chat.selected_model.clone(),
+                                        rpi_session_id: pane.chat.rpi_session_id.clone(),
+                                        models: pane
+                                            .chat
+                                            .models
+                                            .iter()
+                                            .map(|(model, chat)| workspace_state::SavedModelChat {
+                                                model: Some(model.clone()),
+                                                rpi_session_id: chat.rpi_session_id.clone(),
+                                                conversation: conversations::conversation_key(
+                                                    Some(model),
+                                                ),
+                                            })
+                                            .collect(),
+                                    },
+                                }
+                            })
+                            .collect();
+                        workspace_state::SavedSession {
+                            id: session.id,
+                            uid: session.uid.clone(),
+                            title: session.title.to_string(),
+                            display_title: session.display_title.to_string(),
+                            logo: session.logo.to_string(),
+                            maximized_pane_id: session.maximized_pane_id,
+                            focused_pane: self
+                                .focused_pane_id
+                                .filter(|id| session.panes.iter().any(|pane| pane.id == *id))
+                                .or_else(|| session.panes.first().map(|pane| pane.id)),
+                            tree: session
+                                .pane_tree
+                                .as_ref()
+                                .map(save_pane_tree)
+                                .unwrap_or_else(|| workspace_state::SavedPaneNode::Leaf {
+                                    pane: session.panes.first().map(|pane| pane.id).unwrap_or(0),
+                                }),
+                            panes,
+                        }
+                    })
+                    .collect();
+                workspace_state::SavedProject {
+                    id: project.id,
+                    path: project.path.clone(),
+                    name: project.name.to_string(),
+                    expanded: project.expanded,
+                    active_session: project.active_session_idx,
+                    sessions,
+                }
+            })
+            .collect();
+        workspace_state::SavedWorkspace {
+            version: workspace_state::CURRENT_VERSION,
+            active_project: self.active_project().map(|project| project.path.clone()),
+            projects,
+        }
+    }
+
+    fn saved_settings(&self) -> settings::AppSettings {
+        let mut saved = self.settings.clone();
+        saved.sidebar.visible = self.sidebar_visible;
+        saved.sidebar.width = f32::from(self.sidebar_width);
+        saved.theme = self.theme_preference;
+        saved.palette_scheme = self.palette_scheme;
+        saved.default_agent_model = self.default_agent_model.clone();
+        if let Some(window) = self.last_window_bounds {
+            saved.window = Some(window);
+        }
+        saved
+    }
+
+    fn mark_dirty(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
+        self.schedule_workspace_save(cx);
     }
 
     fn schedule_workspace_save(&mut self, cx: &Context<Self>) {
         self.startup_loaded = true;
-        let (Some(path), Some(snapshot)) =
-            (self.persistence_path.clone(), Some(self.saved_workspace()))
-        else {
+        self.dirty = true;
+        if !self.persistence_enabled {
+            return;
+        }
+        let Some(path) = self.persistence_path.clone() else {
             return;
         };
+        let workspace = self.saved_workspace(cx);
+        let settings = self.saved_settings();
         let generation = self.save_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let generation_counter = self.save_generation.clone();
         let executor = cx.background_executor().clone();
@@ -1408,79 +1614,323 @@ impl AppState {
             .clone()
             .spawn(async move {
                 executor.timer(std::time::Duration::from_millis(300)).await;
-                if let Err(error) = workspace_state::save_if_current(
+                match workspace_state::save_if_current(
                     &path,
-                    &snapshot,
+                    &workspace,
                     &generation_counter,
                     generation,
                 ) {
-                    eprintln!("failed to save workspace state: {error}");
+                    Ok(true) => {}
+                    // A newer snapshot superseded this one; do not write the
+                    // settings that belong to this stale generation.
+                    Ok(false) => return,
+                    Err(error) => eprintln!("failed to save workspace state: {error}"),
+                }
+                if let Err(error) = settings::save_atomic(&settings) {
+                    eprintln!("failed to save settings: {error}");
                 }
             })
             .detach();
     }
 
-    fn apply_saved_workspace(
-        &mut self,
-        saved: workspace_state::SavedWorkspace,
-        cx: &mut Context<Self>,
-    ) {
+    fn capture_window_bounds(&mut self, cx: &mut App) {
+        let handles = cx.windows();
+        for handle in handles {
+            if let Ok(bounds) = handle.update(cx, |_root, window, _cx| window.window_bounds()) {
+                self.last_window_bounds = Some(settings::SavedWindow::from_bounds(bounds));
+                break;
+            }
+        }
+    }
+
+    fn pane_scrollback(&self, pane: &TerminalPane, cx: &App) -> Option<String> {
+        let terminal = pane.terminal.read(cx);
+        if terminal.is_alt_screen() {
+            return None;
+        }
+        let text = terminal.buffer_text(workspace_state::max_scrollback_lines());
+        (!text.trim().is_empty()).then_some(text)
+    }
+
+    /// Synchronous, best-effort flush used when the window closes or the app
+    /// quits. Writes settings, workspace, scrollback and conversation logs so a
+    /// normal close never loses the last few seconds of work.
+    fn save_all_sync(&mut self, window: Option<&Window>, cx: &mut App) {
+        self.startup_loaded = true;
+        if !self.persistence_enabled {
+            self.dirty = false;
+            return;
+        }
+        self.save_generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(window) = window {
+            self.last_window_bounds =
+                Some(settings::SavedWindow::from_bounds(window.window_bounds()));
+        } else {
+            self.capture_window_bounds(cx);
+        }
+
+        let workspace = self.saved_workspace(cx);
+        let settings = self.saved_settings();
+        if let Some(path) = self.persistence_path.clone() {
+            if let Err(error) = workspace_state::save_atomic(&path, &workspace) {
+                eprintln!("failed to save workspace state: {error}");
+            }
+        }
+        if let Err(error) = settings::save_atomic(&settings) {
+            eprintln!("failed to save settings: {error}");
+        }
+
+        if self.settings.restore.scrollback {
+            let mut written = HashSet::new();
+            for project in &self.projects {
+                for session in &project.sessions {
+                    for pane in &session.panes {
+                        if written.insert(pane.uid.clone()) {
+                            if let Some(text) = self.pane_scrollback(pane, cx) {
+                                if let Err(error) =
+                                    workspace_state::write_scrollback(&pane.uid, &text)
+                                {
+                                    eprintln!("failed to save scrollback: {error}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                for pane in &mut session.panes {
+                    if let Some(log) = pane.chat.conversation.as_mut() {
+                        log.flush();
+                    }
+                    for chat in pane.chat.models.values_mut() {
+                        if let Some(log) = chat.conversation.as_mut() {
+                            log.flush();
+                        }
+                    }
+                }
+            }
+        }
+        self.dirty = false;
+    }
+
+    fn autosave(&mut self, cx: &mut Context<Self>) {
+        if !self.dirty {
+            return;
+        }
+        self.save_all_sync(None, cx);
+    }
+
+    fn apply_saved_workspace(&mut self, restored: RestoreData, cx: &mut Context<Self>) {
         if self.startup_loaded {
             return;
         }
         self.startup_loaded = true;
-        self.sidebar_visible = saved.sidebar_visible;
-        self.sidebar_width = SIDEBAR_WIDTH;
-        self.theme_preference = saved.theme;
-        self.palette_scheme = saved.palette_scheme;
-        self.default_agent_model = saved.default_agent_model;
+
+        self.sidebar_visible = self.settings.sidebar.visible;
+        self.sidebar_width = px(self.settings.sidebar.width.max(120.0));
+        self.theme_preference = self.settings.theme;
+        self.palette_scheme = self.settings.palette_scheme;
+        self.default_agent_model = self.settings.default_agent_model.clone();
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
         self.palette = load_palette(self.palette_scheme, mode.is_dark());
         gpui_component::Theme::change(mode, None, cx);
         sync_component_fonts(cx);
+
+        let RestoreData {
+            workspace,
+            scrollbacks,
+            transcripts,
+        } = restored;
+        let max_id = workspace.max_id();
+        let active_project_path = workspace.active_project.clone();
+        let mut focus_by_session: HashMap<usize, Option<usize>> = HashMap::new();
+
         self.projects.clear();
         self.active_project_idx = 0;
-        for project in saved.projects {
+
+        for project in workspace.projects {
             if !project.path.is_dir() || self.projects.iter().any(|p| p.path == project.path) {
                 continue;
             }
-            let id = self.next_id;
-            self.next_id += 1;
-            let weak = cx.entity().downgrade();
-            let Ok((terminal, pid, generation, terminal_subscription)) =
-                Self::spawn_terminal_view(Some(&project.path), self.palette.clone(), weak, id, cx)
-            else {
+            let project_path = project.path.clone();
+            let mut sessions = Vec::new();
+
+            for saved_session in project.sessions {
+                let mut panes = Vec::new();
+                for saved_pane in saved_session.panes {
+                    let dir = saved_pane
+                        .cwd
+                        .clone()
+                        .filter(|cwd| cwd.is_dir())
+                        .unwrap_or_else(|| project_path.clone());
+                    let scrollback = if self.settings.restore.scrollback {
+                        scrollbacks.get(&saved_pane.uid).cloned()
+                    } else {
+                        None
+                    };
+                    let weak = cx.entity().downgrade();
+                    let Ok((terminal, pid, generation, terminal_subscription)) =
+                        Self::spawn_terminal_view(
+                            Some(&dir),
+                            self.palette.clone(),
+                            weak,
+                            saved_pane.id.max(1),
+                            scrollback.as_deref(),
+                            cx,
+                        )
+                    else {
+                        continue;
+                    };
+
+                    let title = SharedString::from(if saved_pane.title.is_empty() {
+                        "terminal".to_string()
+                    } else {
+                        saved_pane.title.clone()
+                    });
+                    let display_title =
+                        SharedString::from(if saved_pane.display_title.is_empty() {
+                            title.to_string()
+                        } else {
+                            saved_pane.display_title.clone()
+                        });
+                    let mut pane = TerminalPane::new(
+                        saved_pane.id,
+                        generation,
+                        terminal,
+                        title,
+                        display_title,
+                        pid,
+                    );
+                    pane.uid = if saved_pane.uid.is_empty() {
+                        paths::uid("p")
+                    } else {
+                        saved_pane.uid.clone()
+                    };
+                    pane.cwd = Some(dir);
+                    pane.command_history = saved_pane.command_history;
+                    pane.restore_draft = Some(saved_pane.draft.clone());
+                    pane.chat.active = saved_pane.chat_active;
+                    pane.chat.fast_mode = saved_pane.chat.fast_mode;
+                    pane.chat.selected_model = saved_pane.chat.selected_model.clone();
+                    pane.chat.rpi_session_id = saved_pane.chat.rpi_session_id.clone();
+                    pane.chat.terminal_draft = saved_pane.draft.clone();
+                    pane.chat.agent_draft = saved_pane.agent_draft.clone();
+
+                    if self.settings.restore.agent_history {
+                        let default_key = conversations::conversation_key(None);
+                        pane.chat.conversation =
+                            Some(conversations::Log::open(&pane.uid, &default_key));
+                        if let Some(messages) =
+                            transcripts.get(&transcript_key(&pane.uid, &default_key))
+                        {
+                            pane.chat.messages = messages.clone();
+                        }
+                        for saved_model in &saved_pane.chat.models {
+                            let Some(model) = saved_model.model.clone() else {
+                                continue;
+                            };
+                            let key = conversations::conversation_key(Some(&model));
+                            let mut chat = ModelChat {
+                                rpi_session_id: saved_model.rpi_session_id.clone(),
+                                conversation: Some(conversations::Log::open(&pane.uid, &key)),
+                                ..Default::default()
+                            };
+                            if let Some(messages) =
+                                transcripts.get(&transcript_key(&pane.uid, &key))
+                            {
+                                chat.messages = messages.clone();
+                            }
+                            pane.chat.models.insert(model, chat);
+                        }
+                    }
+
+                    pane.terminal_subscription = Some(terminal_subscription);
+                    panes.push(pane);
+                }
+
+                if panes.is_empty() {
+                    continue;
+                }
+                let tree = restore_pane_tree(&saved_session.tree);
+                let tree = if tree_matches_panes(&tree, &panes)
+                    && panes.iter().all(|pane| tree.contains(pane.id))
+                {
+                    tree
+                } else {
+                    PaneNode::Leaf(panes[0].id)
+                };
+                let maximized = saved_session
+                    .maximized_pane_id
+                    .filter(|id| panes.iter().any(|pane| pane.id == *id));
+                let title = SharedString::from(if saved_session.title.is_empty() {
+                    "terminal".to_string()
+                } else {
+                    saved_session.title.clone()
+                });
+                let display_title = SharedString::from(if saved_session.display_title.is_empty() {
+                    title.to_string()
+                } else {
+                    saved_session.display_title.clone()
+                });
+                let session_id = saved_session.id.max(1);
+                focus_by_session.insert(session_id, saved_session.focused_pane);
+                sessions.push(Session {
+                    id: session_id,
+                    uid: if saved_session.uid.is_empty() {
+                        paths::uid("s")
+                    } else {
+                        saved_session.uid.clone()
+                    },
+                    title,
+                    display_title,
+                    logo: if saved_session.logo.is_empty() {
+                        logos::default_logo()
+                    } else {
+                        SharedString::from(saved_session.logo)
+                    },
+                    pane_tree: Some(tree),
+                    maximized_pane_id: maximized,
+                    panes,
+                    status: SessionStatus::Idle,
+                });
+            }
+
+            if sessions.is_empty() {
                 continue;
-            };
-            let title = SharedString::from("terminal 1");
-            let mut pane =
-                TerminalPane::new(id, generation, terminal, title.clone(), title.clone(), pid);
-            pane.chat.selected_model = self.default_agent_model.clone();
-            pane.terminal_subscription = Some(terminal_subscription);
-            let session = Session {
-                id,
-                title: title.clone(),
-                display_title: title,
-                logo: logos::default_logo(),
-                pane_tree: Some(PaneNode::Leaf(id)),
-                maximized_pane_id: None,
-                panes: vec![pane],
-                status: SessionStatus::Idle,
-            };
+            }
+            let mut active_session_idx = project.active_session.min(sessions.len() - 1);
+            if active_session_idx >= sessions.len() {
+                active_session_idx = 0;
+            }
             self.projects.push(Project {
-                id,
+                id: if project.id == 0 {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    id
+                } else {
+                    project.id
+                },
                 name: SharedString::from(project.name),
                 path: project.path,
-                sessions: vec![session],
-                active_session_idx: 0,
+                sessions,
+                active_session_idx,
                 expanded: project.expanded,
             });
         }
-        self.active_project_idx = saved
-            .active_project
+
+        self.next_id = self.next_id.max(max_id + 1);
+        self.active_project_idx = active_project_path
             .as_ref()
-            .and_then(|path| self.projects.iter().position(|p| &p.path == path))
+            .and_then(|path| {
+                self.projects
+                    .iter()
+                    .position(|project| &project.path == path)
+            })
             .unwrap_or(0);
+
         if self.projects.is_empty() {
             let default_dir = std::env::current_dir()
                 .ok()
@@ -1494,15 +1944,24 @@ impl AppState {
             self.next_id += 1;
             let weak = cx.entity().downgrade();
             if let Ok((terminal, pid, generation, terminal_subscription)) =
-                Self::spawn_terminal_view(Some(&default_dir), self.palette.clone(), weak, id, cx)
+                Self::spawn_terminal_view(
+                    Some(&default_dir),
+                    self.palette.clone(),
+                    weak,
+                    id,
+                    None,
+                    cx,
+                )
             {
                 let title = SharedString::from("terminal 1");
                 let mut pane =
                     TerminalPane::new(id, generation, terminal, title.clone(), title.clone(), pid);
+                pane.cwd = Some(default_dir.clone());
                 pane.chat.selected_model = self.default_agent_model.clone();
                 pane.terminal_subscription = Some(terminal_subscription);
                 let session = Session {
                     id,
+                    uid: paths::uid("s"),
                     title: title.clone(),
                     display_title: title,
                     logo: logos::default_logo(),
@@ -1523,14 +1982,19 @@ impl AppState {
                 self.active_project_idx = 0;
             }
         } else {
-            self.focused_pane_id = self.projects[self.active_project_idx]
-                .sessions
-                .first()
-                .and_then(|s| s.panes.first())
-                .map(|p| p.id);
+            let project = &self.projects[self.active_project_idx];
+            let session =
+                &project.sessions[project.active_session_idx.min(project.sessions.len() - 1)];
+            self.focused_pane_id = focus_by_session
+                .get(&session.id)
+                .copied()
+                .flatten()
+                .filter(|id| session.panes.iter().any(|pane| pane.id == *id))
+                .or_else(|| session.panes.first().map(|pane| pane.id));
         }
 
         self.rebuild_session_index();
+        self.schedule_workspace_save(cx);
         cx.notify();
     }
 
@@ -1679,6 +2143,7 @@ impl AppState {
         palette: ColorPalette,
         window_title_target: gpui::WeakEntity<Self>,
         pane_id: usize,
+        scrollback: Option<&str>,
         cx: &mut Context<Self>,
     ) -> Result<(
         Entity<TerminalView>,
@@ -1810,8 +2275,9 @@ impl AppState {
         };
 
         let target = window_title_target.clone();
+        let seed = scrollback.map(str::to_string);
         let terminal = cx.new(|cx| {
-            TerminalView::new(shared_writer, reader, config, cx)
+            TerminalView::new_with_scrollback(shared_writer, reader, config, seed, cx)
                 .with_resize_callback(resize_callback)
                 .with_title_callback(move |window, cx, title| {
                     window.set_window_title(title);
@@ -1878,6 +2344,7 @@ impl AppState {
                 session.logo = title_logo;
             }
         }
+        self.mark_dirty(cx);
         cx.notify();
     }
 
@@ -2940,9 +3407,14 @@ impl AppState {
         let Some(dir) = self.projects.get(project_idx).map(|p| p.path.clone()) else {
             return;
         };
-        if let Ok((terminal, pid, generation, terminal_subscription)) =
-            Self::spawn_terminal_view(Some(&dir), self.palette.clone(), self_weak, next_id, cx)
-        {
+        if let Ok((terminal, pid, generation, terminal_subscription)) = Self::spawn_terminal_view(
+            Some(&dir),
+            self.palette.clone(),
+            self_weak,
+            next_id,
+            None,
+            cx,
+        ) {
             let session_count = self
                 .projects
                 .get(project_idx)
@@ -2966,6 +3438,7 @@ impl AppState {
             pane.input_subscription = Some(input_subscription);
             let session = Session {
                 id: next_id,
+                uid: paths::uid("s"),
                 title: title.clone(),
                 display_title: truncate_title(&title),
                 logo: logos::default_logo(),
@@ -2983,6 +3456,7 @@ impl AppState {
             self.active_project_idx = project_idx;
             self.focused_pane_id = Some(next_id);
             self.rebuild_session_index();
+            self.schedule_workspace_save(cx);
             cx.notify();
         }
     }
@@ -3162,9 +3636,14 @@ impl AppState {
         let next_id = self.next_id;
         self.next_id += 1;
 
-        if let Ok((terminal, pid, generation, terminal_subscription)) =
-            Self::spawn_terminal_view(Some(&folder), self.palette.clone(), self_weak, next_id, cx)
-        {
+        if let Ok((terminal, pid, generation, terminal_subscription)) = Self::spawn_terminal_view(
+            Some(&folder),
+            self.palette.clone(),
+            self_weak,
+            next_id,
+            None,
+            cx,
+        ) {
             let title = SharedString::from("terminal 1");
             let mut pane = TerminalPane::new(
                 next_id,
@@ -3182,6 +3661,7 @@ impl AppState {
             pane.input_subscription = Some(input_subscription);
             let session = Session {
                 id: next_id,
+                uid: paths::uid("s"),
                 title: title.clone(),
                 display_title: title,
                 logo: logos::default_logo(),
@@ -3253,9 +3733,14 @@ impl AppState {
             .and_then(|p| p.sessions.get(s_idx))
             .map(|s| s.panes.len())
             .unwrap_or(0);
-        if let Ok((terminal, pid, generation, terminal_subscription)) =
-            Self::spawn_terminal_view(dir.as_ref(), self.palette.clone(), self_weak, next_id, cx)
-        {
+        if let Ok((terminal, pid, generation, terminal_subscription)) = Self::spawn_terminal_view(
+            dir.as_ref(),
+            self.palette.clone(),
+            self_weak,
+            next_id,
+            None,
+            cx,
+        ) {
             let title = SharedString::from(format!("terminal {}", pane_count + 1));
             let display_title = truncate_title(&title);
             let mut pane = TerminalPane::new(
@@ -3286,6 +3771,7 @@ impl AppState {
             }
             self.focused_pane_id = Some(next_id);
             self.rebuild_session_index();
+            self.schedule_workspace_save(cx);
             cx.notify();
         }
     }
@@ -3305,6 +3791,7 @@ impl AppState {
             } else {
                 session.maximized_pane_id = Some(pane_id);
             }
+            self.schedule_workspace_save(cx);
             cx.notify();
         }
     }
@@ -3360,6 +3847,7 @@ impl AppState {
         if needs_new_session {
             self.create_new_session_in_project(p_idx, window, cx);
         } else {
+            self.schedule_workspace_save(cx);
             cx.notify();
         }
     }
@@ -3400,6 +3888,7 @@ impl AppState {
                 }
             }
         }
+        self.dirty = true;
         cx.notify();
     }
 
@@ -3473,6 +3962,12 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         let (input, subscription) = build_pane_input(pane_id, window, cx);
+        let restore = self
+            .pane_mut(pane_id)
+            .and_then(|pane| pane.restore_draft.take());
+        if let Some(text) = restore.filter(|text| !text.is_empty()) {
+            set_input_text(&input, text, window, cx);
+        }
         if let Some(pane) = self.pane_mut(pane_id) {
             pane.input_state = Some(input.clone());
             pane.input_subscription = Some(subscription);
@@ -3969,6 +4464,7 @@ impl AppState {
     }
 
     fn warm_agent_bridge(&mut self, pane_id: usize) {
+        let save_history = self.settings.restore.agent_history;
         let Some(pane) = self.pane_ref(pane_id) else {
             return;
         };
@@ -3980,13 +4476,23 @@ impl AppState {
         };
         if let Some(model) = pane.chat.selected_model.clone() {
             let fast = pane.chat.fast_mode;
+            let pane_uid = pane.uid.clone();
+            let model_key = conversations::conversation_key(Some(&model));
             let chat = pane.chat.models.entry(model.clone()).or_default();
+            if save_history && chat.conversation.is_none() {
+                chat.conversation = Some(conversations::Log::open(&pane_uid, &model_key));
+            }
             if chat.bridge.is_none() {
                 let bridge = match model.backend {
                     agent_auth::ModelBackend::Rpi => {
                         let selector = format!("{}/{}", model.provider, model.id);
-                        agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector))
-                            .map(ModelBridge::Rpi)
+                        agent_bridge::AgentBridge::spawn_resumed(
+                            &cwd,
+                            chat.rpi_session_id.as_deref(),
+                            Some(&selector),
+                        )
+                        .or_else(|_| agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector)))
+                        .map(ModelBridge::Rpi)
                     }
                     agent_auth::ModelBackend::Omp => {
                         omp_bridge::OmpBridge::spawn(&cwd, &model.id).map(ModelBridge::Omp)
@@ -4000,7 +4506,17 @@ impl AppState {
                 }
             }
         } else if pane.chat.bridge.is_none() {
-            if let Ok(bridge) = agent_bridge::AgentBridge::spawn(&cwd) {
+            if save_history && pane.chat.conversation.is_none() {
+                pane.chat.conversation = Some(conversations::Log::open(
+                    &pane.uid,
+                    &conversations::conversation_key(None),
+                ));
+            }
+            let saved_session = pane.chat.rpi_session_id.clone();
+            if let Ok(bridge) =
+                agent_bridge::AgentBridge::spawn_resumed(&cwd, saved_session.as_deref(), None)
+                    .or_else(|_| agent_bridge::AgentBridge::spawn(&cwd))
+            {
                 pane.chat.cwd = Some(cwd);
                 pane.chat.bridge = Some(bridge);
             }
@@ -4234,9 +4750,16 @@ impl AppState {
         let mut changed = false;
         let mut authenticated = false;
         let mut streaming = false;
+        let save_history = self.settings.restore.agent_history;
         for project in &mut self.projects {
             for session in &mut project.sessions {
                 for pane in &mut session.panes {
+                    if save_history && pane.chat.conversation.is_none() {
+                        pane.chat.conversation = Some(conversations::Log::open(
+                            &pane.uid,
+                            &conversations::conversation_key(None),
+                        ));
+                    }
                     if let Some(auth) = pane.chat.auth.as_mut() {
                         if let Some(receiver) = &auth.discovery {
                             match receiver.try_recv() {
@@ -4311,6 +4834,17 @@ impl AppState {
                         let mut closed = false;
                         for event in bridge.poll() {
                             changed = true;
+                            if save_history {
+                                if let Some(log) = pane.chat.conversation.as_mut() {
+                                    if !matches!(
+                                        &event,
+                                        agent_bridge::AgentEvent::Done
+                                            | agent_bridge::AgentEvent::Closed
+                                    ) {
+                                        log.append_event(&event);
+                                    }
+                                }
+                            }
                             if pane.chat.selected_model.is_none() && pane.chat.autoscroll {
                                 pane.chat.scroll.scroll_to_bottom();
                             }
@@ -4329,17 +4863,38 @@ impl AppState {
                                 other => push_chat_event(&mut pane.chat.messages, other),
                             }
                         }
+                        if let Some(id) = bridge.session_id() {
+                            pane.chat.rpi_session_id = Some(id);
+                        }
                         if closed {
                             pane.chat.bridge = None;
                             pane.chat.cwd = None;
                         }
                     }
                     streaming |= pane.chat.running;
+                    let pane_uid = pane.uid.clone();
                     for (model, chat) in &mut pane.chat.models {
+                        if save_history && chat.conversation.is_none() {
+                            chat.conversation = Some(conversations::Log::open(
+                                &pane_uid,
+                                &conversations::conversation_key(Some(model)),
+                            ));
+                        }
                         if let Some(bridge) = chat.bridge.as_mut() {
                             let mut closed = false;
                             for event in bridge.poll() {
                                 changed = true;
+                                if save_history {
+                                    if let Some(log) = chat.conversation.as_mut() {
+                                        if !matches!(
+                                            &event,
+                                            agent_bridge::AgentEvent::Done
+                                                | agent_bridge::AgentEvent::Closed
+                                        ) {
+                                            log.append_event(&event);
+                                        }
+                                    }
+                                }
                                 if pane.chat.selected_model.as_ref() == Some(model)
                                     && pane.chat.autoscroll
                                 {
@@ -4358,6 +4913,11 @@ impl AppState {
                                         closed = true;
                                     }
                                     other => push_chat_event(&mut chat.messages, other),
+                                }
+                            }
+                            if let Some(ModelBridge::Rpi(bridge)) = chat.bridge.as_ref() {
+                                if let Some(id) = bridge.session_id() {
+                                    chat.rpi_session_id = Some(id);
                                 }
                             }
                             if closed {
@@ -4410,6 +4970,7 @@ impl AppState {
     }
 
     fn submit_agent_prompt(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let save_history = self.settings.restore.agent_history;
         let Some(pane) = self.pane_ref(pane_id) else {
             return;
         };
@@ -4459,6 +5020,9 @@ impl AppState {
                 pane.chat
                     .visible_messages_mut()
                     .push(ChatMessage::new(ChatRole::Status, msg.into()));
+                if let Some(log) = pane.chat.visible_conversation() {
+                    log.append_local(ChatRole::Status, msg);
+                }
             }
             cx.notify();
             return;
@@ -4490,19 +5054,36 @@ impl AppState {
                         if fast { "Fast" } else { "Deep" }
                     ),
                 ));
+                let status = format!(
+                    "Thinking level set to '{level}' ({} mode).",
+                    if fast { "Fast" } else { "Deep" }
+                );
+                if let Some(log) = pane.chat.visible_conversation() {
+                    log.append_local(ChatRole::Status, &status);
+                }
             }
             cx.notify();
             return;
         }
         if let Some(model) = pane.chat.selected_model.clone() {
             let fast = pane.chat.fast_mode;
+            let pane_uid = pane.uid.clone();
+            let model_key = conversations::conversation_key(Some(&model));
             let chat = pane.chat.models.entry(model.clone()).or_default();
+            if save_history && chat.conversation.is_none() {
+                chat.conversation = Some(conversations::Log::open(&pane_uid, &model_key));
+            }
             if chat.bridge.is_none() {
                 let bridge = match model.backend {
                     agent_auth::ModelBackend::Rpi => {
                         let selector = format!("{}/{}", model.provider, model.id);
-                        agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector))
-                            .map(ModelBridge::Rpi)
+                        agent_bridge::AgentBridge::spawn_resumed(
+                            &cwd,
+                            chat.rpi_session_id.as_deref(),
+                            Some(&selector),
+                        )
+                        .or_else(|_| agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector)))
+                        .map(ModelBridge::Rpi)
                     }
                     agent_auth::ModelBackend::Omp => {
                         omp_bridge::OmpBridge::spawn(&cwd, &model.id).map(ModelBridge::Omp)
@@ -4524,6 +5105,9 @@ impl AppState {
             }
             match chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
                 Ok(()) => {
+                    if let Some(log) = chat.conversation.as_mut() {
+                        log.append_user(&prompt);
+                    }
                     chat.messages.push(ChatMessage::new(ChatRole::User, prompt));
                     chat.running = true;
                     pane.attachments.clear();
@@ -4536,8 +5120,17 @@ impl AppState {
             cx.notify();
             return;
         }
+        if save_history && pane.chat.conversation.is_none() {
+            pane.chat.conversation = Some(conversations::Log::open(
+                &pane.uid,
+                &conversations::conversation_key(None),
+            ));
+        }
         if pane.chat.bridge.is_none() {
-            match agent_bridge::AgentBridge::spawn(&cwd) {
+            let saved_session = pane.chat.rpi_session_id.clone();
+            match agent_bridge::AgentBridge::spawn_resumed(&cwd, saved_session.as_deref(), None)
+                .or_else(|_| agent_bridge::AgentBridge::spawn(&cwd))
+            {
                 Ok(bridge) => {
                     pane.chat.cwd = Some(cwd);
                     pane.chat.bridge = Some(bridge);
@@ -4553,6 +5146,9 @@ impl AppState {
         }
         match pane.chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
             Ok(()) => {
+                if let Some(log) = pane.chat.conversation.as_mut() {
+                    log.append_user(&prompt);
+                }
                 pane.chat
                     .messages
                     .push(ChatMessage::new(ChatRole::User, prompt));
@@ -4678,23 +5274,33 @@ impl AppState {
 
     /// Transfer input ownership between the editor and the command's PTY.
     fn on_shell_event(&mut self, pane_id: usize, event: &ShellEvent, cx: &mut Context<Self>) {
-        let Some(pane) = self.pane_mut(pane_id) else {
-            return;
-        };
-        match event {
-            ShellEvent::CommandStarted { .. } => {
-                pane.command_running = true;
-                pane.completion_menu = None;
+        let mut cwd_changed = false;
+        {
+            let Some(pane) = self.pane_mut(pane_id) else {
+                return;
+            };
+            match event {
+                ShellEvent::CommandStarted { .. } => {
+                    pane.command_running = true;
+                    pane.completion_menu = None;
+                }
+                ShellEvent::CommandFinished { .. } | ShellEvent::PromptStart => {
+                    pane.command_running = false;
+                    pane.bottom_input_visible = true;
+                }
+                ShellEvent::CwdChanged(path) => {
+                    pane.cwd = Some(PathBuf::from(path));
+                    cwd_changed = true;
+                }
+                _ => return,
             }
-            ShellEvent::CommandFinished { .. } | ShellEvent::PromptStart => {
-                pane.command_running = false;
-                pane.bottom_input_visible = true;
-            }
-            _ => return,
+            let show_input = pane.should_show_bottom_input(cx);
+            pane.terminal
+                .update(cx, |terminal, _| terminal.set_read_only(show_input));
         }
-        let show_input = pane.should_show_bottom_input(cx);
-        pane.terminal
-            .update(cx, |terminal, _| terminal.set_read_only(show_input));
+        if cwd_changed {
+            self.mark_dirty(cx);
+        }
         cx.notify();
     }
 
@@ -6047,6 +6653,9 @@ impl AppState {
             .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
         {
             return Some(link);
+        }
+        if let Some(cwd) = pane.cwd.clone().filter(|path| path.is_dir()) {
+            return Some(cwd);
         }
         if let Some(project) = self
             .pane_index
@@ -8413,9 +9022,266 @@ impl AppState {
                                     ),
                             )
                             .child(div().flex().gap(px(12.0)).children(cards))
-                            .child(self.render_palette_scheme_picker(cx)),
+                            .child(self.render_palette_scheme_picker(cx))
+                            .child(self.render_data_section(cx)),
                     ),
             )
+    }
+
+    /// Data directory, restore toggles and the "clear saved sessions" action.
+    fn render_data_section(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let tokens = self.tokens(cx);
+        let restore = self.settings.restore.clone();
+        let toggles = [
+            (
+                "restore-sessions",
+                "Restore sessions on launch",
+                "Reopen projects, tabs, splits, focus and working directories.",
+                restore.sessions,
+            ),
+            (
+                "restore-scrollback",
+                "Restore terminal scrollback",
+                "Seed the previous screen text above the fresh shell prompt.",
+                restore.scrollback,
+            ),
+            (
+                "restore-agent-history",
+                "Save agent history",
+                "Keep conversation transcripts and resume rpi sessions after a restart.",
+                restore.agent_history,
+            ),
+        ];
+        let toggle_rows = toggles
+            .into_iter()
+            .map(|(id, title, subtitle, on)| {
+                div()
+                    .id(id)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(tokens.card_border)
+                    .bg(tokens.card_bg)
+                    .cursor(CursorStyle::PointingHand)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_restore_option(id, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(tokens.text_primary)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(tokens.text_secondary)
+                                    .child(subtitle),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded_full()
+                            .bg(if on {
+                                tokens.pill_active_bg
+                            } else {
+                                tokens.pill_inactive_bg
+                            })
+                            .text_size(px(11.0))
+                            .text_color(if on {
+                                tokens.pill_active_fg
+                            } else {
+                                tokens.text_secondary
+                            })
+                            .child(if on { "On" } else { "Off" }),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        let confirm = self.clear_data_confirm;
+        let data_dir = paths::data_dir();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(20.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(tokens.text_primary)
+                            .child("Data & Sessions"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(tokens.text_secondary)
+                            .child("Everything Kathamo remembers is stored in this folder."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(tokens.card_border)
+                    .bg(tokens.card_bg)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(tokens.text_secondary)
+                                    .child("App data folder"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(tokens.text_primary)
+                                    .child(data_dir.display().to_string()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("open-data-folder")
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(tokens.card_border)
+                            .text_size(px(12.0))
+                            .text_color(tokens.text_primary)
+                            .cursor(CursorStyle::PointingHand)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_data_folder(cx);
+                            }))
+                            .child("Open folder"),
+                    ),
+            )
+            .children(toggle_rows)
+            .child(
+                div()
+                    .id("clear-saved-data")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(tokens.card_border)
+                    .bg(tokens.card_bg)
+                    .cursor(CursorStyle::PointingHand)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.clear_saved_data(cx);
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(tokens.block_failure)
+                                    .child("Clear saved sessions & history"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(tokens.text_secondary)
+                                    .child("Deletes saved layouts, scrollback and transcripts. Settings are kept."),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .rounded_full()
+                            .bg(tokens.pill_inactive_bg)
+                            .text_size(px(11.0))
+                            .text_color(if confirm {
+                                tokens.block_failure
+                            } else {
+                                tokens.text_secondary
+                            })
+                            .child(if confirm { "Confirm clear" } else { "Clear" }),
+                    ),
+            )
+    }
+
+    fn toggle_restore_option(&mut self, id: &'static str, cx: &mut Context<Self>) {
+        match id {
+            "restore-sessions" => self.settings.restore.sessions = !self.settings.restore.sessions,
+            "restore-scrollback" => {
+                self.settings.restore.scrollback = !self.settings.restore.scrollback
+            }
+            "restore-agent-history" => {
+                self.settings.restore.agent_history = !self.settings.restore.agent_history
+            }
+            _ => return,
+        }
+        self.clear_data_confirm = false;
+        if let Err(error) = settings::save_atomic(&self.settings) {
+            eprintln!("failed to save settings: {error}");
+        }
+        cx.notify();
+    }
+
+    fn open_data_folder(&mut self, cx: &mut Context<Self>) {
+        if let Err(error) = paths::open_in_file_manager(&paths::data_dir()) {
+            eprintln!("failed to open the data folder: {error}");
+        }
+        cx.notify();
+    }
+
+    fn clear_saved_data(&mut self, cx: &mut Context<Self>) {
+        if !self.clear_data_confirm {
+            self.clear_data_confirm = true;
+            cx.notify();
+            return;
+        }
+        self.clear_data_confirm = false;
+        if let Err(error) = std::fs::remove_file(paths::workspace_path()) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("failed to remove saved workspace: {error}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(paths::sessions_dir());
+        let _ = std::fs::create_dir_all(paths::sessions_dir());
+        if let Err(error) = conversations::clear_all() {
+            eprintln!("failed to clear conversations: {error}");
+        }
+        self.dirty = false;
+        cx.notify();
     }
 
     /// Warp / GitHub terminal palette selector shown under the theme cards.
@@ -9311,6 +10177,7 @@ impl AppState {
         } else {
             self.focused_pane_id = None;
         }
+        self.schedule_workspace_save(cx);
         cx.notify();
     }
 }
@@ -10053,10 +10920,17 @@ fn main() -> Result<()> {
         .run(|cx: &mut App| {
             #[cfg(target_os = "linux")]
             ensure_linux_desktop_entry();
+            if let Err(error) = paths::ensure_dirs() {
+                eprintln!("failed to create app data directories: {error}");
+            }
+            let app_settings = settings::load();
+            let restore_enabled = app_settings.restore.sessions
+                && std::env::var_os("KATHAMO_DISABLE_RESTORE").is_none();
+            let load_history = app_settings.restore.agent_history && restore_enabled;
             let window_icon = image::load_from_memory(APP_ICON_PNG).ok().map(|image| Arc::new(image.into_rgba8()));
             gpui_component::init(cx);
             init_kathamo_input_bindings(cx);
-            let initial_mode = ThemePreference::System.resolve_mode(cx.window_appearance());
+            let initial_mode = app_settings.theme.resolve_mode(cx.window_appearance());
             gpui_component::Theme::change(initial_mode, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
@@ -10066,13 +10940,18 @@ fn main() -> Result<()> {
                 let _ = shell_history::cached();
             });
 
-            let palette = load_palette(PaletteScheme::default(), initial_mode.is_dark());
-            let persistence_path = workspace_state::state_path();
+            let palette = load_palette(app_settings.palette_scheme, initial_mode.is_dark());
+            let persistence_path = Some(paths::workspace_path());
 
-            let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
+            let displays: Vec<Bounds<Pixels>> = cx
+                .displays()
+                .iter()
+                .map(|display| display.visible_bounds())
+                .collect();
+            let bounds = settings::window_bounds(app_settings.window, &displays);
             cx.open_window(
                 WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_bounds: Some(bounds),
                     titlebar: Some(TitleBar::title_bar_options()),
                     window_decorations: Some(WindowDecorations::Client),
                     app_id: Some("kathamo".to_string()),
@@ -10088,14 +10967,14 @@ fn main() -> Result<()> {
                         pane_index: HashMap::new(),
                         palette: palette.clone(),
                         focused_pane_id: None,
-                        sidebar_visible: true,
+                        sidebar_visible: app_settings.sidebar.visible,
                         active_view: ActiveView::Workspace,
-                        theme_preference: ThemePreference::System,
-                        palette_scheme: PaletteScheme::default(),
-                        default_agent_model: None,
+                        theme_preference: app_settings.theme,
+                        palette_scheme: app_settings.palette_scheme,
+                        default_agent_model: app_settings.default_agent_model.clone(),
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
-                        sidebar_width: SIDEBAR_WIDTH,
+                        sidebar_width: px(app_settings.sidebar.width.max(120.0)),
                         drag_start_pos: None,
                         persistence_path: persistence_path.clone(),
                         save_generation: Arc::new(AtomicU64::new(0)),
@@ -10110,47 +10989,121 @@ fn main() -> Result<()> {
                         terminal_context_menu: None,
                         history_search: None,
                         image_viewer: None,
+                        settings: app_settings.clone(),
+                        dirty: false,
+                        last_window_bounds: app_settings.window,
+                        persistence_enabled: std::env::var_os("KATHAMO_DISABLE_RESTORE").is_none(),
+                        clear_data_confirm: false,
                     });
                     app_state.update(cx, |state, cx| state.observe_appearance(window, cx));
+
+                    // Close button / window-manager close: flush everything
+                    // synchronously before the window goes away.
+                    let close_state = app_state.downgrade();
+                    window.on_window_should_close(cx, move |window, cx| {
+                        if let Some(state) = close_state.upgrade() {
+                            let _ = state.update(cx, |state, cx| {
+                                state.save_all_sync(Some(window), cx);
+                            });
+                        }
+                        true
+                    });
 
                     let weak_state = app_state.downgrade();
                     let load_path = persistence_path.clone();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-                        let saved = cx
+                        let restored = cx
                             .background_executor()
                             .spawn(async move {
-                                load_path
-                                    .as_deref()
-                                    .map(workspace_state::load)
-                                    .unwrap_or_default()
+                                let Some(path) = load_path else {
+                                    return RestoreData {
+                                        workspace: workspace_state::SavedWorkspace::default(),
+                                        scrollbacks: HashMap::new(),
+                                        transcripts: HashMap::new(),
+                                    };
+                                };
+                                let workspace = if restore_enabled {
+                                    workspace_state::load(&path)
+                                } else {
+                                    workspace_state::SavedWorkspace::default()
+                                };
+                                let mut scrollbacks = HashMap::new();
+                                let mut transcripts = HashMap::new();
+                                let mut live_uids = HashSet::new();
+                                for project in &workspace.projects {
+                                    for session in &project.sessions {
+                                        for pane in &session.panes {
+                                            live_uids.insert(pane.uid.clone());
+                                            if let Some(text) =
+                                                workspace_state::read_scrollback(&pane.uid)
+                                            {
+                                                scrollbacks.insert(pane.uid.clone(), text);
+                                            }
+                                            if load_history {
+                                                let keys = std::iter::once(None::<&agent_auth::AgentModel>)
+                                                    .chain(pane
+                                                        .chat
+                                                        .models
+                                                        .iter()
+                                                        .map(|chat| chat.model.as_ref()));
+                                                for model in keys {
+                                                    let key = conversations::conversation_key(model);
+                                                    let conversation_path = paths::conversations_dir()
+                                                        .join(&pane.uid)
+                                                        .join(format!("{key}.jsonl"));
+                                                    let messages = conversations::load(&conversation_path);
+                                                    if !messages.is_empty() {
+                                                        transcripts.insert(
+                                                            transcript_key(&pane.uid, &key),
+                                                            messages,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                // Never prune from an empty/malformed workspace:
+                                // that would delete scrollback for every pane.
+                                if restore_enabled && !workspace.projects.is_empty() {
+                                    workspace_state::prune_stale_scrollbacks(&live_uids);
+                                }
+                                RestoreData {
+                                    workspace,
+                                    scrollbacks,
+                                    transcripts,
+                                }
                             })
                             .await;
                         let _ = weak_state
-                            .update(cx, |state, cx| state.apply_saved_workspace(saved, cx));
+                            .update(cx, |state, cx| state.apply_saved_workspace(restored, cx));
                     })
                     .detach();
 
-                    let quit_path = persistence_path.clone();
                     app_state.update(cx, |state, cx| {
                         state.persistence_path = persistence_path.clone();
                         state.startup_loaded = false;
                         state.quit_subscription = Some(cx.on_app_quit(move |state, cx| {
-                            state.save_generation.fetch_add(1, Ordering::SeqCst);
-                            let path = quit_path.clone();
-                            let snapshot = state.saved_workspace();
-                            cx.background_executor().spawn(async move {
-                                if let Some(path) = path {
-                                    if let Err(error) =
-                                        workspace_state::save_atomic(&path, &snapshot)
-                                    {
-                                        eprintln!(
-                                            "failed to save workspace state on quit: {error}"
-                                        );
-                                    }
-                                }
-                            })
+                            state.save_all_sync(None, cx);
+                            async {}
                         }));
                     });
+
+                    // Periodic snapshot: bounds the amount of work lost if the
+                    // process is killed instead of closed.
+                    let autosave_state = app_state.downgrade();
+                    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                        loop {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_secs(30))
+                                .await;
+                            match autosave_state.update(cx, |state, cx| state.autosave(cx)) {
+                                Ok(()) => {}
+                                Err(_) => break,
+                            }
+                        }
+                    })
+                    .detach();
 
                     let agent_state_weak = app_state.downgrade();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
@@ -10357,7 +11310,7 @@ mod resize_tests {
         let dir = std::env::current_dir().expect("current dir");
         let weak = cx.entity().downgrade();
         let (terminal, pid, generation, terminal_subscription) =
-            AppState::spawn_terminal_view(Some(&dir), palette.clone(), weak, 1, cx)
+            AppState::spawn_terminal_view(Some(&dir), palette.clone(), weak, 1, None, cx)
                 .expect("terminal view");
         let title = SharedString::from("terminal 1");
 
@@ -10375,6 +11328,7 @@ mod resize_tests {
                 path: dir,
                 sessions: vec![Session {
                     id: 1,
+                    uid: paths::uid("s"),
                     title: title.clone(),
                     display_title: title,
                     logo: logos::default_logo(),
@@ -10416,6 +11370,11 @@ mod resize_tests {
             terminal_context_menu: None,
             history_search: None,
             image_viewer: None,
+            settings: settings::AppSettings::default(),
+            dirty: false,
+            last_window_bounds: None,
+            persistence_enabled: false,
+            clear_data_confirm: false,
         }
     }
 
@@ -10435,7 +11394,7 @@ mod resize_tests {
                 let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
                 cx.open_window(
                     WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
                         titlebar: Some(TitleBar::title_bar_options()),
                         window_decorations: Some(WindowDecorations::Client),
                         app_id: Some("kathamo".to_string()),

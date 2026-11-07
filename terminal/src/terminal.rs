@@ -545,6 +545,47 @@ impl TerminalState {
         term.bounds_to_string(start, end).trim_end().to_string()
     }
 
+    /// Snapshot the whole buffer (scrollback + visible screen) as plain text,
+    /// keeping the newest `max_lines` lines. Used to persist a pane's output
+    /// across restarts; control characters are never produced by
+    /// `bounds_to_string`, so the result is safe to feed back with `feed_raw`.
+    pub fn buffer_text(&self, max_lines: usize) -> String {
+        if max_lines == 0 {
+            return String::new();
+        }
+        let term = self.term.lock();
+        let history = term.grid().history_size();
+        let screen_lines = term.screen_lines();
+        let total = history + screen_lines;
+        let keep = max_lines.min(total);
+        if keep == 0 {
+            return String::new();
+        }
+
+        let first = total - keep;
+        let last_column = term.last_column();
+        let mut lines = Vec::with_capacity(keep);
+        for index in first..total {
+            let line = Line(index as i32 - history as i32);
+            let start = Point::new(line, Column(0));
+            let end = Point::new(line, last_column);
+            lines.push(term.bounds_to_string(start, end).trim_end().to_string());
+        }
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+
+        let mut text = String::with_capacity(lines.iter().map(|line| line.len() + 2).sum());
+        for line in lines {
+            text.push_str(&line);
+            text.push_str("\r\n");
+        }
+        text
+    }
+
     /// Retrieve the bottom N lines from the visible viewport.
     pub fn bottom_lines(&self, n: usize) -> Vec<String> {
         let mut lines = Vec::new();
@@ -953,5 +994,27 @@ mod tests {
         let mut terminal = state(40, 6);
         terminal.process_bytes(b"hello world\r\n");
         assert_eq!(terminal.line_text(Line(0)), "hello world");
+    }
+
+    #[test]
+    fn buffer_text_keeps_the_newest_lines_and_trims_blanks() {
+        let mut terminal = state(20, 3);
+        terminal.process_bytes(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+
+        let all = terminal.buffer_text(100);
+        assert!(all.contains("one"));
+        assert!(all.contains("four"));
+        assert!(all.ends_with("\r\n"));
+
+        let recent = terminal.buffer_text(2);
+        assert!(!recent.contains("one"));
+        assert!(recent.contains("four"));
+        assert_eq!(terminal.buffer_text(0), "");
+    }
+
+    #[test]
+    fn buffer_text_of_an_empty_terminal_is_empty() {
+        let terminal = state(20, 3);
+        assert!(terminal.buffer_text(100).is_empty());
     }
 }

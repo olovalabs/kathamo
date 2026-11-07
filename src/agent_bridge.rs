@@ -4,10 +4,11 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Events from one persistent rpi RPC session.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
     Text(String),
     Thinking(String),
@@ -59,6 +60,21 @@ impl AgentBridge {
 
     pub fn spawn_model(cwd: &Path, model: Option<&str>) -> Result<Self, String> {
         Self::spawn_session(cwd, None, model)
+    }
+
+    /// Reopen a durable rpi conversation, optionally with a specific model.
+    pub fn spawn_resumed(
+        cwd: &Path,
+        session: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::spawn_session(cwd, session, model)
+    }
+
+    /// The durable conversation id reported by `get_state`, once the process
+    /// has started. Persist this to resume the conversation after a restart.
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id.lock().ok().and_then(|id| id.clone())
     }
 
     fn spawn_session(

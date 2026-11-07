@@ -10,6 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Zed-style per-platform app data directories (`src/paths.rs`): workspace, scrollback, agent conversations and backups under the OS data dir; user settings under the OS config dir. Missing folders are created on launch.
+- Full session restoration: projects, sidebar tabs, nested split layouts, focused pane, per-pane working directories, tab titles/logos, input drafts, command history, sidebar width and window geometry are saved and restored after a restart.
+- Terminal scrollback is snapshotted per pane and seeded above the fresh shell prompt on restore.
+- Append-only agent conversation history in `conversations/<pane-uid>/*.jsonl`; restored transcripts match the previous UI, and rpi conversations resume via `rpi --session <id>` on the next prompt (OMP restores the transcript only).
+- **Settings → Data & Sessions** section: shows the data folder, opens it in the file manager, toggles session/scrollback/agent-history restore, and clears saved sessions.
+- Synchronous save on window close and app quit, plus a 30-second autosave for crash recovery.
+- One-time migration from the legacy `workspace.json` (including the old Markup location) with a timestamped backup in `<data>/backups/`.
+- `KATHAMO_DATA_DIR` and `KATHAMO_DISABLE_RESTORE` environment overrides.
 - Render streamed agent replies as Markdown, including headings, lists, links, and syntax-highlighted code blocks.
 - Display all tool call details in rich Zed-style cards showing tool badges, call ID tags, inline argument summaries, status indicators, line counts, pretty-printed arguments with a copy button, and bounded scrollable outputs with one-click copying.
 - Collapsible thinking accordions that display live streaming thoughts while reasoning and automatically fold into compact headers when the response begins.

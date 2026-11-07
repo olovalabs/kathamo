@@ -7233,7 +7233,7 @@ impl AppState {
                                 .px(px(10.0))
                                 .py(px(3.0))
                                 .rounded_full()
-                                .bg(tokens.card_bg)
+                                .bg(tokens.card_hover)
                                 .text_size(px(11.0))
                                 .text_color(tokens.text_muted)
                                 .child(message.text.clone()),

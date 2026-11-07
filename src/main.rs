@@ -1,12 +1,13 @@
 use anyhow::Result;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, App, AppContext, Bounds, ClipboardEntry, Context, CursorStyle,
-    Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Rems,
-    Render, ScrollEvent, SharedString, StatefulInteractiveElement as _, StyleRefinement, Styled,
-    StyledImage as _, Transformation, Window, WindowBounds, WindowControlArea, WindowDecorations,
-    WindowOptions, actions, deferred, div, img, percentage, px, relative, rems, rgba, size, svg,
+    Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClipboardEntry, Context,
+    CursorStyle, Div, Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
+    Point, Rems, Render, ScrollEvent, SharedString, StatefulInteractiveElement as _,
+    StyleRefinement, Styled, StyledImage as _, Transformation, Window, WindowBounds,
+    WindowControlArea, WindowDecorations, WindowOptions, actions, deferred, div, img, percentage,
+    px, relative, rems, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::highlighter::HighlightTheme;
@@ -223,6 +224,332 @@ fn format_tool_summary(_name: &str, input: &str) -> String {
     clip(input.lines().next().unwrap_or("").trim())
 }
 
+/// Markdown body shared by user and assistant chat messages.
+///
+/// Mirrors the Wake reading pane: GFM tables/quotes/dividers come from the
+/// component, headings scale relative to body text, and code blocks get a
+/// raised surface plus a language label and copy action.
+fn chat_markdown(
+    id: SharedString,
+    text: impl Into<SharedString>,
+    base: Pixels,
+    paragraph_gap: Rems,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> TextView {
+    let dark = cx.theme().is_dark();
+    let themed_id: SharedString = format!("{id}-{}", if dark { "dark" } else { "light" }).into();
+
+    TextView::markdown(themed_id, text, window, cx)
+        .style(
+            TextViewStyle {
+                heading_base_font_size: base,
+                paragraph_gap,
+                is_dark: dark,
+                highlight_theme: if dark {
+                    HighlightTheme::default_dark()
+                } else {
+                    HighlightTheme::default_light()
+                },
+                ..Default::default()
+            }
+            .heading_font_size(|level, base| match level {
+                1 => base * 1.45,
+                2 => base * 1.28,
+                3 => base * 1.14,
+                4 => base * 1.05,
+                _ => base,
+            })
+            .code_block(
+                StyleRefinement::default()
+                    .bg(tokens.card_hover)
+                    .border_1()
+                    .border_color(tokens.border_subtle)
+                    .rounded(px(8.0))
+                    .px(px(16.0))
+                    .py(px(12.0)),
+            ),
+        )
+        .code_block_actions(move |block, _window, _cx| {
+            let code = block.code();
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(6.0))
+                .text_size(px(11.0))
+                .text_color(tokens.text_muted)
+                .when_some(block.lang(), |actions, lang| actions.child(lang))
+                .child(
+                    div()
+                        .id("chat-code-copy")
+                        .size(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |style| style.bg(tokens.sidebar_item_hover))
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                code.to_string(),
+                            ));
+                        })
+                        .child(
+                            svg()
+                                .path("icons/copy.svg")
+                                .size(px(12.0))
+                                .text_color(tokens.text_muted),
+                        ),
+                )
+                .into_any_element()
+        })
+        .selectable(true)
+        .w_full()
+        .text_size(base)
+        .text_color(tokens.text_primary)
+}
+
+/// One collapsed tool-call card, matching Wake's tool cluster:
+/// chevron + tool name + inline argument preview + state badge on the header,
+/// then up to 600 characters of Input/Output in monospace panels.
+fn chat_tool_card(
+    pane_id: usize,
+    index: usize,
+    tool: &ChatTool,
+    tokens: ThemeTokens,
+    on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    let expanded = tool.expanded;
+    let summary = format_tool_summary(&tool.name, &tool.input);
+    let failed = tool.state == ToolState::Failed;
+    let mono = MONO_FONT;
+
+    let mut card = div()
+        .w_full()
+        .min_w_0()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(tokens.border_subtle)
+        .bg(tokens.card_hover)
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .id(SharedString::from(format!(
+                    "tool-card-header-{pane_id}-{index}"
+                )))
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .cursor(CursorStyle::PointingHand)
+                .text_size(px(11.5))
+                .text_color(tokens.text_muted)
+                .hover(move |style| style.text_color(tokens.text_primary))
+                .on_mouse_down(MouseButton::Left, on_toggle)
+                .child(
+                    svg()
+                        .path(if expanded {
+                            "icons/chevron-down.svg"
+                        } else {
+                            "icons/chevron-right.svg"
+                        })
+                        .size(px(11.0))
+                        .flex_shrink_0()
+                        .text_color(tokens.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(tokens.text_primary)
+                        .child(tool.name.clone()),
+                )
+                .when(!summary.is_empty(), |header| {
+                    header.child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font_family(mono)
+                            .child(summary),
+                    )
+                })
+                .child(div().flex_1())
+                .when(failed, |header| {
+                    header.child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(7.0))
+                            .rounded(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(tokens.block_failure)
+                            .bg(tokens.block_failure.opacity(0.12))
+                            .child("Failed"),
+                    )
+                })
+                .when(tool.state == ToolState::Running, |header| {
+                    header.child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(7.0))
+                            .rounded(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(tokens.block_warning)
+                            .bg(tokens.block_warning.opacity(0.12))
+                            .child("Running…"),
+                    )
+                }),
+        );
+
+    if expanded {
+        let mut body = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .border_t_1()
+            .border_color(tokens.border_subtle)
+            .px(px(12.0))
+            .py(px(10.0));
+
+        let display_input = serde_json::from_str::<serde_json::Value>(&tool.input)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or_else(|| tool.input.clone());
+        if !display_input.trim().is_empty() {
+            body = body.child(chat_tool_section(
+                SharedString::from(format!("copy-tool-input-{pane_id}-{index}")),
+                "Input",
+                &display_input,
+                false,
+                tokens,
+            ));
+        }
+
+        if !tool.output.trim().is_empty() {
+            body = body.child(chat_tool_section(
+                SharedString::from(format!("copy-tool-{pane_id}-{index}")),
+                "Output",
+                &tool.output,
+                failed,
+                tokens,
+            ));
+        } else if tool.state == ToolState::Running {
+            body = body.child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(tokens.text_muted)
+                    .child("Running…"),
+            );
+        }
+
+        card = card.child(body);
+    }
+
+    card
+}
+
+fn chat_tool_section(
+    copy_id: SharedString,
+    label: &'static str,
+    body: &str,
+    is_error: bool,
+    tokens: ThemeTokens,
+) -> Div {
+    let (shown, truncated) = clip_tool_text(body, TOOL_TEXT_PREVIEW_LIMIT);
+    let full = body.to_string();
+    let copy_tooltip: SharedString = format!("Copy full {}", label.to_lowercase()).into();
+
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(px(11.0))
+                .text_color(if is_error {
+                    tokens.block_failure
+                } else {
+                    tokens.text_muted
+                })
+                .child(label)
+                .when(truncated, |header| {
+                    header.child(
+                        div()
+                            .text_color(tokens.text_muted)
+                            .child(format!("First {} characters", TOOL_TEXT_PREVIEW_LIMIT)),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id(copy_id)
+                        .size(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .cursor(CursorStyle::PointingHand)
+                        .text_color(tokens.text_muted)
+                        .hover(move |style| {
+                            style
+                                .bg(tokens.sidebar_item_hover)
+                                .text_color(tokens.text_primary)
+                        })
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(copy_tooltip.clone())
+                                .build(window, cx)
+                        })
+                        .on_click(move |_, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(full.clone()));
+                        })
+                        .child(
+                            svg()
+                                .path("icons/copy.svg")
+                                .size(px(12.0))
+                                .text_color(tokens.text_muted),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .px(px(10.0))
+                .py(px(7.0))
+                .rounded(px(5.0))
+                .bg(if is_error {
+                    tokens.block_failure.opacity(0.08)
+                } else {
+                    tokens.card_bg
+                })
+                .whitespace_normal()
+                .text_size(px(11.5))
+                .line_height(relative(1.6))
+                .font_family(MONO_FONT)
+                .text_color(if is_error {
+                    tokens.block_failure
+                } else {
+                    tokens.text_secondary
+                })
+                .child(shown),
+        )
+}
+
 fn update_chat_tool(
     messages: &mut Vec<ChatMessage>,
     id: Option<String>,
@@ -246,7 +573,6 @@ fn update_chat_tool(
     if let Some(tool) = existing {
         tool.output = output;
         tool.state = state;
-        tool.expanded = true;
     } else {
         messages.push(ChatMessage {
             role: ChatRole::Tool,
@@ -257,9 +583,9 @@ fn update_chat_tool(
                 input: String::new(),
                 output,
                 state,
-                expanded: true,
+                expanded: false,
             }),
-            expanded: true,
+            expanded: false,
         });
     }
 }
@@ -273,7 +599,6 @@ fn finish_chat_tools(messages: &mut [ChatMessage]) {
         .filter(|tool| tool.state == ToolState::Running)
     {
         tool.state = ToolState::Unknown;
-        tool.expanded = true;
     }
 }
 
@@ -289,9 +614,9 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                     input,
                     output: String::new(),
                     state: ToolState::Running,
-                    expanded: true,
+                    expanded: false,
                 }),
-                expanded: true,
+                expanded: false,
             });
             return;
         }
@@ -342,7 +667,11 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
             return;
         }
     }
-    messages.push(ChatMessage::new(role, text));
+    let mut message = ChatMessage::new(role, text);
+    if role == ChatRole::Thinking {
+        message.expanded = false;
+    }
+    messages.push(message);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3496,32 +3825,6 @@ impl AppState {
         }
     }
 
-    fn copy_chat_tool_input(&self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
-        if let Some(pane) = self.pane_ref(pane_id) {
-            if let Some(msg) = pane.chat.visible_messages().get(index) {
-                if let Some(tool) = &msg.tool {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(tool.input.clone()));
-                }
-            }
-        }
-    }
-
-    fn copy_chat_tool_output(&self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
-        if let Some(pane) = self.pane_ref(pane_id) {
-            if let Some(msg) = pane.chat.visible_messages().get(index) {
-                let text = if let Some(tool) = &msg.tool {
-                    if !tool.output.is_empty() {
-                        tool.output.clone()
-                    } else {
-                        tool.input.clone()
-                    }
-                } else {
-                    msg.text.clone()
-                };
-                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-            }
-        }
-    }
     fn warm_agent_bridge(&mut self, pane_id: usize) {
         let Some(pane) = self.pane_ref(pane_id) else {
             return;
@@ -6786,207 +7089,87 @@ impl AppState {
             pane.chat.scroll.scroll_to_bottom();
         }
 
-        let messages = pane.chat.visible_messages().iter().enumerate().map(|(index, message)| {
-            match message.role {
-                ChatRole::User => {
-                    div()
+        let messages = pane
+            .chat
+            .visible_messages()
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let inner: AnyElement = match message.role {
+                    ChatRole::User => div()
                         .w_full()
-                        .p(px(12.0))
-                        .rounded(px(6.0))
-                        .bg(tokens.pane_header_bg)
-                        .border_1()
-                        .border_color(tokens.border_subtle)
                         .flex()
-                        .flex_col()
-                        .gap(px(6.0))
+                        .justify_end()
                         .child(
                             div()
-                                .text_size(px(11.0))
-                                .text_color(tokens.text_primary)
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .child("You")
+                                .max_w(px(540.0))
+                                .min_w_0()
+                                .px(px(14.0))
+                                .py(px(8.0))
+                                .rounded(px(12.0))
+                                .bg(tokens.card_hover)
+                                .text_size(px(13.5))
+                                .line_height(relative(1.85))
+                                .child(chat_markdown(
+                                    SharedString::from(format!(
+                                        "agent-user-{pane_id}-{conversation}-{index}"
+                                    )),
+                                    message.text.clone(),
+                                    px(13.5),
+                                    rems(0.5),
+                                    tokens,
+                                    window,
+                                    cx,
+                                )),
                         )
-                        .child(
-                            div()
-                                .w_full()
-                                .font_family(MONO_FONT)
-                                .text_size(px(13.0))
-                                .text_color(tokens.text_primary)
-                                .child(message.text.clone())
-                        )
-                        .into_any_element()
-                }
-                ChatRole::Assistant => {
-                    div()
+                        .into_any_element(),
+                    ChatRole::Assistant => div()
                         .w_full()
-                        .p(px(12.0))
-                        .rounded(px(6.0))
-                        .bg(tokens.pane_header_bg)
-                        .border_1()
-                        .border_color(tokens.border_subtle)
-                        .flex()
-                        .flex_col()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(tokens.text_primary)
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .child("Agent")
-                        )
-                        .child(
-                            TextView::markdown(
-                                SharedString::from(format!("agent-markdown-{}-{}-{}-{}", pane_id, conversation, index, cx.theme().is_dark())),
-                                message.text.clone(),
-                                window,
-                                cx,
-                            )
-                            .selectable(true)
+                        .min_w_0()
+                        .text_size(px(13.0))
+                        .line_height(relative(1.9))
+                        .child(chat_markdown(
+                            SharedString::from(format!(
+                                "agent-markdown-{pane_id}-{conversation}-{index}"
+                            )),
+                            message.text.clone(),
+                            px(13.0),
+                            rems(0.6),
+                            tokens,
+                            window,
+                            cx,
+                        ))
+                        .into_any_element(),
+                    ChatRole::Thinking => {
+                        let is_expanded = message.expanded;
+                        let summary =
+                            clip_tool_text(message.text.lines().next().unwrap_or("").trim(), 88).0;
+                        let mut panel = div()
                             .w_full()
-                            .text_size(px(13.0))
-                            .text_color(tokens.text_primary)
-                        )
-                        .into_any_element()
-                }
-                ChatRole::Thinking => {
-                    let is_expanded = message.expanded;
-                    let first_line = message.text.lines().next().unwrap_or("").trim();
-                    div()
-                        .id(SharedString::from(format!("thinking-block-{pane_id}-{index}")))
-                        .w_full()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(tokens.border_subtle)
-                        .bg(tokens.pane_header_bg)
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("thinking-header-{pane_id}-{index}")))
-                                .w_full()
-                                .cursor(CursorStyle::PointingHand)
-                                .hover(move |s| s.bg(tokens.sidebar_item_hover))
-                                .px(px(10.0))
-                                .py(px(6.0))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .gap(px(8.0))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.toggle_chat_tool_expanded(pane_id, index, cx);
-                                    }),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .min_w_0()
-                                        .child(
-                                            svg()
-                                                .path(if is_expanded { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
-                                                .size(px(11.0))
-                                                .text_color(tokens.text_muted)
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.0))
-                                                .font_weight(gpui::FontWeight::BOLD)
-                                                .text_color(tokens.text_secondary)
-                                                .child("Thinking")
-                                        )
-                                        .when(!is_expanded && !first_line.is_empty(), |view| {
-                                            view.child(
-                                                div()
-                                                    .text_size(px(11.0))
-                                                    .text_color(tokens.text_muted)
-                                                    .truncate()
-                                                    .child(first_line.to_string())
-                                            )
-                                        })
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(tokens.text_muted)
-                                        .flex_shrink_0()
-                                        .child(if is_expanded { "Hide reasoning" } else { "Show reasoning" })
-                                )
-                        )
-                        .when(is_expanded, |block| {
-                            block
-                                .border_t_1()
-                                .border_color(tokens.border_subtle)
-                                .child(
-                                    div()
-                                        .p(px(10.0))
-                                        .child(
-                                            TextView::markdown(
-                                                SharedString::from(format!("agent-thinking-{}-{}-{}-{}", pane_id, conversation, index, cx.theme().is_dark())),
-                                                message.text.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                            .selectable(true)
-                                            .w_full()
-                                            .text_size(px(12.0))
-                                            .text_color(tokens.text_secondary)
-                                        )
-                                )
-                        })
-                        .into_any_element()
-                }
-                ChatRole::Status => {
-                    div()
-                        .w_full()
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .rounded(px(5.0))
-                        .bg(tokens.pane_bg)
-                        .border_1()
-                        .border_color(tokens.border_subtle)
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            div().size(px(5.0)).rounded_full().bg(tokens.text_muted)
-                        )
-                        .child(
-                            div().text_size(px(11.0)).text_color(tokens.text_muted).child(message.text.clone())
-                        )
-                        .into_any_element()
-                }
-                ChatRole::Tool => {
-                    if let Some(tool) = &message.tool {
-                        let summary = format_tool_summary(&tool.name, &tool.input);
-                        let line_count = if tool.output.is_empty() { 0 } else { tool.output.lines().count() };
-                        let is_expanded = tool.expanded;
-                        div()
-                            .id(SharedString::from(format!("tool-card-{pane_id}-{index}")))
-                            .w_full()
-                            .rounded(px(6.0))
+                            .min_w_0()
+                            .rounded(px(8.0))
                             .border_1()
-                            .border_color(if is_expanded { tokens.border } else { tokens.border_subtle })
-                            .bg(tokens.pane_header_bg)
+                            .border_color(tokens.border_subtle)
+                            .bg(tokens.card_hover)
                             .overflow_hidden()
                             .flex()
                             .flex_col()
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("tool-card-header-{pane_id}-{index}")))
+                                    .id(SharedString::from(format!(
+                                        "thinking-header-{pane_id}-{index}"
+                                    )))
                                     .w_full()
-                                    .cursor(CursorStyle::PointingHand)
-                                    .hover(move |s| s.bg(tokens.sidebar_item_hover))
-                                    .px(px(10.0))
-                                    .py(px(7.0))
+                                    .min_w_0()
                                     .flex()
                                     .items_center()
-                                    .justify_between()
-                                    .gap(px(8.0))
+                                    .gap(px(6.0))
+                                    .px(px(12.0))
+                                    .py(px(8.0))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .text_size(px(11.5))
+                                    .text_color(tokens.text_muted)
+                                    .hover(move |style| style.text_color(tokens.text_primary))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _, _, cx| {
@@ -6995,336 +7178,128 @@ impl AppState {
                                         }),
                                     )
                                     .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .min_w_0()
-                                            .child(
-                                                svg()
-                                                    .path(if is_expanded { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
-                                                    .size(px(11.0))
-                                                    .text_color(tokens.text_muted)
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(5.0))
-                                                    .px(px(6.0))
-                                                    .py(px(2.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(tokens.pane_bg)
-                                                    .border_1()
-                                                    .border_color(tokens.border_subtle)
-                                                    .child(
-                                                        div()
-                                                            .size(px(6.0))
-                                                            .rounded_full()
-                                                            .bg(match tool.state {
-                                                                ToolState::Running => tokens.block_warning,
-                                                                ToolState::Completed => tokens.block_success,
-                                                                ToolState::Failed => tokens.block_failure,
-                                                                ToolState::Unknown => tokens.text_muted,
-                                                            })
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .font_family(MONO_FONT)
-                                                            .text_size(px(11.0))
-                                                            .font_weight(gpui::FontWeight::BOLD)
-                                                            .text_color(tokens.text_primary)
-                                                            .child(tool.name.clone())
-                                                    )
-                                            )
-                                            .when_some(tool.id.as_ref(), |view, id| {
-                                                view.child(
-                                                    div()
-                                                        .px(px(5.0))
-                                                        .py(px(1.5))
-                                                        .rounded(px(3.0))
-                                                        .bg(tokens.titlebar_bg)
-                                                        .border_1()
-                                                        .border_color(tokens.border_subtle)
-                                                        .font_family(MONO_FONT)
-                                                        .text_size(px(10.0))
-                                                        .text_color(tokens.text_muted)
-                                                        .child(format!("#{id}")),
-                                                )
+                                        svg()
+                                            .path(if is_expanded {
+                                                "icons/chevron-down.svg"
+                                            } else {
+                                                "icons/chevron-right.svg"
                                             })
-                                            .when(!summary.is_empty(), |view| {
-                                                view.child(
-                                                    div()
-                                                        .font_family(MONO_FONT)
-                                                        .text_size(px(11.0))
-                                                        .text_color(tokens.text_secondary)
-                                                        .truncate()
-                                                        .child(summary),
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
+                                            .size(px(11.0))
                                             .flex_shrink_0()
-                                            .when(line_count > 0, |view| {
-                                                view.child(
-                                                    div()
-                                                        .text_size(px(11.0))
-                                                        .text_color(tokens.text_muted)
-                                                        .child(format!(
-                                                            "{line_count} {}",
-                                                            if line_count == 1 { "line" } else { "lines" }
-                                                        )),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(4.0))
-                                                    .px(px(6.0))
-                                                    .py(px(2.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(tokens.pane_bg)
-                                                    .border_1()
-                                                    .border_color(tokens.border_subtle)
-                                                    .text_size(px(11.0))
-                                                    .font_weight(gpui::FontWeight::BOLD)
-                                                    .text_color(match tool.state {
-                                                        ToolState::Running => tokens.block_warning,
-                                                        ToolState::Completed => tokens.block_success,
-                                                        ToolState::Failed => tokens.block_failure,
-                                                        ToolState::Unknown => tokens.text_muted,
-                                                    })
-                                                    .child(match tool.state {
-                                                        ToolState::Running => "● Running…",
-                                                        ToolState::Completed => "✓ Completed",
-                                                        ToolState::Failed => "✗ Failed",
-                                                        ToolState::Unknown => "Done",
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                            .when(is_expanded, |card| {
-                                card
-                                    .border_t_1()
-                                    .border_color(tokens.border_subtle)
-                                    .child(
-                                        div()
-                                            .p(px(10.0))
-                                            .bg(tokens.pane_bg)
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(8.0))
-                                            .when(!tool.input.is_empty(), |view| {
-                                                let display_input = serde_json::from_str::<serde_json::Value>(&tool.input)
-                                                    .ok()
-                                                    .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                                                    .unwrap_or_else(|| tool.input.clone());
-                                                view.child(
-                                                    div().flex().flex_col().gap(px(4.0))
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_between()
-                                                                .child(
-                                                                    div()
-                                                                        .text_size(px(10.0))
-                                                                        .font_weight(gpui::FontWeight::BOLD)
-                                                                        .text_color(tokens.text_muted)
-                                                                        .child("ARGUMENTS / INPUT"),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .id(SharedString::from(format!("copy-tool-input-{pane_id}-{index}")))
-                                                                        .cursor(CursorStyle::PointingHand)
-                                                                        .flex()
-                                                                        .items_center()
-                                                                        .gap(px(4.0))
-                                                                        .text_size(px(11.0))
-                                                                        .text_color(tokens.text_muted)
-                                                                        .hover(move |s| s.text_color(tokens.text_primary))
-                                                                        .child(
-                                                                            svg()
-                                                                                .path("icons/copy.svg")
-                                                                                .size(px(11.0))
-                                                                                .text_color(tokens.text_muted),
-                                                                        )
-                                                                        .child("Copy")
-                                                                        .on_mouse_down(
-                                                                            MouseButton::Left,
-                                                                            cx.listener(move |this, _, _, cx| {
-                                                                                cx.stop_propagation();
-                                                                                this.copy_chat_tool_input(pane_id, index, cx);
-                                                                            }),
-                                                                        ),
-                                                                ),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .w_full()
-                                                                .p(px(8.0))
-                                                                .rounded(px(4.0))
-                                                                .bg(tokens.pane_header_bg)
-                                                                .border_1()
-                                                                .border_color(tokens.border_subtle)
-                                                                .font_family(MONO_FONT)
-                                                                .text_size(px(11.5))
-                                                                .text_color(tokens.text_primary)
-                                                                .child(display_input),
-                                                        ),
-                                                )
-                                            })
-                                            .when(!tool.output.is_empty() || tool.state == ToolState::Running, |view| {
-                                                view.child(
-                                                    div().flex().flex_col().gap(px(4.0))
-                                                        .child(
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_between()
-                                                                .child(
-                                                                    div()
-                                                                        .text_size(px(10.0))
-                                                                        .font_weight(gpui::FontWeight::BOLD)
-                                                                        .text_color(tokens.text_muted)
-                                                                        .child(if line_count > 0 {
-                                                                            format!("OUTPUT ({line_count} {})", if line_count == 1 { "line" } else { "lines" })
-                                                                        } else {
-                                                                            "OUTPUT".to_string()
-                                                                        })
-                                                                )
-                                                                .when(!tool.output.is_empty(), |row| {
-                                                                    row.child(
-                                                                        div()
-                                                                            .id(SharedString::from(format!("copy-tool-{pane_id}-{index}")))
-                                                                            .cursor(CursorStyle::PointingHand)
-                                                                            .flex()
-                                                                            .items_center()
-                                                                            .gap(px(4.0))
-                                                                            .text_size(px(11.0))
-                                                                            .text_color(tokens.text_muted)
-                                                                            .hover(move |s| s.text_color(tokens.text_primary))
-                                                                            .child(
-                                                                                svg()
-                                                                                    .path("icons/copy.svg")
-                                                                                    .size(px(11.0))
-                                                                                    .text_color(tokens.text_muted)
-                                                                            )
-                                                                            .child("Copy")
-                                                                            .on_mouse_down(
-                                                                                MouseButton::Left,
-                                                                                cx.listener(move |this, _, _, cx| {
-                                                                                    cx.stop_propagation();
-                                                                                    this.copy_chat_tool_output(pane_id, index, cx);
-                                                                                }),
-                                                                            )
-                                                                    )
-                                                                })
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .w_full()
-                                                                .max_h(px(380.0))
-                                                                .overflow_y_scrollbar()
-                                                                .p(px(8.0))
-                                                                .rounded(px(4.0))
-                                                                .bg(tokens.pane_header_bg)
-                                                                .border_1()
-                                                                .border_color(tokens.border_subtle)
-                                                                .font_family(MONO_FONT)
-                                                                .text_size(px(11.5))
-                                                                .text_color(if tool.state == ToolState::Failed {
-                                                                    tokens.block_failure
-                                                                } else {
-                                                                    tokens.text_primary
-                                                                })
-                                                                .child(if tool.output.is_empty() {
-                                                                    "Running…".to_string()
-                                                                } else {
-                                                                    tool.output.clone()
-                                                                })
-                                                        )
-                                                )
-                                            })
-                                    )
-                            })
-                            .into_any_element()
-                    } else {
-                        div()
-                            .w_full()
-                            .p(px(10.0))
-                            .rounded(px(6.0))
-                            .bg(tokens.pane_header_bg)
-                            .border_1()
-                            .border_color(tokens.border_subtle)
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .size(px(6.0))
-                                            .rounded_full()
-                                            .bg(tokens.text_muted),
+                                            .text_color(tokens.text_muted),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(11.0))
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(tokens.text_secondary)
-                                            .child("Tool Activity"),
-                                    ),
-                            )
-                            .child(
+                                            .flex_shrink_0()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(tokens.text_primary)
+                                            .child("Thinking"),
+                                    )
+                                    .when(!is_expanded && !summary.is_empty(), |header| {
+                                        header.child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(summary),
+                                        )
+                                    }),
+                            );
+                        if is_expanded {
+                            panel = panel.child(
                                 div()
                                     .w_full()
-                                    .font_family(MONO_FONT)
-                                    .text_size(px(12.0))
-                                    .text_color(tokens.text_primary)
+                                    .min_w_0()
+                                    .pl(px(30.0))
+                                    .pr(px(12.0))
+                                    .pb(px(12.0))
+                                    .whitespace_normal()
+                                    .text_size(px(11.5))
+                                    .line_height(relative(1.7))
+                                    .text_color(tokens.text_muted)
                                     .child(message.text.clone()),
-                            )
-                            .into_any_element()
+                            );
+                        }
+                        panel.into_any_element()
                     }
-                }
-                ChatRole::Error => {
-                    div()
+                    ChatRole::Status => div()
                         .w_full()
-                        .p(px(12.0))
-                        .rounded(px(6.0))
-                        .bg(tokens.pane_header_bg)
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .max_w(px(520.0))
+                                .truncate()
+                                .px(px(10.0))
+                                .py(px(3.0))
+                                .rounded_full()
+                                .bg(tokens.card_bg)
+                                .text_size(px(11.0))
+                                .text_color(tokens.text_muted)
+                                .child(message.text.clone()),
+                        )
+                        .into_any_element(),
+                    ChatRole::Tool => {
+                        if let Some(tool) = &message.tool {
+                            let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_chat_tool_expanded(pane_id, index, cx);
+                            });
+                            chat_tool_card(pane_id, index, tool, tokens, on_toggle)
+                                .into_any_element()
+                        } else {
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .rounded(px(5.0))
+                                .text_size(px(11.0))
+                                .text_color(tokens.text_muted)
+                                .child(message.text.clone())
+                                .into_any_element()
+                        }
+                    }
+                    ChatRole::Error => div()
+                        .w_full()
+                        .min_w_0()
+                        .px(px(12.0))
+                        .py(px(8.0))
+                        .rounded(px(8.0))
+                        .bg(tokens.block_failure.opacity(0.08))
                         .border_1()
-                        .border_color(tokens.block_failure)
+                        .border_color(tokens.block_failure.opacity(0.35))
                         .flex()
                         .flex_col()
-                        .gap(px(6.0))
+                        .gap(px(4.0))
                         .child(
                             div()
                                 .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(tokens.block_failure)
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .child("Error")
+                                .child("Error"),
                         )
                         .child(
                             div()
                                 .w_full()
+                                .whitespace_normal()
                                 .font_family(MONO_FONT)
-                                .text_size(px(13.0))
+                                .text_size(px(11.5))
+                                .line_height(relative(1.6))
                                 .text_color(tokens.block_failure)
-                                .child(message.text.clone())
+                                .child(message.text.clone()),
                         )
-                        .into_any_element()
-                }
-            }
-        }).collect::<Vec<_>>();
+                        .into_any_element(),
+                };
+
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(div().w_full().max_w(px(720.0)).min_w_0().child(inner))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         let chat_view = div()
             .id(("agent-chat", pane_id))
             .size_full()
@@ -7353,10 +7328,11 @@ impl AppState {
                     }
                 }
             }))
-            .p(px(16.0))
+            .px(px(24.0))
+            .py(px(8.0))
             .flex()
             .flex_col()
-            .gap(px(10.0))
+            .gap(px(8.0))
             .when(pane.chat.visible_messages().is_empty(), |view| {
                 view.child(
                     div()

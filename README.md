@@ -15,6 +15,7 @@ Kathamo combines ultra-fast native terminal rendering powered by [GPUI](https://
   - Powered by GPUI and Alacritty's VTE engine for 60+ FPS, tearing-free rendering with minimal latency.
   - Adaptive 1 ms stream coalescing with a 128 KiB parse cap handles intensive outputs (e.g., 40 MB/s compilation logs) without locking the UI thread.
   - Full support for ANSI colors (16 standard, 256-color, 24-bit true color), bold, italics, underlines, and custom font glyphs.
+  - Displays a plain terminal grid without block UI, with a Warp-style bottom input whenever the shell is idle. The input temporarily hides while a command runs or the alternate screen is active.
 
 - **🤖 Native Agent Attention System**
   - **Agent Attention Protocol**: Strict attention priority hierarchy (`blocked > done > working > idle`).

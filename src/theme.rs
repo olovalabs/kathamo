@@ -147,10 +147,6 @@ pub struct ThemeTokens {
 }
 
 impl ThemeTokens {
-    pub fn from_mode(mode: gpui_component::ThemeMode) -> Self {
-        Self::from_mode_with_scheme(mode, PaletteScheme::default())
-    }
-
     /// Build tokens for a mode and palette scheme. The Warp scheme reproduces
     /// Warp's default terminal chrome: near-black surfaces, white text, a cyan
     /// accent and block colors derived from Warp's ANSI palette.
@@ -734,8 +730,6 @@ mod tests {
         // Warp selection accent is the cyan #19AAD8.
         let accent = terminal::hsla_to_rgb(warp.block_border_selected);
         assert_eq!((accent.r, accent.g, accent.b), (0x19, 0xaa, 0xd8));
-        // `from_mode` defaults to the Warp scheme.
-        assert_eq!(ThemeTokens::from_mode(mode).pane_bg, warp.pane_bg);
     }
 
     #[test]

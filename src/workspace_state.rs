@@ -30,8 +30,6 @@ pub struct SavedWorkspace {
     pub theme: ThemePreference,
     #[serde(default)]
     pub palette_scheme: PaletteScheme,
-    #[serde(default = "default_bottom_input", alias = "warp_bottom_input")]
-    pub bottom_input: bool,
 }
 
 impl Default for SavedWorkspace {
@@ -43,15 +41,11 @@ impl Default for SavedWorkspace {
             sidebar_width: default_width(),
             theme: ThemePreference::default(),
             palette_scheme: PaletteScheme::default(),
-            bottom_input: default_bottom_input(),
         }
     }
 }
 
 fn default_visible() -> bool {
-    true
-}
-fn default_bottom_input() -> bool {
     true
 }
 fn default_expanded() -> bool {
@@ -168,5 +162,20 @@ mod tests {
         let legacy = r#"{"projects":[],"theme":"dark","bottom_input":true}"#;
         let deserialized: SavedWorkspace = serde_json::from_str(legacy).expect("deserialize");
         assert_eq!(deserialized.palette_scheme, PaletteScheme::Warp);
+    }
+
+    #[test]
+    fn obsolete_bottom_input_preferences_are_ignored() {
+        for field in ["bottom_input", "warp_bottom_input"] {
+            for value in [true, false] {
+                let json = format!(r#"{{"theme":"dark","{field}":{value}}}"#);
+                let workspace: SavedWorkspace = serde_json::from_str(&json).expect("deserialize");
+                assert_eq!(workspace.theme, ThemePreference::Dark);
+
+                let serialized = serde_json::to_value(&workspace).expect("serialize");
+                assert!(serialized.get("bottom_input").is_none());
+                assert!(serialized.get("warp_bottom_input").is_none());
+            }
+        }
     }
 }

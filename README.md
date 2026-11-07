@@ -87,6 +87,62 @@ cargo build --release
 ./target/release/kathamo
 ```
 
+### Native agent chat
+
+Kathamo's native agent view uses the [pi-rust](https://github.com/bigfish1913/pi-rust)
+`rpi` executable. Install it before starting Kathamo:
+
+```bash
+cargo install rpi-cli --locked
+```
+
+Alternatively configure a provider using pi-rust's environment variables or
+`~/.rpi/agent/models.json`; see the upstream documentation. The agent can read
+and change files and execute commands in the project's working directory. Model
+provider charges may apply.
+
+In a terminal pane, select **Agent** in the bottom input bar to open a native
+chat view. Enter sends a prompt, Shift+Enter inserts a newline, and Stop or
+Ctrl+C cancels a running request. Select **Terminal** to return to the shell;
+each pane keeps its own agent conversation while it remains open. Answer text
+and reasoning/thinking appear incrementally as the agent sends them, rendered as
+Markdown with syntax-highlighted code blocks. Thinking blocks fold into compact,
+clickable accordions once the agent begins answering. Tool calls are presented in
+Zed-style collapsible cards showing tool badges, argument summaries, status indicators,
+and output line counts. Expanding a tool card displays formatted arguments, a bounded
+scrollable output window, and a one-click output copy action. When the provider
+emits retry or compaction notices, these appear as clean activity updates.
+Agent processes are pre-warmed when entering Agent mode or choosing a model, and
+idle cache warming is enabled so prompts do not wait for cold starts. A **⚡ Fast**
+toggle in the bottom bar (or `/fast`, `/thinking <level>`) configures low reasoning
+effort for fast responses, with a single click to switch to **🧠 Deep** reasoning.
+Interactive rpi extension dialogs are not supported and are cancelled.
+
+Type `/auth` in agent mode to open the provider authentication dialog. Select an
+unauthenticated provider to start login, then follow its instructions; input is
+masked. The list includes rpi's model catalog and configured providers. If an installed
+authentication-only extension is not listed, enter its provider ID manually.
+Readiness reports local configuration, not whether a provider accepts the key.
+A ready provider is already authenticated; select it to choose a model, or use
+**Add account** to sign in again explicitly.
+Authenticating a provider does not switch the model of an existing agent session.
+The dialog requires a Unix PTY; on other platforms use the provider's CLI login.
+
+Select **Models** in the agent input bar or enter `/model` to see the available
+rpi models and OMP Antigravity models. Select a row for the current pane, or
+choose **Set default** to use that provider and model in new panes and after
+restarting Kathamo. Existing panes keep their selection. **Reset default to rpi
+automatic model** clears the saved default. Each selected model has a separate
+conversation within the pane.
+
+Google Antigravity additionally requires [oh-my-pi](https://github.com/can1357/oh-my-pi)
+(`omp`) on `PATH`. In `/auth`, select **google-antigravity** if it is not ready,
+complete the Google sign-in in a browser, then use `/model` to select an available
+Antigravity model. If no models appear, retry discovery. These models run through
+OMP, not rpi. Use **Use rpi automatic model** in `/model` to return to the
+automatic rpi conversation. OMP interactive tool approvals and extension dialogs
+are cancelled when they cannot be shown in this view.
+
 ---
 
 ## CLI Usage Reference

@@ -30,6 +30,8 @@ pub struct SavedWorkspace {
     pub theme: ThemePreference,
     #[serde(default)]
     pub palette_scheme: PaletteScheme,
+    #[serde(default)]
+    pub default_agent_model: Option<crate::agent_auth::AgentModel>,
 }
 
 impl Default for SavedWorkspace {
@@ -41,6 +43,7 @@ impl Default for SavedWorkspace {
             sidebar_width: default_width(),
             theme: ThemePreference::default(),
             palette_scheme: PaletteScheme::default(),
+            default_agent_model: None,
         }
     }
 }
@@ -120,6 +123,25 @@ fn save_locked(path: &Path, state: &SavedWorkspace) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_default_survives_workspace_roundtrip() {
+        use crate::agent_auth::{AgentModel, ModelBackend};
+        let model = AgentModel {
+            provider: "google-antigravity".into(),
+            id: "gemini-3.1-pro".into(),
+            backend: ModelBackend::Omp,
+        };
+        let workspace = SavedWorkspace {
+            default_agent_model: Some(model.clone()),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&workspace).unwrap();
+        let restored: SavedWorkspace = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.default_agent_model, Some(model));
+        let legacy: SavedWorkspace = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.default_agent_model, None);
+    }
 
     #[test]
     fn saved_workspace_defaults_to_system_theme() {

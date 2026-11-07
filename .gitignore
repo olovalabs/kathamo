@@ -21,3 +21,6 @@ coverage/
 # Node / JS integration test artifacts
 node_modules/
 
+# Agent runtime artifacts
+.rpi/
+

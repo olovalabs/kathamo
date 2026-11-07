@@ -13,7 +13,8 @@ use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
-use gpui_component::{Root, Sizable as _, TitleBar};
+use gpui_component::text::TextView;
+use gpui_component::{ActiveTheme as _, Root, Sizable as _, TitleBar};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{HashMap, HashSet};
@@ -23,6 +24,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use terminal::{ColorPalette, ShellEvent, TerminalConfig, TerminalView};
 
+mod agent_auth;
+mod agent_bridge;
 mod agent_rules;
 mod assets;
 mod attachments;
@@ -34,6 +37,7 @@ mod integrations;
 #[cfg(unix)]
 mod kathamo_compat;
 mod logos;
+mod omp_bridge;
 mod shell_history;
 #[path = "blocks/shell_integration.rs"]
 mod shell_integration;
@@ -116,6 +120,378 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatRole {
+    User,
+    Assistant,
+    Thinking,
+    Status,
+    Tool,
+    Error,
+}
+
+struct ChatMessage {
+    role: ChatRole,
+    text: String,
+    tool: Option<ChatTool>,
+    expanded: bool,
+}
+
+struct ChatTool {
+    id: Option<String>,
+    name: String,
+    input: String,
+    output: String,
+    state: ToolState,
+    expanded: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToolState {
+    Running,
+    Completed,
+    Failed,
+    Unknown,
+}
+impl ChatMessage {
+    fn new(role: ChatRole, text: String) -> Self {
+        Self {
+            role,
+            text,
+            tool: None,
+            expanded: true,
+        }
+    }
+}
+
+fn format_tool_summary(_name: &str, input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        return String::new();
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
+        if let Some(map) = value.as_object() {
+            if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
+                let first_line = cmd.lines().next().unwrap_or("").trim();
+                let truncated = if first_line.len() > 60 {
+                    format!("{}…", &first_line[..60])
+                } else {
+                    first_line.to_string()
+                };
+                return format!("$ {truncated}");
+            }
+            if let Some(path) = map.get("path").and_then(|v| v.as_str()) {
+                if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
+                    return format!("{path} · {pattern}");
+                }
+                return path.to_string();
+            }
+            if let Some(pattern) = map.get("pattern").and_then(|v| v.as_str()) {
+                return format!("/{pattern}/");
+            }
+            if let Some(query) = map.get("query").and_then(|v| v.as_str()) {
+                return format!("\"{query}\"");
+            }
+            if let Some(url) = map.get("url").and_then(|v| v.as_str()) {
+                return url.to_string();
+            }
+            let mut parts = Vec::new();
+            for (k, v) in map.iter().take(2) {
+                let val_str = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    _ => serde_json::to_string(v).unwrap_or_default(),
+                };
+                parts.push(format!("{k}: {val_str}"));
+            }
+            if !parts.is_empty() {
+                let joined = parts.join(", ");
+                return if joined.len() > 60 {
+                    format!("{}…", &joined[..60])
+                } else {
+                    joined
+                };
+            }
+        }
+    }
+    let first = input.lines().next().unwrap_or("").trim();
+    if first.len() > 60 {
+        format!("{}…", &first[..60])
+    } else {
+        first.to_string()
+    }
+}
+
+fn update_chat_tool(
+    messages: &mut Vec<ChatMessage>,
+    id: Option<String>,
+    name: String,
+    output: String,
+    state: ToolState,
+) {
+    // An absent ID cannot distinguish concurrent calls with the same name.
+    // Associate those events with the oldest matching running call.
+    let existing = messages
+        .iter_mut()
+        .rev()
+        .take_while(|message| message.role != ChatRole::User)
+        .filter_map(|message| message.tool.as_mut())
+        .filter(|tool| tool.state == ToolState::Running)
+        .filter(|tool| match id.as_ref() {
+            Some(id) => tool.id.as_ref() == Some(id),
+            None => tool.id.is_none() && tool.name == name,
+        })
+        .last();
+    if let Some(tool) = existing {
+        tool.output = output;
+        tool.state = state;
+        if state == ToolState::Completed {
+            tool.expanded = false;
+        } else if state == ToolState::Failed {
+            tool.expanded = true;
+        }
+    } else {
+        let expanded = state != ToolState::Completed;
+        messages.push(ChatMessage {
+            role: ChatRole::Tool,
+            text: String::new(),
+            tool: Some(ChatTool {
+                id,
+                name,
+                input: String::new(),
+                output,
+                state,
+                expanded,
+            }),
+            expanded,
+        });
+    }
+}
+
+fn finish_chat_tools(messages: &mut [ChatMessage]) {
+    for tool in messages
+        .iter_mut()
+        .rev()
+        .take_while(|message| message.role != ChatRole::User)
+        .filter_map(|message| message.tool.as_mut())
+        .filter(|tool| tool.state == ToolState::Running)
+    {
+        tool.state = ToolState::Unknown;
+        tool.expanded = false;
+    }
+}
+
+fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEvent) {
+    let (role, text) = match event {
+        agent_bridge::AgentEvent::ToolStart { id, name, input } => {
+            messages.push(ChatMessage {
+                role: ChatRole::Tool,
+                text: String::new(),
+                tool: Some(ChatTool {
+                    id,
+                    name,
+                    input,
+                    output: String::new(),
+                    state: ToolState::Running,
+                    expanded: true,
+                }),
+                expanded: true,
+            });
+            return;
+        }
+        agent_bridge::AgentEvent::ToolUpdate { id, name, output } => {
+            update_chat_tool(messages, id, name, output, ToolState::Running);
+            return;
+        }
+        agent_bridge::AgentEvent::ToolEnd {
+            id,
+            name,
+            output,
+            failed,
+        } => {
+            update_chat_tool(
+                messages,
+                id,
+                name,
+                output,
+                if failed {
+                    ToolState::Failed
+                } else {
+                    ToolState::Completed
+                },
+            );
+            return;
+        }
+        agent_bridge::AgentEvent::Text(text) => (ChatRole::Assistant, text),
+        agent_bridge::AgentEvent::Thinking(text) => (ChatRole::Thinking, text),
+        agent_bridge::AgentEvent::Status(text) => (ChatRole::Status, text),
+        agent_bridge::AgentEvent::Tool(text) => (ChatRole::Tool, text),
+        agent_bridge::AgentEvent::Error(text) => (ChatRole::Error, text),
+        agent_bridge::AgentEvent::Done | agent_bridge::AgentEvent::Closed => return,
+    };
+    if role == ChatRole::Assistant {
+        for message in messages
+            .iter_mut()
+            .rev()
+            .take_while(|m| m.role != ChatRole::User)
+        {
+            if message.role == ChatRole::Thinking {
+                message.expanded = false;
+            }
+        }
+    }
+    if matches!(role, ChatRole::Assistant | ChatRole::Thinking) {
+        if let Some(last) = messages.last_mut().filter(|message| message.role == role) {
+            last.text.push_str(&text);
+            return;
+        }
+    }
+    messages.push(ChatMessage::new(role, text));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentDialogPage {
+    Auth,
+    Models,
+}
+
+struct AuthModal {
+    page: AgentDialogPage,
+    focus: gpui::FocusHandle,
+    cwd: PathBuf,
+    providers: Vec<agent_auth::Provider>,
+    discovery: Option<std::sync::mpsc::Receiver<Result<Vec<agent_auth::Provider>, String>>>,
+    models: Vec<agent_auth::AgentModel>,
+    model_discovery: Option<std::sync::mpsc::Receiver<Result<Vec<agent_auth::AgentModel>, String>>>,
+    model_error: Option<String>,
+    provider_input: Entity<InputState>,
+    input: Entity<InputState>,
+    login: Option<agent_auth::Login>,
+    selected: Option<String>,
+    output: String,
+    error: Option<String>,
+}
+
+impl AuthModal {
+    fn discover(&mut self) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cwd = self.cwd.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(agent_auth::providers(&cwd));
+        });
+        self.discovery = Some(receiver);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let cwd = self.cwd.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(agent_auth::available_models(&cwd));
+        });
+        self.model_discovery = Some(receiver);
+    }
+}
+
+enum ModelBridge {
+    Rpi(agent_bridge::AgentBridge),
+    Omp(omp_bridge::OmpBridge),
+}
+
+impl ModelBridge {
+    fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
+        match self {
+            Self::Rpi(bridge) => bridge.send_prompt(prompt),
+            Self::Omp(bridge) => bridge.send_prompt(prompt),
+        }
+    }
+    fn cancel(&mut self) -> Result<(), String> {
+        match self {
+            Self::Rpi(bridge) => bridge.cancel(),
+            Self::Omp(bridge) => bridge.cancel(),
+        }
+    }
+    fn poll(&mut self) -> Vec<agent_bridge::AgentEvent> {
+        match self {
+            Self::Rpi(bridge) => bridge.poll(),
+            Self::Omp(bridge) => bridge.poll(),
+        }
+    }
+    fn set_thinking_level(&mut self, level: &str) -> Result<(), String> {
+        match self {
+            Self::Omp(bridge) => bridge.set_thinking_level(level),
+            Self::Rpi(_) => Ok(()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ModelChat {
+    bridge: Option<ModelBridge>,
+    messages: Vec<ChatMessage>,
+    running: bool,
+    auth_refresh_pending: bool,
+}
+
+struct PaneChat {
+    active: bool,
+    bridge: Option<agent_bridge::AgentBridge>,
+    cwd: Option<PathBuf>,
+    messages: Vec<ChatMessage>,
+    running: bool,
+    terminal_draft: String,
+    scroll: gpui::ScrollHandle,
+    agent_draft: String,
+    auth_refresh_pending: bool,
+    auth: Option<AuthModal>,
+    selected_model: Option<agent_auth::AgentModel>,
+    models: HashMap<agent_auth::AgentModel, ModelChat>,
+    fast_mode: bool,
+}
+
+impl Default for PaneChat {
+    fn default() -> Self {
+        Self {
+            active: false,
+            bridge: None,
+            cwd: None,
+            messages: Vec::new(),
+            running: false,
+            terminal_draft: String::new(),
+            scroll: gpui::ScrollHandle::new(),
+            agent_draft: String::new(),
+            auth_refresh_pending: false,
+            auth: None,
+            selected_model: None,
+            models: HashMap::new(),
+            fast_mode: true,
+        }
+    }
+}
+
+impl PaneChat {
+    fn visible_messages(&self) -> &[ChatMessage] {
+        match self.selected_model.as_ref() {
+            Some(model) => self
+                .models
+                .get(model)
+                .map(|chat| chat.messages.as_slice())
+                .unwrap_or(&[]),
+            None => &self.messages,
+        }
+    }
+    fn visible_messages_mut(&mut self) -> &mut Vec<ChatMessage> {
+        match self.selected_model.as_ref() {
+            Some(model) => &mut self.models.entry(model.clone()).or_default().messages,
+            None => &mut self.messages,
+        }
+    }
+
+    fn visible_running(&self) -> bool {
+        match self.selected_model.as_ref() {
+            Some(model) => self.models.get(model).is_some_and(|chat| chat.running),
+            None => self.running,
+        }
+    }
+}
+
 /// One terminal inside a session's screen. A session (a sidebar tab) owns a
 /// split tree of panes; each pane is a full, independent terminal whose PTY
 /// keeps running while another session's screen is shown.
@@ -165,6 +541,7 @@ pub struct TerminalPane {
     pub is_agent: bool,
     /// Workers reported by this pane's agent, keyed by their `agent_id`.
     pub sub_agents: HashMap<String, attention::SubAgent>,
+    chat: PaneChat,
     pub input_state: Option<Entity<InputState>>,
     /// Drops the `InputEvent::Change` subscription that keeps ghost text and
     /// the completion menu in sync with what is typed.
@@ -247,6 +624,7 @@ impl TerminalPane {
             app: None,
             is_agent: false,
             sub_agents: HashMap::new(),
+            chat: PaneChat::default(),
             input_state: None,
             input_subscription: None,
             shell_history: shell_history::cached(),
@@ -265,6 +643,9 @@ impl TerminalPane {
     /// Show the editor at the shell prompt; running commands and alternate
     /// screen programs receive input directly through the terminal.
     pub fn should_show_bottom_input(&self, cx: &App) -> bool {
+        if self.chat.active {
+            return true;
+        }
         if !self.bottom_input_visible {
             return false;
         }
@@ -465,6 +846,7 @@ struct AppState {
     pub theme_preference: ThemePreference,
     /// Terminal color palette / block chrome (Warp by default).
     pub palette_scheme: PaletteScheme,
+    default_agent_model: Option<agent_auth::AgentModel>,
     pub sidebar_visible: bool,
     integration_panel_visible: bool,
     integration_feedback: SharedString,
@@ -539,6 +921,7 @@ impl AppState {
             sidebar_width: f32::from(self.sidebar_width),
             theme: self.theme_preference,
             palette_scheme: self.palette_scheme,
+            default_agent_model: self.default_agent_model.clone(),
         }
     }
 
@@ -581,6 +964,7 @@ impl AppState {
         self.sidebar_width = SIDEBAR_WIDTH;
         self.theme_preference = saved.theme;
         self.palette_scheme = saved.palette_scheme;
+        self.default_agent_model = saved.default_agent_model;
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
         self.palette = load_palette(self.palette_scheme, mode.is_dark());
         gpui_component::Theme::change(mode, None, cx);
@@ -602,6 +986,7 @@ impl AppState {
             let title = SharedString::from("terminal 1");
             let mut pane =
                 TerminalPane::new(id, generation, terminal, title.clone(), title.clone(), pid);
+            pane.chat.selected_model = self.default_agent_model.clone();
             pane.terminal_subscription = Some(terminal_subscription);
             let session = Session {
                 id,
@@ -645,6 +1030,7 @@ impl AppState {
                 let title = SharedString::from("terminal 1");
                 let mut pane =
                     TerminalPane::new(id, generation, terminal, title.clone(), title.clone(), pid);
+                pane.chat.selected_model = self.default_agent_model.clone();
                 pane.terminal_subscription = Some(terminal_subscription);
                 let session = Session {
                     id,
@@ -2103,6 +2489,7 @@ impl AppState {
                 display_title.clone(),
                 pid,
             );
+            pane.chat.selected_model = self.default_agent_model.clone();
             pane.terminal_subscription = Some(terminal_subscription);
             let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             input_state.update(cx, |state, cx| state.focus(window, cx));
@@ -2318,6 +2705,7 @@ impl AppState {
                 title.clone(),
                 pid,
             );
+            pane.chat.selected_model = self.default_agent_model.clone();
             pane.terminal_subscription = Some(terminal_subscription);
             let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             input_state.update(cx, |state, cx| state.focus(window, cx));
@@ -2409,6 +2797,7 @@ impl AppState {
                 display_title,
                 pid,
             );
+            pane.chat.selected_model = self.default_agent_model.clone();
             pane.terminal_subscription = Some(terminal_subscription);
             let (input_state, input_subscription) = build_pane_input(next_id, window, cx);
             input_state.update(cx, |state, cx| state.focus(window, cx));
@@ -2629,6 +3018,15 @@ impl AppState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pane_ref(pane_id).is_some_and(|pane| pane.chat.active) {
+            if let Some(input) = self
+                .pane_ref(pane_id)
+                .and_then(|pane| pane.input_state.clone())
+            {
+                input.update(cx, |state, cx| state.clear_inline_completion(cx));
+            }
+            return;
+        }
         let Some((value, cursor, cwd, entries, input)) = self.input_context(pane_id, cx) else {
             return;
         };
@@ -3086,8 +3484,636 @@ impl AppState {
         }
         cx.notify();
     }
+    fn toggle_chat_tool_expanded(&mut self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            let messages = pane.chat.visible_messages_mut();
+            if let Some(msg) = messages.get_mut(index) {
+                if let Some(tool) = &mut msg.tool {
+                    tool.expanded = !tool.expanded;
+                    cx.notify();
+                } else if msg.role == ChatRole::Thinking {
+                    msg.expanded = !msg.expanded;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn copy_chat_tool_output(&self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_ref(pane_id) {
+            if let Some(msg) = pane.chat.visible_messages().get(index) {
+                let text = if let Some(tool) = &msg.tool {
+                    if !tool.output.is_empty() {
+                        tool.output.clone()
+                    } else {
+                        tool.input.clone()
+                    }
+                } else {
+                    msg.text.clone()
+                };
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            }
+        }
+    }
+    fn warm_agent_bridge(&mut self, pane_id: usize) {
+        let Some(pane) = self.pane_ref(pane_id) else {
+            return;
+        };
+        let cwd = self
+            .pane_cwd_path(pane)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        if let Some(model) = pane.chat.selected_model.clone() {
+            let fast = pane.chat.fast_mode;
+            let chat = pane.chat.models.entry(model.clone()).or_default();
+            if chat.bridge.is_none() {
+                let bridge = match model.backend {
+                    agent_auth::ModelBackend::Rpi => {
+                        let selector = format!("{}/{}", model.provider, model.id);
+                        agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector))
+                            .map(ModelBridge::Rpi)
+                    }
+                    agent_auth::ModelBackend::Omp => {
+                        omp_bridge::OmpBridge::spawn(&cwd, &model.id).map(ModelBridge::Omp)
+                    }
+                };
+                if let Ok(mut bridge) = bridge {
+                    if !fast {
+                        let _ = bridge.set_thinking_level("high");
+                    }
+                    chat.bridge = Some(bridge);
+                }
+            }
+        } else if pane.chat.bridge.is_none() {
+            if let Ok(bridge) = agent_bridge::AgentBridge::spawn(&cwd) {
+                pane.chat.cwd = Some(cwd);
+                pane.chat.bridge = Some(bridge);
+            }
+        }
+    }
+
+    fn toggle_fast_mode(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        pane.chat.fast_mode = !pane.chat.fast_mode;
+        let fast = pane.chat.fast_mode;
+        let level = if fast { "low" } else { "high" };
+        if let Some(model) = &pane.chat.selected_model {
+            if let Some(chat) = pane.chat.models.get_mut(model) {
+                if let Some(bridge) = chat.bridge.as_mut() {
+                    let _ = bridge.set_thinking_level(level);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_chat_mode(
+        &mut self,
+        pane_id: usize,
+        active: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        if pane.chat.active == active {
+            return;
+        }
+        let Some(input) = pane.input_state.clone() else {
+            return;
+        };
+        let current = input.read(cx).value().to_string();
+        let draft = if active {
+            pane.chat.terminal_draft = current;
+            std::mem::take(&mut pane.chat.agent_draft)
+        } else {
+            pane.chat.agent_draft = current;
+            std::mem::take(&mut pane.chat.terminal_draft)
+        };
+        pane.chat.active = active;
+        pane.completion_menu = None;
+        pane.history_index = None;
+        pane.pending_draft.clear();
+        set_input_text(&input, draft, window, cx);
+        self.focus_pane(pane_id, window, cx);
+        if active {
+            self.warm_agent_bridge(pane_id);
+        }
+    }
+    fn open_agent_auth(
+        &mut self,
+        pane_id: usize,
+        page: AgentDialogPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.pane_ref(pane_id) else {
+            return;
+        };
+        let cwd = self
+            .pane_cwd_path(pane)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Credential or response")
+                .masked(true)
+        });
+        let provider_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Other provider ID"));
+        let focus = cx.focus_handle();
+        if page == AgentDialogPage::Auth {
+            provider_input.update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            focus.focus(window, cx);
+        }
+        let mut auth = AuthModal {
+            page,
+            focus,
+            cwd,
+            providers: Vec::new(),
+            discovery: None,
+            models: Vec::new(),
+            model_discovery: None,
+            model_error: None,
+            provider_input,
+            input,
+            login: None,
+            selected: None,
+            output: String::new(),
+            error: None,
+        };
+        auth.discover();
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.chat.auth = Some(auth);
+            cx.notify();
+        }
+    }
+
+    fn close_agent_auth(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            if let Some(mut auth) = pane.chat.auth.take() {
+                if let Some(mut login) = auth.login.take() {
+                    login.cancel();
+                }
+                auth.input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+            }
+        }
+        self.focus_pane(pane_id, window, cx);
+        cx.notify();
+    }
+
+    fn set_agent_dialog_page(
+        &mut self,
+        pane_id: usize,
+        page: AgentDialogPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(auth) = self
+            .pane_mut(pane_id)
+            .and_then(|pane| pane.chat.auth.as_mut())
+        else {
+            return;
+        };
+        if page == AgentDialogPage::Models && auth.page != page {
+            if let Some(mut login) = auth.login.take() {
+                login.cancel();
+            }
+            auth.input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            auth.selected = None;
+            auth.output.clear();
+            auth.error = None;
+        }
+        auth.page = page;
+        if page == AgentDialogPage::Models {
+            auth.focus.focus(window, cx);
+        } else {
+            auth.provider_input
+                .update(cx, |state, cx| state.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    fn select_agent_model(
+        &mut self,
+        pane_id: usize,
+        model: Option<agent_auth::AgentModel>,
+        make_default: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.chat.selected_model = model.clone();
+        }
+        if make_default {
+            self.default_agent_model = model;
+            self.schedule_workspace_save(cx);
+        }
+        self.warm_agent_bridge(pane_id);
+        self.close_agent_auth(pane_id, window, cx);
+    }
+
+    fn start_agent_auth(
+        &mut self,
+        pane_id: usize,
+        provider: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(auth) = self
+            .pane_mut(pane_id)
+            .and_then(|pane| pane.chat.auth.as_mut())
+        else {
+            return;
+        };
+        if let Some(mut login) = auth.login.take() {
+            login.cancel();
+        }
+        auth.input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        auth.selected = Some(provider.clone());
+        auth.output.clear();
+        auth.error = None;
+        match agent_auth::Login::start(&provider, &auth.cwd) {
+            Ok(login) => auth.login = Some(login),
+            Err(error) => auth.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn submit_agent_auth(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(auth) = self
+            .pane_mut(pane_id)
+            .and_then(|pane| pane.chat.auth.as_mut())
+        else {
+            return;
+        };
+        if auth.page != AgentDialogPage::Auth {
+            return;
+        }
+        let Some(login) = auth.login.as_mut() else {
+            let provider = auth.provider_input.read(cx).value().trim().to_string();
+            if !provider.is_empty() {
+                self.start_agent_auth(pane_id, provider, window, cx);
+            }
+            return;
+        };
+        let value = auth.input.read(cx).value().to_string();
+        let result = login.submit(&value);
+        auth.input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        if let Err(error) = result {
+            auth.error = Some(error);
+        }
+        cx.notify();
+    }
+
+    fn poll_agent_events(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
+        let mut authenticated = false;
+        let mut streaming = false;
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                for pane in &mut session.panes {
+                    if let Some(auth) = pane.chat.auth.as_mut() {
+                        if let Some(receiver) = &auth.discovery {
+                            match receiver.try_recv() {
+                                Ok(result) => {
+                                    auth.discovery = None;
+                                    match result {
+                                        Ok(providers) => auth.providers = providers,
+                                        Err(error) => auth.error = Some(error),
+                                    }
+                                    changed = true;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    auth.discovery = None;
+                                    auth.error =
+                                        Some("Provider discovery stopped unexpectedly.".into());
+                                    changed = true;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            }
+                        }
+                        if let Some(receiver) = &auth.model_discovery {
+                            match receiver.try_recv() {
+                                Ok(result) => {
+                                    auth.model_discovery = None;
+                                    match result {
+                                        Ok(models) => {
+                                            auth.models = models;
+                                            auth.model_error = None;
+                                        }
+                                        Err(error) => auth.model_error = Some(error),
+                                    }
+                                    changed = true;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    auth.model_discovery = None;
+                                    auth.model_error =
+                                        Some("Model discovery stopped unexpectedly.".into());
+                                    changed = true;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            }
+                        }
+                        let mut finished = None;
+                        if let Some(login) = auth.login.as_mut() {
+                            while let Some(event) = login.try_event() {
+                                changed = true;
+                                match event {
+                                    agent_auth::LoginEvent::Output(text) => {
+                                        auth.output.push_str(&text)
+                                    }
+                                    agent_auth::LoginEvent::Finished(result) => {
+                                        finished = Some(result);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(result) = finished {
+                            auth.login = None;
+                            match result {
+                                Ok(()) => {
+                                    authenticated |=
+                                        auth.selected.as_deref() != Some("google-antigravity");
+                                    auth.output.push_str("\nAuthentication complete.");
+                                    auth.discover();
+                                }
+                                Err(error) => auth.error = Some(error),
+                            }
+                        }
+                    }
+                    if let Some(bridge) = pane.chat.bridge.as_mut() {
+                        let mut closed = false;
+                        for event in bridge.poll() {
+                            changed = true;
+                            if pane.chat.selected_model.is_none() {
+                                pane.chat.scroll.scroll_to_bottom();
+                            }
+                            match event {
+                                agent_bridge::AgentEvent::Done => {
+                                    pane.chat.running = false;
+                                    finish_chat_tools(&mut pane.chat.messages);
+                                }
+                                agent_bridge::AgentEvent::Closed => {
+                                    pane.chat.running = false;
+                                    finish_chat_tools(&mut pane.chat.messages);
+                                    closed = true;
+                                }
+                                other => push_chat_event(&mut pane.chat.messages, other),
+                            }
+                        }
+                        if closed {
+                            pane.chat.bridge = None;
+                            pane.chat.cwd = None;
+                        }
+                    }
+                    streaming |= pane.chat.running;
+                    for (model, chat) in &mut pane.chat.models {
+                        if let Some(bridge) = chat.bridge.as_mut() {
+                            let mut closed = false;
+                            for event in bridge.poll() {
+                                changed = true;
+                                if pane.chat.selected_model.as_ref() == Some(model) {
+                                    pane.chat.scroll.scroll_to_bottom();
+                                }
+                                match event {
+                                    agent_bridge::AgentEvent::Done => {
+                                        chat.running = false;
+                                        finish_chat_tools(&mut chat.messages);
+                                    }
+                                    agent_bridge::AgentEvent::Closed => {
+                                        chat.running = false;
+                                        finish_chat_tools(&mut chat.messages);
+                                        closed = true;
+                                    }
+                                    other => push_chat_event(&mut chat.messages, other),
+                                }
+                            }
+                            if closed {
+                                chat.bridge = None;
+                            }
+                        }
+                        streaming |= chat.running;
+                    }
+                }
+            }
+        }
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                for pane in &mut session.panes {
+                    if authenticated && pane.chat.bridge.is_some() {
+                        pane.chat.auth_refresh_pending = true;
+                    }
+                    if pane.chat.auth_refresh_pending && !pane.chat.running {
+                        pane.chat.auth_refresh_pending = false;
+                        if let Some(bridge) = pane.chat.bridge.as_mut() {
+                            if let Err(error) = bridge.restart_after_auth() {
+                                pane.chat
+                                    .messages
+                                    .push(ChatMessage::new(ChatRole::Error, error));
+                            }
+                        }
+                        changed = true;
+                    }
+                    for chat in pane.chat.models.values_mut() {
+                        if authenticated && matches!(chat.bridge, Some(ModelBridge::Rpi(_))) {
+                            chat.auth_refresh_pending = true;
+                        }
+                        if chat.auth_refresh_pending && !chat.running {
+                            chat.auth_refresh_pending = false;
+                            if let Some(ModelBridge::Rpi(bridge)) = chat.bridge.as_mut() {
+                                if let Err(error) = bridge.restart_after_auth() {
+                                    chat.messages.push(ChatMessage::new(ChatRole::Error, error));
+                                }
+                            }
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+        streaming
+    }
+
+    fn submit_agent_prompt(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_ref(pane_id) else {
+            return;
+        };
+        let cwd = self
+            .pane_cwd_path(pane)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let Some(input) = pane.input_state.clone() else {
+            return;
+        };
+        let page = match input.read(cx).value().trim() {
+            "/auth" => Some(AgentDialogPage::Auth),
+            "/model" => Some(AgentDialogPage::Models),
+            _ => None,
+        };
+        if let Some(page) = page {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.open_agent_auth(pane_id, page, window, cx);
+            return;
+        }
+        let mut prompt = input.read(cx).value().to_string();
+        for attachment in &pane.attachments {
+            if !prompt.is_empty() {
+                prompt.push(' ');
+            }
+            prompt.push_str(&attachments::prompt_path(&attachment.path));
+        }
+        let trimmed = prompt.trim();
+        if trimmed.is_empty() || pane.chat.visible_running() {
+            return;
+        }
+        if trimmed == "/fast" {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+            self.toggle_fast_mode(pane_id, cx);
+            let fast = self
+                .pane_ref(pane_id)
+                .map(|p| p.chat.fast_mode)
+                .unwrap_or(true);
+            let msg = if fast {
+                "⚡ Fast mode enabled (low reasoning for rapid responses)."
+            } else {
+                "🧠 Deep mode enabled (full reasoning for complex logic)."
+            };
+            if let Some(pane) = self.pane_mut(pane_id) {
+                pane.chat
+                    .visible_messages_mut()
+                    .push(ChatMessage::new(ChatRole::Status, msg.into()));
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(arg) = trimmed.strip_prefix("/thinking") {
+            let level = match arg.trim() {
+                "off" => "off",
+                "min" | "minimal" => "minimal",
+                "low" => "low",
+                "med" | "medium" => "medium",
+                "high" | "max" => "high",
+                _ => "low",
+            };
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+            let fast = matches!(level, "off" | "minimal" | "low");
+            if let Some(pane) = self.pane_mut(pane_id) {
+                pane.chat.fast_mode = fast;
+                if let Some(model) = &pane.chat.selected_model {
+                    if let Some(chat) = pane.chat.models.get_mut(model) {
+                        if let Some(bridge) = chat.bridge.as_mut() {
+                            let _ = bridge.set_thinking_level(level);
+                        }
+                    }
+                }
+                pane.chat.visible_messages_mut().push(ChatMessage::new(
+                    ChatRole::Status,
+                    format!(
+                        "Thinking level set to '{level}' ({} mode).",
+                        if fast { "Fast" } else { "Deep" }
+                    ),
+                ));
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(model) = pane.chat.selected_model.clone() {
+            let fast = pane.chat.fast_mode;
+            let chat = pane.chat.models.entry(model.clone()).or_default();
+            if chat.bridge.is_none() {
+                let bridge = match model.backend {
+                    agent_auth::ModelBackend::Rpi => {
+                        let selector = format!("{}/{}", model.provider, model.id);
+                        agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector))
+                            .map(ModelBridge::Rpi)
+                    }
+                    agent_auth::ModelBackend::Omp => {
+                        omp_bridge::OmpBridge::spawn(&cwd, &model.id).map(ModelBridge::Omp)
+                    }
+                };
+                match bridge {
+                    Ok(mut bridge) => {
+                        if !fast {
+                            let _ = bridge.set_thinking_level("high");
+                        }
+                        chat.bridge = Some(bridge);
+                    }
+                    Err(error) => {
+                        chat.messages.push(ChatMessage::new(ChatRole::Error, error));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+            match chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
+                Ok(()) => {
+                    chat.messages.push(ChatMessage::new(ChatRole::User, prompt));
+                    chat.running = true;
+                    pane.attachments.clear();
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                Err(error) => chat.messages.push(ChatMessage::new(ChatRole::Error, error)),
+            }
+            pane.chat.scroll.scroll_to_bottom();
+            cx.notify();
+            return;
+        }
+        if pane.chat.bridge.is_none() {
+            match agent_bridge::AgentBridge::spawn(&cwd) {
+                Ok(bridge) => {
+                    pane.chat.cwd = Some(cwd);
+                    pane.chat.bridge = Some(bridge);
+                }
+                Err(error) => {
+                    pane.chat
+                        .messages
+                        .push(ChatMessage::new(ChatRole::Error, error));
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        match pane.chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
+            Ok(()) => {
+                pane.chat
+                    .messages
+                    .push(ChatMessage::new(ChatRole::User, prompt));
+                pane.chat.running = true;
+                pane.attachments.clear();
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            Err(error) => pane
+                .chat
+                .messages
+                .push(ChatMessage::new(ChatRole::Error, error)),
+        }
+        pane.chat.scroll.scroll_to_bottom();
+        cx.notify();
+    }
 
     fn execute_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pane_ref(pane_id).is_some_and(|pane| pane.chat.active) {
+            self.submit_agent_prompt(pane_id, window, cx);
+            return;
+        }
         let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
             return;
         };
@@ -3224,6 +4250,38 @@ impl AppState {
         let Some(pane) = session.panes.get_mut(pane_idx) else {
             return;
         };
+        if pane.chat.active {
+            if let Some(model) = pane.chat.selected_model.as_ref() {
+                if let Some(chat) = pane.chat.models.get_mut(model) {
+                    if chat.running {
+                        if let Some(bridge) = chat.bridge.as_mut() {
+                            if let Err(error) = bridge.cancel() {
+                                chat.messages.push(ChatMessage::new(ChatRole::Error, error));
+                            }
+                        }
+                    } else if let Some(input) = &pane.input_state {
+                        input.update(cx, |state, cx| state.set_value("", window, cx));
+                    }
+                } else if let Some(input) = &pane.input_state {
+                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                }
+                cx.notify();
+                return;
+            }
+            if pane.chat.running {
+                if let Some(bridge) = pane.chat.bridge.as_mut() {
+                    if let Err(error) = bridge.cancel() {
+                        pane.chat
+                            .messages
+                            .push(ChatMessage::new(ChatRole::Error, error));
+                    }
+                }
+            } else if let Some(input) = &pane.input_state {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            cx.notify();
+            return;
+        }
 
         // 1. Clear input state and draft
         if let Some(input_state) = &pane.input_state {
@@ -3363,6 +4421,9 @@ impl AppState {
         if key == "c" && modifiers.control && !modifiers.shift && !modifiers.alt {
             cx.stop_propagation();
             self.handle_pane_ctrl_c(pane_id, window, cx);
+            return;
+        }
+        if self.pane_ref(pane_id).is_some_and(|pane| pane.chat.active) {
             return;
         }
 
@@ -4892,8 +5953,15 @@ impl AppState {
     ) -> gpui::Stateful<gpui::Div> {
         let pane_id = pane.id;
         let tokens = self.tokens(cx);
-        let cwd_display = self.pane_cwd_display(pane);
-        let git_branch = self.pane_git_branch(pane);
+        let agent_cwd = pane.chat.active.then_some(pane.chat.cwd.as_ref()).flatten();
+        let cwd_display = agent_cwd
+            .map(|path| Self::format_path_display(path))
+            .unwrap_or_else(|| self.pane_cwd_display(pane));
+        let git_branch = if let Some(cwd) = agent_cwd {
+            Self::detect_git_branch(cwd)
+        } else {
+            self.pane_git_branch(pane)
+        };
 
         let bar_border: Hsla = if tokens.is_dark {
             rgba(0x1d1d1dff).into()
@@ -4949,7 +6017,9 @@ impl AppState {
                 .key_context(KATHAMO_INPUT_CONTEXT)
                 .on_action(cx.listener(move |this, _: &CompleteCommand, window, cx| {
                     cx.stop_propagation();
-                    this.start_completion(pane_id, window, cx);
+                    if !this.pane_ref(pane_id).is_some_and(|pane| pane.chat.active) {
+                        this.start_completion(pane_id, window, cx);
+                    }
                 }))
                 .on_action(cx.listener(|_, _: &IgnoreKey, _, cx| {
                     cx.stop_propagation();
@@ -5113,6 +6183,72 @@ impl AppState {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
+                    .child(
+                        div().id(("input-mode-terminal", pane_id))
+                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
+                            .bg(if !pane.chat.active { badge_bg } else { bar_bg })
+                            .text_size(px(12.0))
+                            .text_color(if !pane.chat.active { tokens.text_primary } else { tokens.text_muted })
+                            .cursor(CursorStyle::PointingHand)
+                            .child("Terminal")
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.set_chat_mode(pane_id, false, window, cx);
+                            })),
+                    )
+                    .child(
+                        div().id(("input-mode-agent", pane_id))
+                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
+                            .bg(if pane.chat.active { badge_bg } else { bar_bg })
+                            .text_size(px(12.0))
+                            .text_color(if pane.chat.active { tokens.text_primary } else { tokens.text_muted })
+                            .cursor(CursorStyle::PointingHand)
+                            .child("Agent")
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.set_chat_mode(pane_id, true, window, cx);
+                            })),
+                    )
+                    .when(pane.chat.active, |row| row.child(
+                        div().id(("select-agent-model", pane_id))
+                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
+                            .text_size(px(11.0)).text_color(tokens.text_secondary)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|view| view.bg(tokens.pane_header_btn_hover))
+                            .child(pane.chat.selected_model.as_ref()
+                                .map(|model| format!("{} · {}", model.provider, model.id))
+                                .unwrap_or_else(|| "Models".to_string()))
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_agent_auth(pane_id, AgentDialogPage::Models, window, cx);
+                            }))
+                    ))
+                    .when(pane.chat.active, |row| row.child(
+                        div().id(("agent-speed-toggle", pane_id))
+                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
+                            .text_size(px(11.0))
+                            .text_color(if pane.chat.fast_mode { tokens.text_primary } else { tokens.text_muted })
+                            .bg(if pane.chat.fast_mode { badge_bg } else { bar_bg })
+                            .border_1()
+                            .border_color(if pane.chat.fast_mode { badge_border } else { tokens.border_subtle })
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(|view| view.bg(tokens.pane_header_btn_hover))
+                            .child(if pane.chat.fast_mode { "⚡ Fast" } else { "🧠 Deep" })
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_fast_mode(pane_id, cx);
+                            }))
+                    ))
+                    .when(pane.chat.active && pane.chat.visible_running(), |row| row.child(
+                        div().id(("agent-stop", pane_id))
+                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
+                            .text_size(px(12.0)).text_color(tokens.text_secondary)
+                            .cursor(CursorStyle::PointingHand).child("Stop")
+                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.handle_pane_ctrl_c(pane_id, window, cx);
+                            })),
+                    ))
                     // Badge 1: Directory
                     .child(
                         div()
@@ -5189,7 +6325,11 @@ impl AppState {
                     .text_size(px(10.0))
                     .text_color(tokens.text_muted)
                     .child(div().child(
-                        "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images",
+                        if pane.chat.active {
+                            "Enter send · Shift+Enter newline · Ctrl+C stop · Drop or paste images"
+                        } else {
+                            "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images"
+                        },
                     )),
             )
     }
@@ -5318,10 +6458,801 @@ impl AppState {
         )
     }
 
+    fn render_agent_auth(
+        &self,
+        pane_id: usize,
+        auth: &AuthModal,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let tokens = self.tokens(cx);
+        let rows = auth
+            .providers
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                let id = provider.id.clone();
+                let login_id = id.clone();
+                let ready = provider.ready;
+                let selected = auth.selected.as_deref() == Some(id.as_str());
+                let label = match &provider.source {
+                    Some(source) => format!(
+                        "{}  ·  {}  ·  {}",
+                        id,
+                        if provider.ready {
+                            "Ready"
+                        } else {
+                            "Not authenticated"
+                        },
+                        source
+                    ),
+                    None => format!(
+                        "{}  ·  {}",
+                        id,
+                        if provider.ready {
+                            "Ready"
+                        } else {
+                            "Not authenticated"
+                        }
+                    ),
+                };
+                div()
+                    .id(("auth-provider", index))
+                    .debug_selector(move || format!("auth-provider-{index}"))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(tokens.text_primary)
+                    .when(selected, |view| view.bg(tokens.pane_header_bg))
+                    .hover(|view| view.bg(tokens.pane_header_btn_hover))
+                    .cursor(CursorStyle::PointingHand)
+                    .child(div().flex_1().child(label))
+                    .when(ready, |view| {
+                        view.child(
+                            div()
+                                .id(("auth-add-account", index))
+                                .text_color(tokens.text_secondary)
+                                .child("Add account")
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.start_agent_auth(
+                                            pane_id,
+                                            login_id.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                        )
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if ready {
+                                this.set_agent_dialog_page(
+                                    pane_id,
+                                    AgentDialogPage::Models,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                this.start_agent_auth(pane_id, id.clone(), window, cx);
+                            }
+                        }),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let model_rows = auth
+            .models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                let selected_model = model.clone();
+                let default_model = model.clone();
+                let is_default = self.default_agent_model.as_ref() == Some(model);
+                let ready = auth
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == model.provider)
+                    .is_some_and(|provider| provider.ready);
+                let label = format!(
+                    "{}/{}{}",
+                    model.provider,
+                    model.id,
+                    if ready { "" } else { " · sign in required" }
+                );
+                div()
+                    .id(("agent-model", index))
+                    .debug_selector(move || format!("agent-model-{index}"))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .text_size(px(12.0))
+                    .text_color(tokens.text_primary)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(|view| view.bg(tokens.pane_header_btn_hover))
+                    .child(div().flex_1().child(label))
+                    .child(
+                        div()
+                            .id(("default-agent-model", index))
+                            .text_color(tokens.text_secondary)
+                            .child(if is_default { "Default" } else { "Set default" })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.select_agent_model(
+                                        pane_id,
+                                        Some(default_model.clone()),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.select_agent_model(
+                                pane_id,
+                                Some(selected_model.clone()),
+                                false,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+            })
+            .collect::<Vec<_>>();
+        deferred(
+            div().id(("auth-layer", pane_id)).absolute().size_full().top_0().left_0()
+                .flex().items_center().justify_center()
+                .bg(rgba(0x00000088))
+                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.close_agent_auth(pane_id, window, cx);
+                }))
+                .child(
+                    div().id(("auth-panel", pane_id))
+                        .track_focus(&auth.focus)
+                        .w(px(520.0)).max_w(relative(0.95)).max_h(relative(0.9))
+                        .p(px(16.0)).rounded(px(10.0)).border_1()
+                        .border_color(tokens.pane_border).bg(tokens.pane_bg).shadow_lg()
+                        .flex().flex_col().gap(px(10.0))
+                        .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.close_agent_auth(pane_id, window, cx);
+                            }
+                        }))
+                        .on_action(cx.listener(move |this, _: &gpui_component::input::Enter, window, cx| {
+                            cx.stop_propagation();
+                            this.submit_agent_auth(pane_id, window, cx);
+                        }))
+                        .child(div().flex().justify_between().items_center()
+                            .child(div().text_size(px(15.0)).font_weight(gpui::FontWeight::BOLD)
+                                .text_color(tokens.text_primary).child(if auth.page == AgentDialogPage::Models { "Choose model" } else { "Authenticate provider" }))
+                            .child(div().id(("auth-close", pane_id)).cursor(CursorStyle::PointingHand)
+                                .text_color(tokens.text_muted).child("Close")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_agent_auth(pane_id, window, cx);
+                                }))))
+                        .child(div().flex().gap(px(12.0))
+                            .child(div().id(("auth-tab", pane_id)).cursor(CursorStyle::PointingHand)
+                                .debug_selector(|| "agent-auth-tab".into())
+                                .text_color(if auth.page == AgentDialogPage::Auth { tokens.text_primary } else { tokens.text_muted })
+                                .child("Providers")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.set_agent_dialog_page(pane_id, AgentDialogPage::Auth, window, cx);
+                                })))
+                            .child(div().id(("models-tab", pane_id)).cursor(CursorStyle::PointingHand)
+                                .text_color(if auth.page == AgentDialogPage::Models { tokens.text_primary } else { tokens.text_muted })
+                                .child("Models")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.set_agent_dialog_page(pane_id, AgentDialogPage::Models, window, cx);
+                                }))))
+                        .when(auth.page == AgentDialogPage::Auth, |view| view
+                            .child(div().text_size(px(12.0)).text_color(tokens.text_muted)
+                                .child("Select a provider to sign in. Ready providers are already authenticated."))
+                            .when(auth.discovery.is_some(), |view| view.child(
+                                div().text_size(px(12.0)).text_color(tokens.text_muted).child("Loading providers…")))
+                            .child(div().id(("auth-providers", pane_id)).max_h(px(180.0))
+                                .overflow_y_scrollbar().flex().flex_col().children(rows))
+                        )
+                        .when(auth.page == AgentDialogPage::Models, |view| view.child(
+                            div().id(("use-rpi", pane_id)).text_size(px(12.0))
+                                .text_color(tokens.text_secondary).cursor(CursorStyle::PointingHand)
+                                .child("Use rpi automatic model")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.select_agent_model(pane_id, None, false, window, cx);
+                                }))
+                        ))
+                        .when(auth.page == AgentDialogPage::Models, |view| view
+                            .child(div().id(("reset-default-model", pane_id)).text_size(px(11.0))
+                                .text_color(tokens.text_secondary).cursor(CursorStyle::PointingHand)
+                                .child("Reset default to rpi automatic model")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.select_agent_model(pane_id, None, true, window, cx);
+                                })))
+                            .child(div().text_size(px(12.0)).text_color(tokens.text_secondary)
+                                .child("Available models · select to use"))
+                            .when(auth.model_discovery.is_some(), |view| view.child(
+                                div().text_size(px(11.0)).text_color(tokens.text_muted).child("Loading models…")))
+                            .when_some(auth.model_error.as_ref(), |view, error| view.child(
+                                div().text_size(px(11.0)).text_color(rgba(0xf87171ff)).child(error.clone())))
+                            .when(auth.model_discovery.is_none(), |view| view.child(
+                                div().id(("refresh-models", pane_id)).text_size(px(11.0))
+                                    .text_color(tokens.text_muted).cursor(CursorStyle::PointingHand)
+                                    .child(if auth.models.is_empty() { "No models available. Retry discovery" } else { "Refresh models" })
+                                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(auth) = this.pane_mut(pane_id).and_then(|pane| pane.chat.auth.as_mut()) {
+                                            auth.discover();
+                                            cx.notify();
+                                        }
+                                    }))
+                            ))
+                            .child(div().id(("antigravity-models", pane_id)).max_h(px(140.0))
+                                .overflow_y_scrollbar().flex().flex_col().children(model_rows))
+                        )
+                        .when(auth.page == AgentDialogPage::Auth && auth.discovery.is_none() && auth.providers.is_empty(), |view| view.child(
+                            div().id(("auth-retry", pane_id)).text_size(px(12.0))
+                                .text_color(tokens.text_secondary).cursor(CursorStyle::PointingHand)
+                                .child("Retry provider discovery")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(auth) = this.pane_mut(pane_id).and_then(|pane| pane.chat.auth.as_mut()) {
+                                        auth.error = None;
+                                        auth.discover();
+                                        cx.notify();
+                                    }
+                                }))))
+                        .when(auth.page == AgentDialogPage::Auth && auth.login.is_none(), |view| view
+                            .child(Input::new(&auth.provider_input).appearance(true).bordered(true))
+                            .child(div().text_size(px(11.0)).text_color(tokens.text_muted)
+                                .child("For an extension not listed above, enter its provider ID and press Enter.")))
+                        .when_some(auth.selected.as_ref().filter(|_| auth.page == AgentDialogPage::Auth), |view, selected| view.child(
+                            div().text_size(px(12.0)).text_color(tokens.text_primary)
+                                .child(format!("Login: {selected}"))))
+                        .when(auth.page == AgentDialogPage::Auth && !auth.output.is_empty(), |view| view.child(
+                            div().id(("auth-output", pane_id)).max_h(px(140.0)).overflow_y_scrollbar()
+                                .text_size(px(12.0)).text_color(tokens.text_primary).child(auth.output.clone())))
+                        .when(auth.page == AgentDialogPage::Auth && !auth.output.is_empty(), |view| view.child(
+                            div().id(("auth-copy-output", pane_id)).text_size(px(11.0))
+                                .text_color(tokens.text_secondary).cursor(CursorStyle::PointingHand)
+                                .child("Copy login instructions")
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(auth) = this.pane_ref(pane_id).and_then(|pane| pane.chat.auth.as_ref()) {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(auth.output.clone()));
+                                    }
+                                }))))
+                        .when_some(auth.error.as_ref().filter(|_| auth.page == AgentDialogPage::Auth), |view, error| view.child(
+                            div().text_size(px(12.0)).text_color(rgba(0xf87171ff)).child(error.clone())))
+                        .when(auth.page == AgentDialogPage::Auth && auth.login.is_some(), |view| view
+                            .child(Input::new(&auth.input).appearance(true).bordered(true))
+                            .child(div().text_size(px(11.0)).text_color(tokens.text_muted)
+                                .child("Enter a credential or response if prompted, then press Enter. Input is masked.")))
+                        .child(div().text_size(px(11.0)).text_color(tokens.text_muted)
+                            .child(if auth.page == AgentDialogPage::Auth { "Esc or Close cancels login." } else { "Select a model or set a default." }))
+                )
+        ).priority(210).into_any_element()
+    }
+
+    fn render_agent_chat(
+        &self,
+        pane: &TerminalPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let tokens = self.tokens(cx);
+        let conversation = format!("{:?}", pane.chat.selected_model);
+        let pane_id = pane.id;
+        let messages = pane.chat.visible_messages().iter().enumerate().map(|(index, message)| {
+            match message.role {
+                ChatRole::User => {
+                    div()
+                        .w_full()
+                        .p(px(12.0))
+                        .rounded(px(6.0))
+                        .bg(tokens.pane_header_bg)
+                        .border_1()
+                        .border_color(tokens.border_subtle)
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(tokens.text_primary)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("You")
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .font_family(MONO_FONT)
+                                .text_size(px(13.0))
+                                .text_color(tokens.text_primary)
+                                .child(message.text.clone())
+                        )
+                        .into_any_element()
+                }
+                ChatRole::Assistant => {
+                    div()
+                        .w_full()
+                        .p(px(12.0))
+                        .rounded(px(6.0))
+                        .bg(tokens.pane_header_bg)
+                        .border_1()
+                        .border_color(tokens.border_subtle)
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(tokens.text_primary)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("Agent")
+                        )
+                        .child(
+                            TextView::markdown(
+                                SharedString::from(format!("agent-markdown-{}-{}-{}-{}", pane_id, conversation, index, cx.theme().is_dark())),
+                                message.text.clone(),
+                                window,
+                                cx,
+                            )
+                            .selectable(true)
+                            .w_full()
+                            .text_size(px(13.0))
+                            .text_color(tokens.text_primary)
+                        )
+                        .into_any_element()
+                }
+                ChatRole::Thinking => {
+                    let is_expanded = message.expanded;
+                    let first_line = message.text.lines().next().unwrap_or("").trim();
+                    div()
+                        .id(SharedString::from(format!("thinking-block-{pane_id}-{index}")))
+                        .w_full()
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(tokens.border_subtle)
+                        .bg(tokens.pane_header_bg)
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("thinking-header-{pane_id}-{index}")))
+                                .w_full()
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(move |s| s.bg(tokens.sidebar_item_hover))
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.0))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_chat_tool_expanded(pane_id, index, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .min_w_0()
+                                        .child(
+                                            svg()
+                                                .path(if is_expanded { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
+                                                .size(px(11.0))
+                                                .text_color(tokens.text_muted)
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(11.0))
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .text_color(tokens.text_secondary)
+                                                .child("Thinking")
+                                        )
+                                        .when(!is_expanded && !first_line.is_empty(), |view| {
+                                            view.child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(tokens.text_muted)
+                                                    .truncate()
+                                                    .child(first_line.to_string())
+                                            )
+                                        })
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(tokens.text_muted)
+                                        .flex_shrink_0()
+                                        .child(if is_expanded { "Hide reasoning" } else { "Show reasoning" })
+                                )
+                        )
+                        .when(is_expanded, |block| {
+                            block
+                                .border_t_1()
+                                .border_color(tokens.border_subtle)
+                                .child(
+                                    div()
+                                        .p(px(10.0))
+                                        .child(
+                                            TextView::markdown(
+                                                SharedString::from(format!("agent-thinking-{}-{}-{}-{}", pane_id, conversation, index, cx.theme().is_dark())),
+                                                message.text.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                            .selectable(true)
+                                            .w_full()
+                                            .text_size(px(12.0))
+                                            .text_color(tokens.text_secondary)
+                                        )
+                                )
+                        })
+                        .into_any_element()
+                }
+                ChatRole::Status => {
+                    div()
+                        .w_full()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .rounded(px(5.0))
+                        .bg(tokens.pane_bg)
+                        .border_1()
+                        .border_color(tokens.border_subtle)
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div().size(px(5.0)).rounded_full().bg(tokens.text_muted)
+                        )
+                        .child(
+                            div().text_size(px(11.0)).text_color(tokens.text_muted).child(message.text.clone())
+                        )
+                        .into_any_element()
+                }
+                ChatRole::Tool => {
+                    if let Some(tool) = &message.tool {
+                        let summary = format_tool_summary(&tool.name, &tool.input);
+                        let line_count = if tool.output.is_empty() { 0 } else { tool.output.lines().count() };
+                        let is_expanded = tool.expanded;
+                        div()
+                            .id(SharedString::from(format!("tool-card-{pane_id}-{index}")))
+                            .w_full()
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(if is_expanded { tokens.border } else { tokens.border_subtle })
+                            .bg(tokens.pane_header_bg)
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("tool-card-header-{pane_id}-{index}")))
+                                    .w_full()
+                                    .cursor(CursorStyle::PointingHand)
+                                    .hover(move |s| s.bg(tokens.sidebar_item_hover))
+                                    .px(px(10.0))
+                                    .py(px(7.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_chat_tool_expanded(pane_id, index, cx);
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .min_w_0()
+                                            .child(
+                                                svg()
+                                                    .path(if is_expanded { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" })
+                                                    .size(px(11.0))
+                                                    .text_color(tokens.text_muted)
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(5.0))
+                                                    .px(px(6.0))
+                                                    .py(px(2.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(tokens.pane_bg)
+                                                    .border_1()
+                                                    .border_color(tokens.border_subtle)
+                                                    .child(
+                                                        div()
+                                                            .size(px(6.0))
+                                                            .rounded_full()
+                                                            .bg(match tool.state {
+                                                                ToolState::Running => tokens.block_warning,
+                                                                ToolState::Completed => tokens.block_success,
+                                                                ToolState::Failed => tokens.block_failure,
+                                                                ToolState::Unknown => tokens.text_muted,
+                                                            })
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .font_family(MONO_FONT)
+                                                            .text_size(px(11.0))
+                                                            .font_weight(gpui::FontWeight::BOLD)
+                                                            .text_color(tokens.text_primary)
+                                                            .child(tool.name.clone())
+                                                    )
+                                            )
+                                            .when(!summary.is_empty(), |view| {
+                                                view.child(
+                                                    div()
+                                                        .font_family(MONO_FONT)
+                                                        .text_size(px(11.0))
+                                                        .text_color(tokens.text_secondary)
+                                                        .truncate()
+                                                        .child(summary)
+                                                )
+                                            })
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .flex_shrink_0()
+                                            .when(line_count > 0 && !is_expanded, |view| {
+                                                view.child(
+                                                    div()
+                                                        .text_size(px(11.0))
+                                                        .text_color(tokens.text_muted)
+                                                        .child(format!("{line_count} {}", if line_count == 1 { "line" } else { "lines" }))
+                                                )
+                                            })
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.0))
+                                                    .text_color(match tool.state {
+                                                        ToolState::Running => tokens.block_warning,
+                                                        ToolState::Completed => tokens.text_muted,
+                                                        ToolState::Failed => tokens.block_failure,
+                                                        ToolState::Unknown => tokens.text_muted,
+                                                    })
+                                                    .child(match tool.state {
+                                                        ToolState::Running => "Running…",
+                                                        ToolState::Completed => "Completed",
+                                                        ToolState::Failed => "Failed",
+                                                        ToolState::Unknown => "Done",
+                                                    })
+                                            )
+                                    )
+                            )
+                            .when(is_expanded, |card| {
+                                card
+                                    .border_t_1()
+                                    .border_color(tokens.border_subtle)
+                                    .child(
+                                        div()
+                                            .p(px(10.0))
+                                            .bg(tokens.pane_bg)
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(8.0))
+                                            .when(!tool.input.is_empty(), |view| {
+                                                view.child(
+                                                    div().flex().flex_col().gap(px(4.0))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(10.0))
+                                                                .font_weight(gpui::FontWeight::BOLD)
+                                                                .text_color(tokens.text_muted)
+                                                                .child("ARGUMENTS")
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w_full()
+                                                                .p(px(8.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(tokens.pane_header_bg)
+                                                                .border_1()
+                                                                .border_color(tokens.border_subtle)
+                                                                .font_family(MONO_FONT)
+                                                                .text_size(px(11.0))
+                                                                .text_color(tokens.text_primary)
+                                                                .child(tool.input.clone())
+                                                        )
+                                                )
+                                            })
+                                            .when(!tool.output.is_empty() || tool.state == ToolState::Running, |view| {
+                                                view.child(
+                                                    div().flex().flex_col().gap(px(4.0))
+                                                        .child(
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_between()
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(10.0))
+                                                                        .font_weight(gpui::FontWeight::BOLD)
+                                                                        .text_color(tokens.text_muted)
+                                                                        .child(if line_count > 0 {
+                                                                            format!("OUTPUT ({line_count} {})", if line_count == 1 { "line" } else { "lines" })
+                                                                        } else {
+                                                                            "OUTPUT".to_string()
+                                                                        })
+                                                                )
+                                                                .when(!tool.output.is_empty(), |row| {
+                                                                    row.child(
+                                                                        div()
+                                                                            .id(SharedString::from(format!("copy-tool-{pane_id}-{index}")))
+                                                                            .cursor(CursorStyle::PointingHand)
+                                                                            .flex()
+                                                                            .items_center()
+                                                                            .gap(px(4.0))
+                                                                            .text_size(px(11.0))
+                                                                            .text_color(tokens.text_muted)
+                                                                            .hover(move |s| s.text_color(tokens.text_primary))
+                                                                            .child(
+                                                                                svg()
+                                                                                    .path("icons/copy.svg")
+                                                                                    .size(px(11.0))
+                                                                                    .text_color(tokens.text_muted)
+                                                                            )
+                                                                            .child("Copy")
+                                                                            .on_mouse_down(
+                                                                                MouseButton::Left,
+                                                                                cx.listener(move |this, _, _, cx| {
+                                                                                    cx.stop_propagation();
+                                                                                    this.copy_chat_tool_output(pane_id, index, cx);
+                                                                                }),
+                                                                            )
+                                                                    )
+                                                                })
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .w_full()
+                                                                .max_h(px(260.0))
+                                                                .overflow_y_scrollbar()
+                                                                .p(px(8.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(tokens.pane_header_bg)
+                                                                .border_1()
+                                                                .border_color(tokens.border_subtle)
+                                                                .font_family(MONO_FONT)
+                                                                .text_size(px(11.0))
+                                                                .text_color(if tool.state == ToolState::Failed {
+                                                                    tokens.block_failure
+                                                                } else {
+                                                                    tokens.text_primary
+                                                                })
+                                                                .child(if tool.output.is_empty() {
+                                                                    "Running…".to_string()
+                                                                } else {
+                                                                    tool.output.clone()
+                                                                })
+                                                        )
+                                                )
+                                            })
+                                    )
+                            })
+                            .into_any_element()
+                    } else {
+                        div()
+                            .w_full()
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.0))
+                            .text_color(tokens.text_secondary)
+                            .child(message.text.clone())
+                            .into_any_element()
+                    }
+                }
+                ChatRole::Error => {
+                    div()
+                        .w_full()
+                        .p(px(12.0))
+                        .rounded(px(6.0))
+                        .bg(tokens.pane_header_bg)
+                        .border_1()
+                        .border_color(tokens.block_failure)
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(tokens.block_failure)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("Error")
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .font_family(MONO_FONT)
+                                .text_size(px(13.0))
+                                .text_color(tokens.block_failure)
+                                .child(message.text.clone())
+                        )
+                        .into_any_element()
+                }
+            }
+        }).collect::<Vec<_>>();
+        div()
+            .id(("agent-chat", pane.id))
+            .size_full()
+            .track_scroll(&pane.chat.scroll)
+            .overflow_y_scrollbar()
+            .p(px(16.0))
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .when(pane.chat.visible_messages().is_empty(), |view| {
+                view.child(
+                    div()
+                        .text_color(tokens.text_muted)
+                        .text_size(px(13.0))
+                        .child("Ask the agent to work in this directory."),
+                )
+            })
+            .children(messages)
+            .when(pane.chat.visible_running(), |view| {
+                view.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(4.0))
+                        .py(px(2.0))
+                        .child(div().size(px(6.0)).rounded_full().bg(tokens.block_warning))
+                        .child(
+                            div()
+                                .text_color(tokens.text_muted)
+                                .text_size(px(12.0))
+                                .child("Waiting for agent updates…"),
+                        ),
+                )
+            })
+    }
+
     fn render_terminal_pane(
         &self,
         pane: &TerminalPane,
         is_maximized: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let pane_id = pane.id;
@@ -5330,6 +7261,7 @@ impl AppState {
 
         div()
             .id(("terminal-pane", pane_id))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -5368,6 +7300,24 @@ impl AppState {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
+                            .when(!pane.should_show_bottom_input(cx), |row| {
+                                row.child(
+                                    div()
+                                        .id(("header-agent", pane_id))
+                                        .px(px(7.0))
+                                        .text_size(px(11.0))
+                                        .text_color(tokens.pane_header_fg)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .child("Agent")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.set_chat_mode(pane_id, true, window, cx);
+                                            }),
+                                        ),
+                                )
+                            })
                             .child(
                                 div()
                                     .id(("split-v-btn", pane_id))
@@ -5502,10 +7452,17 @@ impl AppState {
                             this.open_terminal_context_menu(pane_id, event.position, window, cx);
                         }),
                     )
-                    .child(pane.terminal.clone()),
+                    .child(if pane.chat.active {
+                        self.render_agent_chat(pane, window, cx).into_any_element()
+                    } else {
+                        pane.terminal.clone().into_any_element()
+                    }),
             )
             .when(pane.should_show_bottom_input(cx), |this| {
                 this.child(self.render_kathamo_input_bar(pane, is_focused, cx))
+            })
+            .when_some(pane.chat.auth.as_ref(), |this, auth| {
+                this.child(self.render_agent_auth(pane_id, auth, cx))
             })
     }
 
@@ -5514,12 +7471,13 @@ impl AppState {
         node: &PaneNode,
         session: &Session,
         is_maximized: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match node {
             PaneNode::Leaf(pane_id) => {
                 if let Some(pane) = session.panes.iter().find(|p| p.id == *pane_id) {
-                    self.render_terminal_pane(pane, is_maximized, cx)
+                    self.render_terminal_pane(pane, is_maximized, window, cx)
                         .into_any_element()
                 } else {
                     div().into_any_element()
@@ -5531,8 +7489,8 @@ impl AppState {
                 left,
                 right,
             } => {
-                let left_el = self.render_pane_node(left, session, is_maximized, cx);
-                let right_el = self.render_pane_node(right, session, is_maximized, cx);
+                let left_el = self.render_pane_node(left, session, is_maximized, window, cx);
+                let right_el = self.render_pane_node(right, session, is_maximized, window, cx);
                 let is_horizontal = *axis == gpui::Axis::Horizontal;
                 let split_id = ("terminal-split", *id);
 
@@ -7175,16 +9133,17 @@ impl Render for AppState {
             // running in the background.
             if let Some(max_pane_id) = session.maximized_pane_id {
                 if let Some(pane) = session.panes.iter().find(|p| p.id == max_pane_id) {
-                    self.render_terminal_pane(pane, true, cx).into_any_element()
+                    self.render_terminal_pane(pane, true, _window, cx)
+                        .into_any_element()
                 } else if let Some(tree) = &session.pane_tree {
-                    self.render_pane_node(tree, session, false, cx)
+                    self.render_pane_node(tree, session, false, _window, cx)
                 } else {
                     div().into_any_element()
                 }
             } else if let Some(tree) = &session.pane_tree {
-                self.render_pane_node(tree, session, false, cx)
+                self.render_pane_node(tree, session, false, _window, cx)
             } else if let Some(pane) = session.panes.first() {
-                self.render_terminal_pane(pane, false, cx)
+                self.render_terminal_pane(pane, false, _window, cx)
                     .into_any_element()
             } else {
                 div().into_any_element()
@@ -7395,6 +9354,18 @@ impl Render for AppState {
                         cx.notify();
                     }
                     return;
+                }
+                if let Some(pane_id) = this.focused_pane_id {
+                    if this
+                        .pane_ref(pane_id)
+                        .is_some_and(|pane| pane.chat.auth.is_some())
+                    {
+                        if keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            this.close_agent_auth(pane_id, window, cx);
+                        }
+                        return;
+                    }
                 }
 
                 if this.active_view != ActiveView::Workspace
@@ -7763,6 +9734,7 @@ fn main() -> Result<()> {
                         active_view: ActiveView::Workspace,
                         theme_preference: ThemePreference::System,
                         palette_scheme: PaletteScheme::default(),
+                        default_agent_model: None,
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
                         sidebar_width: SIDEBAR_WIDTH,
@@ -7821,6 +9793,19 @@ fn main() -> Result<()> {
                             })
                         }));
                     });
+
+                    let agent_state_weak = app_state.downgrade();
+                    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                        let mut streaming = false;
+                        loop {
+                            let interval = if streaming { 16 } else { 50 };
+                            cx.background_executor().timer(std::time::Duration::from_millis(interval)).await;
+                            match agent_state_weak.update(cx, |state, cx| state.poll_agent_events(cx)) {
+                                Ok(active) => streaming = active,
+                                Err(_) => break,
+                            }
+                        }
+                    }).detach();
 
                     let app_state_weak = app_state.downgrade();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
@@ -8053,6 +10038,7 @@ mod resize_tests {
             active_view: ActiveView::Workspace,
             theme_preference: ThemePreference::System,
             palette_scheme: PaletteScheme::default(),
+            default_agent_model: None,
             integration_panel_visible: false,
             integration_feedback: SharedString::from(
                 "Setup is opt-in. Status becomes Reporting only after a live event arrives.",
@@ -9077,6 +11063,205 @@ mod kathamo_bottom_input_tests {
     use super::*;
     use gpui::{VisualContext, point};
     use resize_tests::{DrawFrame, TestAppContext, open_app};
+
+    #[test]
+    fn streamed_thinking_and_answers_keep_their_boundaries() {
+        use agent_bridge::AgentEvent;
+        let mut messages = Vec::new();
+        push_chat_event(&mut messages, AgentEvent::Thinking("Checking ".into()));
+        push_chat_event(&mut messages, AgentEvent::Thinking("files".into()));
+        push_chat_event(&mut messages, AgentEvent::Text("Found ".into()));
+        push_chat_event(&mut messages, AgentEvent::Text("the issue".into()));
+        push_chat_event(&mut messages, AgentEvent::Tool("read finished".into()));
+        push_chat_event(&mut messages, AgentEvent::Text("Fixed it".into()));
+        assert_eq!(messages.len(), 4);
+        assert!(messages[0].role == ChatRole::Thinking && messages[0].text == "Checking files");
+        assert!(messages[1].role == ChatRole::Assistant && messages[1].text == "Found the issue");
+        assert!(messages[2].role == ChatRole::Tool && messages[2].text == "read finished");
+        assert!(messages[3].role == ChatRole::Assistant && messages[3].text == "Fixed it");
+    }
+
+    #[test]
+    fn concurrent_tool_snapshots_stay_with_their_original_calls() {
+        use agent_bridge::AgentEvent;
+        let mut messages = Vec::new();
+        for id in ["a", "b"] {
+            push_chat_event(
+                &mut messages,
+                AgentEvent::ToolStart {
+                    id: Some(id.into()),
+                    name: "read".into(),
+                    input: format!("input {id}"),
+                },
+            );
+        }
+        push_chat_event(&mut messages, AgentEvent::Thinking("Checking".into()));
+        push_chat_event(
+            &mut messages,
+            AgentEvent::ToolUpdate {
+                id: Some("b".into()),
+                name: "read".into(),
+                output: "partial".into(),
+            },
+        );
+        push_chat_event(
+            &mut messages,
+            AgentEvent::ToolEnd {
+                id: Some("a".into()),
+                name: "read".into(),
+                output: "result a".into(),
+                failed: false,
+            },
+        );
+        push_chat_event(
+            &mut messages,
+            AgentEvent::ToolEnd {
+                id: Some("b".into()),
+                name: "read".into(),
+                output: "result b".into(),
+                failed: true,
+            },
+        );
+        assert_eq!(messages.len(), 3);
+        let a = messages[0].tool.as_ref().unwrap();
+        let b = messages[1].tool.as_ref().unwrap();
+        assert!(a.input == "input a" && a.output == "result a" && a.state == ToolState::Completed);
+        assert!(b.input == "input b" && b.output == "result b" && b.state == ToolState::Failed);
+        assert!(messages[2].role == ChatRole::Thinking);
+    }
+
+    #[test]
+    fn agent_fast_mode_and_speed_control() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(id, true, window, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            assert!(
+                pane.chat.fast_mode,
+                "fast mode should default to true for interactive speed"
+            );
+        });
+
+        // Execute /fast slash command
+        cx.update_window_entity(&state, |s, window, cx| {
+            let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
+            input.update(cx, |input, cx| input.set_value("/fast", window, cx));
+            s.execute_pane_input(id, window, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            assert!(
+                !pane.chat.fast_mode,
+                "toggling via /fast should switch to deep mode"
+            );
+            let last_msg = pane.chat.visible_messages().last().unwrap();
+            assert_eq!(last_msg.role, ChatRole::Status);
+            assert!(last_msg.text.contains("Deep mode"));
+        });
+
+        // Execute /thinking low slash command
+        cx.update_window_entity(&state, |s, window, cx| {
+            let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
+            input.update(cx, |input, cx| input.set_value("/thinking low", window, cx));
+            s.execute_pane_input(id, window, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            assert!(
+                pane.chat.fast_mode,
+                "/thinking low should activate fast mode"
+            );
+            let last_msg = pane.chat.visible_messages().last().unwrap();
+            assert_eq!(last_msg.role, ChatRole::Status);
+            assert!(last_msg.text.contains("low"));
+        });
+    }
+
+    #[test]
+    fn model_selection_does_not_reauthenticate_ready_provider() {
+        use gpui::Modifiers;
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        let model = agent_auth::AgentModel {
+            provider: "google-antigravity".into(),
+            id: "gemini-example".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(id, true, window, cx);
+            let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
+            input.update(cx, |input, cx| input.set_value("/model", window, cx));
+            s.execute_pane_input(id, window, cx);
+            let auth = s.pane_mut(id).unwrap().chat.auth.as_mut().unwrap();
+            auth.discovery = None;
+            auth.model_discovery = None;
+            auth.providers = vec![agent_auth::Provider {
+                id: "google-antigravity".into(),
+                ready: true,
+                source: Some("omp OAuth".into()),
+            }];
+            auth.models = vec![model.clone()];
+        });
+        cx.draw_frame().unwrap();
+        state.read_with(&cx, |s, _| {
+            let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
+            assert!(matches!(auth.page, AgentDialogPage::Models));
+            assert!(auth.login.is_none());
+        });
+        assert!(
+            cx.debug_bounds("auth-provider-0").is_none(),
+            "model page must not show login rows"
+        );
+        let bounds = cx.debug_bounds("agent-auth-tab").unwrap();
+        let center = point(
+            bounds.origin.x + bounds.size.width / 2.0,
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(center, None, Modifiers::default());
+        cx.simulate_click(center, Modifiers::default());
+        cx.draw_frame().unwrap();
+        let bounds = cx.debug_bounds("auth-provider-0").unwrap();
+        let center = point(
+            bounds.origin.x + px(10.0),
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(center, None, Modifiers::default());
+        cx.simulate_click(center, Modifiers::default());
+        cx.draw_frame().unwrap();
+        state.read_with(&cx, |s, _| {
+            let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
+            assert!(matches!(auth.page, AgentDialogPage::Models));
+            assert!(
+                auth.login.is_none(),
+                "clicking a ready provider must not start a second login"
+            );
+        });
+        let bounds = cx.debug_bounds("agent-model-0").unwrap();
+        let center = point(
+            bounds.origin.x + px(10.0),
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(center, None, Modifiers::default());
+        cx.simulate_click(center, Modifiers::default());
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            assert!(pane.chat.auth.is_none());
+            assert_eq!(pane.chat.selected_model.as_ref(), Some(&model));
+        });
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.open_agent_auth(id, AgentDialogPage::Models, window, cx);
+        });
+        cx.draw_frame().unwrap();
+        cx.simulate_keystrokes("escape");
+        state.read_with(&cx, |s, _| {
+            assert!(s.pane_ref(id).unwrap().chat.auth.is_none())
+        });
+    }
 
     #[test]
     fn kathamo_bottom_input_history_and_execution() {

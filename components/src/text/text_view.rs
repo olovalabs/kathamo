@@ -126,6 +126,7 @@ struct UpdateFuture {
     current_style: TextViewStyle,
     current_text: SharedString,
     timer: Timer,
+    update_scheduled: bool,
     rx: Pin<Box<smol::channel::Receiver<Update>>>,
     tx_result: smol::channel::Sender<Result<ParsedContent, SharedString>>,
     delay: Duration,
@@ -150,6 +151,7 @@ impl UpdateFuture {
             current_style: style,
             current_text: text,
             timer: Timer::never(),
+            update_scheduled: false,
             rx: Box::pin(rx),
             tx_result,
             delay,
@@ -163,7 +165,7 @@ impl Future for UpdateFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         loop {
-            match self.rx.poll_next(cx) {
+            let received = match self.rx.poll_next(cx) {
                 Poll::Ready(Some(update)) => {
                     let changed = match update {
                         Update::Text(text) if self.current_text != text => {
@@ -176,18 +178,22 @@ impl Future for UpdateFuture {
                         }
                         _ => false,
                     };
-                    if changed {
+                    if changed && !self.update_scheduled {
+                        // Throttle updates rather than debouncing them: a steady
+                        // stream must still produce intermediate rendered text.
                         let delay = self.delay;
                         self.timer.set_after(delay);
+                        self.update_scheduled = true;
                     }
-                    continue;
+                    true
                 }
                 Poll::Ready(None) => return Poll::Ready(()),
-                Poll::Pending => {}
-            }
+                Poll::Pending => false,
+            };
 
             match self.timer.poll_next(cx) {
                 Poll::Ready(Some(_)) => {
+                    self.update_scheduled = false;
                     let res = parse_content(
                         self.type_,
                         &self.current_text,
@@ -198,7 +204,8 @@ impl Future for UpdateFuture {
                     _ = self.tx_result.try_send(res);
                     continue;
                 }
-                Poll::Ready(None) | Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending if !received => return Poll::Pending,
+                Poll::Ready(None) | Poll::Pending => {}
             }
         }
     }

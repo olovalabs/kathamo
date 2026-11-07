@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Render streamed agent replies as Markdown, including headings, lists, links, and syntax-highlighted code blocks.
+- Redesigned agent tool calls into Zed-style collapsible cards with tool badges, inline argument summaries, status dots, line counts, bounded scrollable output blocks, and one-click output copying.
+- Collapsible thinking accordions that display live streaming thoughts while reasoning and automatically fold into compact headers when the response begins.
+- Pre-warm agent bridge processes in the background upon switching to Agent mode or selecting a model.
+- Enable RPC idle cache warming and default to Fast mode (`low` thinking effort) for rapid responses, with an interactive `⚡ Fast`/`🧠 Deep` toggle and `/fast` / `/thinking` slash commands.
+- Model selector for rpi and Google Antigravity, with a persistent default provider/model for new panes.
+- Google Antigravity OAuth and model selection in `/auth`, with separate native chat sessions using the installed oh-my-pi agent.
+- `/auth` in agent mode opens provider discovery and authentication with masked input and rpi-managed credentials.
+- Native per-pane pi-rust agent chat with streamed replies, tool activity, cancellation, and a terminal/agent switch. Requires a separately installed and configured `rpi` executable.
 - **Kathamo input editor**:
   - Shell history from zsh, bash, and fish history files, merged with the session's own commands for Up/Down recall and ghost suggestions.
   - Context-aware completion menu (Tab) for `PATH` commands, shell builtins, files and directories, git branches, and history — with arrow navigation and click-to-accept.
@@ -19,11 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Poll active agent streams at approximately frame cadence while retaining the lower idle polling rate.
 - Migrated the application and terminal renderer to GPUI Fast.
 - The terminal displays a plain grid without block UI. The Warp-style bottom input is always available when the shell is idle and temporarily hides while a command runs or the alternate screen is active.
 - Removed the bottom input toggle; a previously saved `bottom_input` preference no longer disables the input.
 
 ### Fixed
+- Keep Markdown agent replies updating during continuous streams and reduce OMP streaming payloads.
+- Display streamed agent thinking text instead of leaving the chat blank while a model is reasoning.
+- `/model` opens model selection instead of authentication; selecting an already authenticated provider no longer starts another login.
 - System appearance changes now update existing terminal panes and application chrome; theme changes preserve the configured component fonts.
 - Notify compatible running terminal applications when the terminal palette changes, so their light and dark themes can update without a restart.
 

@@ -6778,9 +6778,7 @@ impl AppState {
         let dist_from_bottom = max_height + offset_y;
 
         if is_autoscroll {
-            if max_height <= px(48.0) || dist_from_bottom <= px(48.0) {
-                pane.chat.scroll.scroll_to_bottom();
-            }
+            pane.chat.scroll.scroll_to_bottom();
         }
 
         let messages = pane.chat.visible_messages().iter().enumerate().map(|(index, message)| {
@@ -7230,9 +7228,9 @@ impl AppState {
         }).collect::<Vec<_>>();
         let chat_view = div()
             .id(("agent-chat", pane_id))
-            .size_full()
             .track_scroll(&pane.chat.scroll)
-            .overflow_y_scrollbar()
+            .overflow_y_scroll()
+            .vertical_scrollbar(&pane.chat.scroll)
             .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
                 if let Some(pane) = this.pane_mut(pane_id) {
                     let line_height = window.line_height();
@@ -7240,16 +7238,18 @@ impl AppState {
                     let offset_y = pane.chat.scroll.offset().y;
                     let max_height = pane.chat.scroll.max_offset().y;
                     let dist = max_height + offset_y;
-                    if delta.y > px(0.0) && dist > px(24.0) {
+                    if delta.y > px(0.0) {
                         if pane.chat.autoscroll {
                             pane.chat.autoscroll = false;
                             cx.notify();
                         }
-                    } else if dist <= px(24.0) || (delta.y < px(0.0) && dist <= px(48.0)) {
-                        if !pane.chat.autoscroll {
-                            pane.chat.autoscroll = true;
-                            pane.chat.scroll.scroll_to_bottom();
-                            cx.notify();
+                    } else if delta.y < px(0.0) {
+                        if dist <= px(40.0) {
+                            if !pane.chat.autoscroll {
+                                pane.chat.autoscroll = true;
+                                pane.chat.scroll.scroll_to_bottom();
+                                cx.notify();
+                            }
                         }
                     }
                 }
@@ -11294,7 +11294,39 @@ mod kathamo_bottom_input_tests {
         });
         cx.draw_frame()
             .expect("draw chat frame with autoscroll pinned");
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            let offset_y = pane.chat.scroll.offset().y;
+            let max_y = pane.chat.scroll.max_offset().y;
+            assert!(max_y > px(0.0), "content should be scrollable");
+            assert_eq!(
+                offset_y, -max_y,
+                "autoscroll must be clamped to the bottom offset"
+            );
+        });
 
+        // Append more content while autoscroll is true
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = s.pane_mut(id).unwrap();
+            for i in 15..25 {
+                pane.chat.messages.push(ChatMessage::new(
+                    ChatRole::Assistant,
+                    format!("New streamed chunk {i} making the conversation much taller!"),
+                ));
+            }
+            cx.notify();
+        });
+        cx.draw_frame()
+            .expect("draw frame after new streamed chunks");
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(id).unwrap();
+            let offset_y = pane.chat.scroll.offset().y;
+            let max_y = pane.chat.scroll.max_offset().y;
+            assert_eq!(
+                offset_y, -max_y,
+                "autoscroll must follow growing content to the new bottom"
+            );
+        });
         // User scrolls up to read history -> unpins autoscroll
         cx.update_window_entity(&state, |s, _, cx| {
             let pane = s.pane_mut(id).unwrap();

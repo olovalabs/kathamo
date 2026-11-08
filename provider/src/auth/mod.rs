@@ -17,6 +17,22 @@ pub fn check_auth_with_active(
     let spec = match get_provider(provider_id) {
         Some(spec) => spec,
         None => {
+            if let Some(cred) = storage::get_local_credential(provider_id) {
+                let source = match cred {
+                    crate::types::StoredCredential::OAuth { .. } => {
+                        "Stored OAuth token".to_string()
+                    }
+                    crate::types::StoredCredential::ApiKey { source, .. } => {
+                        source.unwrap_or_else(|| "Stored API key".to_string())
+                    }
+                };
+                return AuthStatus {
+                    provider: provider_id.to_string(),
+                    ready: true,
+                    source: Some(source),
+                    auth_type: AuthType::ApiKey,
+                };
+            }
             return AuthStatus {
                 provider: provider_id.to_string(),
                 ready: false,
@@ -32,10 +48,26 @@ pub fn check_auth_with_active(
     if let Some(cred) = storage::get_local_credential(&spec.id) {
         let source = match cred {
             crate::types::StoredCredential::OAuth { .. } => "Stored OAuth token".to_string(),
-            crate::types::StoredCredential::ApiKey { source, .. } => {
-                source.unwrap_or_else(|| "Stored API key".to_string())
+            crate::types::StoredCredential::ApiKey { ref source, .. } => {
+                source.clone().unwrap_or_else(|| "Stored API key".to_string())
             }
         };
+        if let crate::types::StoredCredential::ApiKey { ref key, .. } = cred {
+            for var in &spec.env_vars {
+                if std::env::var(var).is_err() {
+                    unsafe {
+                        std::env::set_var(var, key);
+                    }
+                }
+            }
+            let upper = spec.id.replace('-', "_").to_uppercase();
+            let fallback_var = format!("{upper}_API_KEY");
+            if std::env::var(&fallback_var).is_err() {
+                unsafe {
+                    std::env::set_var(&fallback_var, key);
+                }
+            }
+        }
         return AuthStatus {
             provider: spec.id.clone(),
             ready: true,

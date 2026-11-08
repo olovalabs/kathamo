@@ -60,6 +60,9 @@ pub fn get_omp_token(provider_id: &str) -> Option<String> {
 }
 
 fn credentials_file_path() -> Option<PathBuf> {
+    if let Some(custom) = std::env::var_os("KATHAMO_DATA_DIR").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(custom).join("config").join("credentials.json"));
+    }
     directories::BaseDirs::new().map(|dirs| {
         dirs.config_dir()
             .join("kathamo")
@@ -157,7 +160,11 @@ pub fn save_api_key(provider_id: &str, key: &str) -> Result<(), String> {
             }
         }
     }
-
+    let upper = provider_id.replace('-', "_").to_uppercase();
+    let fallback_var = format!("{upper}_API_KEY");
+    unsafe {
+        std::env::set_var(&fallback_var, key);
+    }
     // 3. Import into OMP credentials store via `omp auth import -`
     let import_doc = serde_json::json!({
         "version": 1,
@@ -223,6 +230,36 @@ pub fn disconnect_provider(provider_id: &str) -> Result<(), String> {
             }
         }
     }
+    let upper = provider_id.replace('-', "_").to_uppercase();
+    let fallback_var = format!("{upper}_API_KEY");
+    unsafe {
+        std::env::remove_var(&fallback_var);
+    }
 
     Ok(())
+}
+
+/// Restore all locally stored API keys into the process environment variables.
+pub fn restore_stored_credentials() {
+    let creds = load_local_credentials();
+    for (provider_id, cred) in creds {
+        if let StoredCredential::ApiKey { key, .. } = cred {
+            if let Some(spec) = crate::catalog::get_provider(&provider_id) {
+                for var in &spec.env_vars {
+                    if std::env::var(var).is_err() {
+                        unsafe {
+                            std::env::set_var(var, &key);
+                        }
+                    }
+                }
+            }
+            let upper = provider_id.replace('-', "_").to_uppercase();
+            let fallback_var = format!("{upper}_API_KEY");
+            if std::env::var(&fallback_var).is_err() {
+                unsafe {
+                    std::env::set_var(&fallback_var, &key);
+                }
+            }
+        }
+    }
 }

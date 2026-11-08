@@ -5569,11 +5569,20 @@ impl AppState {
                         .update(cx, |state, cx| state.set_value("", window, cx));
 
                     // Update live readiness in provider list
+                    let mut found = false;
                     for p in &mut auth.providers {
                         if p.id == provider {
                             p.ready = true;
                             p.source = Some("Stored API key".to_string());
+                            found = true;
                         }
+                    }
+                    if !found {
+                        auth.providers.push(agent_auth::Provider {
+                            id: provider.clone(),
+                            ready: true,
+                            source: Some("Stored API key".to_string()),
+                        });
                     }
 
                     // Refresh models catalog
@@ -8652,126 +8661,46 @@ impl AppState {
             })
             .collect();
         providers.sort_by_key(|provider| (!provider.ready, provider.id.clone()));
-        let modal_bg: Hsla = if tokens.is_dark {
-            rgba(0x13141df2).into()
-        } else {
-            rgba(0xffffffeb).into()
-        };
-        let modal_border: Hsla = if tokens.is_dark {
-            rgba(0xffffff22).into()
-        } else {
-            rgba(0x0000001c).into()
-        };
-        let modal_divider: Hsla = if tokens.is_dark {
-            rgba(0xffffff14).into()
-        } else {
-            rgba(0x00000010).into()
-        };
-        let row_hover_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff10).into()
-        } else {
-            rgba(0x0000000a).into()
-        };
-        let row_selected_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff1c).into()
-        } else {
-            rgba(0x00000014).into()
-        };
-        let chip_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff14).into()
-        } else {
-            rgba(0x0000000c).into()
-        };
-        let badge_success_bg: Hsla = if tokens.is_dark {
-            rgba(0x2eaf5a28).into()
-        } else {
-            rgba(0x2eaf5a18).into()
-        };
-        let badge_success_border: Hsla = if tokens.is_dark {
-            rgba(0x2eaf5a45).into()
-        } else {
-            rgba(0x2eaf5a30).into()
-        };
-        let dot_unconnected: Hsla = if tokens.is_dark {
-            rgba(0xffffff33).into()
-        } else {
-            rgba(0x00000030).into()
-        };
-        let btn_contrast_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff20).into()
-        } else {
-            rgba(0x00000012).into()
-        };
-        let btn_contrast_border: Hsla = if tokens.is_dark {
-            rgba(0xffffff2e).into()
-        } else {
-            rgba(0x0000001a).into()
-        };
-        let btn_contrast_hover: Hsla = if tokens.is_dark {
-            rgba(0xffffff32).into()
-        } else {
-            rgba(0x00000020).into()
-        };
-        let close_btn_hover: Hsla = if tokens.is_dark {
-            rgba(0xffffff1c).into()
-        } else {
-            rgba(0x00000012).into()
-        };
-        let tabs_bg: Hsla = if tokens.is_dark {
-            rgba(0x00000055).into()
-        } else {
-            rgba(0x0000000a).into()
-        };
-        let tabs_border: Hsla = if tokens.is_dark {
-            rgba(0xffffff16).into()
-        } else {
-            rgba(0x00000010).into()
-        };
-        let active_tab_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff1c).into()
-        } else {
-            rgba(0xffffffff).into()
-        };
-        let active_tab_border: Hsla = if tokens.is_dark {
-            rgba(0xffffff28).into()
-        } else {
-            rgba(0x00000012).into()
-        };
-        let card_sub_bg: Hsla = if tokens.is_dark {
-            rgba(0x00000040).into()
-        } else {
-            rgba(0x00000006).into()
-        };
-        let esc_chip_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff18).into()
-        } else {
-            rgba(0x0000000c).into()
-        };
-        let esc_chip_border: Hsla = if tokens.is_dark {
-            rgba(0xffffff24).into()
-        } else {
-            rgba(0x00000016).into()
-        };
-        let open_providers_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff1c).into()
-        } else {
-            rgba(0x00000010).into()
-        };
-        let open_providers_hover: Hsla = if tokens.is_dark {
-            rgba(0xffffff2a).into()
-        } else {
-            rgba(0x0000001c).into()
-        };
-        let disconnect_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff12).into()
-        } else {
-            rgba(0x0000000a).into()
-        };
-        let modal_top_highlight: Hsla = if tokens.is_dark {
-            rgba(0xffffff20).into()
-        } else {
-            rgba(0xffffff90).into()
-        };
+        let mut modal_bg = tokens.card_bg;
+        modal_bg.a = if tokens.is_dark { 0.95 } else { 0.96 };
+        let modal_border = tokens.card_border;
+        let modal_divider = tokens.border_subtle;
+
+        let row_hover_bg = tokens.card_hover;
+        let row_selected_bg = tokens.pane_header_btn_hover;
+        let chip_bg = tokens.pane_header_btn_hover;
+
+        let mut badge_success_bg = tokens.block_success;
+        badge_success_bg.a = if tokens.is_dark { 0.18 } else { 0.14 };
+        let mut badge_success_border = tokens.block_success;
+        badge_success_border.a = if tokens.is_dark { 0.38 } else { 0.28 };
+
+        let mut dot_unconnected = tokens.text_muted;
+        dot_unconnected.a = if tokens.is_dark { 0.38 } else { 0.30 };
+
+        let btn_contrast_bg = tokens.card_hover;
+        let btn_contrast_border = tokens.card_border;
+        let btn_contrast_hover = tokens.pane_header_btn_hover;
+
+        let close_btn_hover = tokens.card_hover;
+
+        let tabs_bg = tokens.pane_bg;
+        let tabs_border = tokens.card_border;
+        let active_tab_bg = tokens.card_bg;
+        let active_tab_border = tokens.card_border;
+
+        let card_sub_bg = tokens.pane_header_bg;
+
+        let esc_chip_bg = tokens.pane_bg;
+        let esc_chip_border = tokens.card_border;
+
+        let open_providers_bg = tokens.card_hover;
+        let open_providers_hover = tokens.pane_header_btn_hover;
+
+        let disconnect_bg = tokens.card_hover;
+
+        let mut modal_top_highlight = tokens.border_subtle;
+        modal_top_highlight.a = if tokens.is_dark { 0.45 } else { 0.70 };
         let provider_rows = providers
             .iter()
             .enumerate()
@@ -13247,6 +13176,21 @@ fn main() -> Result<()> {
             ensure_linux_desktop_entry();
             if let Err(error) = paths::ensure_dirs() {
                 eprintln!("failed to create app data directories: {error}");
+            }
+            crate::provider::restore_stored_credentials();
+            #[cfg(target_os = "linux")]
+            if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
+                let local_bin = home.join(".local/bin");
+                if local_bin.exists() {
+                    if let Ok(current_path) = std::env::var("PATH") {
+                        let local_bin_str = local_bin.to_string_lossy();
+                        if !current_path.split(':').any(|p| p == local_bin_str) {
+                            unsafe {
+                                std::env::set_var("PATH", format!("{local_bin_str}:{current_path}"));
+                            }
+                        }
+                    }
+                }
             }
             let app_settings = settings::load();
             let restore_enabled = app_settings.restore.sessions

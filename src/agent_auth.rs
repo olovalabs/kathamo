@@ -197,6 +197,8 @@ fn strip_thinking_suffix(model: &str) -> &str {
 /// Discover catalog and configured provider IDs, then ask rpi for their local
 /// authentication status. This performs blocking IO.
 pub fn providers(cwd: &Path) -> Result<Vec<Provider>, String> {
+    crate::provider::restore_stored_credentials();
+
     let mut result = Vec::new();
     let all_specs = crate::provider::all_providers();
     let active_omp = crate::provider::auth::storage::omp_authenticated_providers();
@@ -208,6 +210,31 @@ pub fn providers(cwd: &Path) -> Result<Vec<Provider>, String> {
             ready: status.ready,
             source: status.source,
         });
+    }
+
+    // Also include any extra custom providers from credentials.json
+    let local_creds = crate::provider::auth::storage::load_local_credentials();
+    for (id, cred) in local_creds {
+        let source_str = match cred {
+            crate::provider::types::StoredCredential::OAuth { .. } => {
+                Some("Stored OAuth token".to_string())
+            }
+            crate::provider::types::StoredCredential::ApiKey { source, .. } => {
+                Some(source.unwrap_or_else(|| "Stored API key".to_string()))
+            }
+        };
+        if let Some(existing) = result.iter_mut().find(|p| p.id == id) {
+            existing.ready = true;
+            if existing.source.is_none() {
+                existing.source = source_str;
+            }
+        } else {
+            result.push(Provider {
+                id,
+                ready: true,
+                source: source_str,
+            });
+        }
     }
 
     // Also include any extra custom providers from rpi if present

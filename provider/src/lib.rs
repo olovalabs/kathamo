@@ -6,7 +6,7 @@ pub mod providers;
 pub mod types;
 
 // Re-export common types and functions for ergonomic access
-pub use auth::storage::{disconnect_provider, save_api_key};
+pub use auth::storage::{disconnect_provider, restore_stored_credentials, save_api_key};
 pub use auth::{check_all_auth, check_auth};
 pub use catalog::{
     all_models, all_providers, api_key_providers, default_model_for, get_provider,
@@ -99,5 +99,32 @@ mod tests {
 
         let gpt_results = search_models("gpt-5");
         assert!(!gpt_results.is_empty(), "Search should find GPT-5 models");
+    }
+
+    #[test]
+    fn test_api_key_persistence_and_restore() {
+        let provider = "anthropic";
+        let test_key = "test-sk-anthropic-persist-12345";
+
+        // 1. Save API key
+        save_api_key(provider, test_key).expect("save_api_key should succeed");
+
+        // 2. Clear env var to simulate application close
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        assert!(std::env::var("ANTHROPIC_API_KEY").is_err());
+
+        // 3. Restore credentials on simulated restart
+        restore_stored_credentials();
+        assert_eq!(std::env::var("ANTHROPIC_API_KEY").unwrap(), test_key);
+
+        // 4. Check auth status
+        let status = check_auth(provider);
+        assert!(status.ready, "Provider should be ready after restore");
+
+        // 5. Clean up
+        disconnect_provider(provider).expect("disconnect should succeed");
+        assert!(std::env::var("ANTHROPIC_API_KEY").is_err());
     }
 }

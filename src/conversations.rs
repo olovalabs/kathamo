@@ -176,6 +176,7 @@ fn bounded_event(event: &AgentEvent) -> AgentEvent {
             failed,
         },
         AgentEvent::Error(text) => AgentEvent::Error(cap_text(&text, MAX_ENTRY_BYTES)),
+        AgentEvent::Title(text) => AgentEvent::Title(cap_text(&text, 200)),
         AgentEvent::Done => AgentEvent::Done,
         AgentEvent::Closed => AgentEvent::Closed,
     }

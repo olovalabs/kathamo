@@ -1211,6 +1211,54 @@ fn agent_model_label(model: &agent_auth::AgentModel) -> String {
     format!("{} · {}", model.provider, model.id)
 }
 
+/// A readable conversation name from the first prompt, used to label the
+/// session in the sidebar. Backends that generate their own title replace it.
+fn agent_title_from_prompt(prompt: &str) -> Option<String> {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('/'))?;
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(match collapsed.char_indices().nth(64) {
+        Some((index, _)) => format!("{}…", &collapsed[..index]),
+        None => collapsed,
+    })
+}
+
+/// The `provider/model` selector both agent backends are launched with.
+///
+/// Model ids may themselves contain slashes (`commandcode` +
+/// `deepseek/deepseek-v4-flash`), so the provider is always prefixed instead of
+/// letting the backend guess a provider from the id. Every launch path must use
+/// this, otherwise a pane runs a different model than the chip shows.
+fn agent_model_selector(model: &agent_auth::AgentModel) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+/// Launch the agent process for one model. Warming a pane and sending its
+/// first prompt must agree here, or the pane runs a different model than its
+/// chip shows.
+fn spawn_model_bridge(
+    model: &agent_auth::AgentModel,
+    cwd: &Path,
+    rpi_session_id: Option<&str>,
+) -> Result<ModelBridge, String> {
+    let selector = agent_model_selector(model);
+    match model.backend {
+        agent_auth::ModelBackend::Rpi => {
+            agent_bridge::AgentBridge::spawn_resumed(cwd, rpi_session_id, Some(&selector))
+                .or_else(|_| agent_bridge::AgentBridge::spawn_model(cwd, Some(&selector)))
+                .map(ModelBridge::Rpi)
+        }
+        agent_auth::ModelBackend::Omp => {
+            omp_bridge::OmpBridge::spawn(cwd, &selector).map(ModelBridge::Omp)
+        }
+    }
+}
+
 /// Turn a pre-prompt agent failure into a short, actionable default-screen note.
 fn agent_startup_notice(error: &str) -> (String, String) {
     let lower = error.to_ascii_lowercase();
@@ -1315,7 +1363,10 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
         agent_bridge::AgentEvent::Status(text) => (ChatRole::Status, text),
         agent_bridge::AgentEvent::Tool(text) => (ChatRole::Tool, text),
         agent_bridge::AgentEvent::Error(text) => (ChatRole::Error, text),
-        agent_bridge::AgentEvent::Done | agent_bridge::AgentEvent::Closed => return,
+        // The session title is metadata, not transcript content.
+        agent_bridge::AgentEvent::Title(_)
+        | agent_bridge::AgentEvent::Done
+        | agent_bridge::AgentEvent::Closed => return,
     };
     if role == ChatRole::Assistant {
         for message in messages
@@ -1432,6 +1483,10 @@ struct ModelChat {
     /// A failure reported before the first prompt; shown on the default screen
     /// instead of as a transcript message.
     startup_error: Option<String>,
+    /// Name the agent reported for this conversation, when it generates one.
+    agent_title: Option<String>,
+    /// Name derived from this conversation's first prompt.
+    prompt_title: Option<String>,
 }
 
 struct PaneChat {
@@ -1446,6 +1501,14 @@ struct PaneChat {
     auth_refresh_pending: bool,
     auth: Option<AuthModal>,
     selected_model: Option<agent_auth::AgentModel>,
+    /// The user has chosen a model for this pane (including "Automatic (rpi)",
+    /// which is `selected_model == None`). Without this, a pane deliberately
+    /// set to Automatic is re-pinned to the app default on the next launch.
+    model_explicit: bool,
+    /// Conversation names for the unpinned ("Automatic") conversation; each
+    /// `ModelChat` carries its own pair.
+    agent_title: Option<String>,
+    prompt_title: Option<String>,
     models: HashMap<agent_auth::AgentModel, ModelChat>,
     fast_mode: bool,
     pub autoscroll: bool,
@@ -1471,6 +1534,9 @@ impl Default for PaneChat {
             auth_refresh_pending: false,
             auth: None,
             selected_model: None,
+            model_explicit: false,
+            agent_title: None,
+            prompt_title: None,
             models: HashMap::new(),
             fast_mode: true,
             autoscroll: true,
@@ -1483,6 +1549,42 @@ impl Default for PaneChat {
 }
 
 impl PaneChat {
+    /// The conversation name for the selected model, if the backend reported
+    /// one or a prompt has already named it.
+    fn conversation_title(&self) -> Option<&str> {
+        let (agent_title, prompt_title) = match self.selected_model.as_ref() {
+            Some(model) => match self.models.get(model) {
+                Some(chat) => (chat.agent_title.as_deref(), chat.prompt_title.as_deref()),
+                None => (None, None),
+            },
+            None => (self.agent_title.as_deref(), self.prompt_title.as_deref()),
+        };
+        agent_title
+            .or(prompt_title)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+    }
+
+    /// Record a prompt-derived conversation name for the selected model.
+    fn set_prompt_title(&mut self, title: String) {
+        match self.selected_model.as_ref() {
+            Some(model) => {
+                self.models.entry(model.clone()).or_default().prompt_title = Some(title);
+            }
+            None => self.prompt_title = Some(title),
+        }
+    }
+
+    /// Record an agent-reported conversation name for the selected model.
+    fn set_agent_title(&mut self, title: String) {
+        match self.selected_model.as_ref() {
+            Some(model) => {
+                self.models.entry(model.clone()).or_default().agent_title = Some(title);
+            }
+            None => self.agent_title = Some(title),
+        }
+    }
+
     fn visible_messages(&self) -> &[ChatMessage] {
         match self.selected_model.as_ref() {
             Some(model) => self
@@ -2070,6 +2172,9 @@ impl AppState {
                                     chat: workspace_state::SavedChat {
                                         fast_mode: pane.chat.fast_mode,
                                         selected_model: pane.chat.selected_model.clone(),
+                                        model_explicit: pane.chat.model_explicit,
+                                        agent_title: pane.chat.agent_title.clone(),
+                                        prompt_title: pane.chat.prompt_title.clone(),
                                         rpi_session_id: pane.chat.rpi_session_id.clone(),
                                         models: pane
                                             .chat
@@ -2081,6 +2186,8 @@ impl AppState {
                                                 conversation: conversations::conversation_key(
                                                     Some(model),
                                                 ),
+                                                agent_title: chat.agent_title.clone(),
+                                                prompt_title: chat.prompt_title.clone(),
                                             })
                                             .collect(),
                                     },
@@ -2362,11 +2469,16 @@ impl AppState {
                     pane.restore_draft = Some(saved_pane.draft.clone());
                     pane.chat.active = saved_pane.chat_active;
                     pane.chat.fast_mode = saved_pane.chat.fast_mode;
-                    pane.chat.selected_model = saved_pane
-                        .chat
-                        .selected_model
-                        .clone()
-                        .or_else(|| self.effective_default_agent_model().cloned());
+                    // A pane keeps exactly the model it was using. Only panes
+                    // that never had a choice adopt the app default.
+                    pane.chat.model_explicit = saved_pane.chat.model_explicit;
+                    pane.chat.agent_title = saved_pane.chat.agent_title.clone();
+                    pane.chat.prompt_title = saved_pane.chat.prompt_title.clone();
+                    pane.chat.selected_model = match saved_pane.chat.selected_model.clone() {
+                        Some(model) => Some(model),
+                        None if saved_pane.chat.model_explicit => None,
+                        None => self.effective_default_agent_model().cloned(),
+                    };
                     pane.chat.rpi_session_id = saved_pane.chat.rpi_session_id.clone();
                     pane.chat.terminal_draft = saved_pane.draft.clone();
                     pane.chat.agent_draft = saved_pane.agent_draft.clone();
@@ -2387,6 +2499,8 @@ impl AppState {
                             let key = conversations::conversation_key(Some(&model));
                             let mut chat = ModelChat {
                                 rpi_session_id: saved_model.rpi_session_id.clone(),
+                                agent_title: saved_model.agent_title.clone(),
+                                prompt_title: saved_model.prompt_title.clone(),
                                 conversation: Some(conversations::Log::open(&pane.uid, &key)),
                                 ..Default::default()
                             };
@@ -3233,6 +3347,7 @@ impl AppState {
         self.apply_status_events(status_bus::drain(), cx);
         let diag_poll = diagnostics::poll_start();
         let mut changed = false;
+        let mut title_changed = false;
         let mut panes_polled = 0u64;
         let focused_id = self.focused_pane_id;
         // `T3_STATUS_DEBUG=1` dumps every detection pass: the facts that went in
@@ -3718,9 +3833,13 @@ impl AppState {
 
                 // Sidebar title/logo follow the pane the user is working in.
                 if let Some(idx) = primary_idx {
-                    let (primary_title, primary_status) = {
+                    let (primary_title, primary_status, conversation_title) = {
                         let pane = &session.panes[idx];
-                        (pane.title.clone(), pane.status)
+                        (
+                            pane.title.clone(),
+                            pane.status,
+                            pane.chat.conversation_title().map(str::to_string),
+                        )
                     };
                     let next_logo = logos::resolve_session_logo(
                         &primary_fg,
@@ -3732,11 +3851,15 @@ impl AppState {
                         session.logo = next_logo;
                         changed = true;
                     }
-                    if session.title.as_str() != primary_title {
-                        let shared = SharedString::from(primary_title);
+                    // An agent conversation is named by its own title; only
+                    // panes without one fall back to the shell's OSC title.
+                    let sidebar_title = conversation_title.unwrap_or(primary_title);
+                    if session.title.as_str() != sidebar_title {
+                        let shared = SharedString::from(sidebar_title);
                         session.title = shared;
                         session.display_title = truncate_title(&session.title);
                         changed = true;
+                        title_changed = true;
                     }
                 }
             }
@@ -3896,6 +4019,10 @@ impl AppState {
         }
         diagnostics::panes_polled(panes_polled);
         diagnostics::poll_end(diag_poll);
+        // A sidebar title that changed here must survive a restart.
+        if title_changed {
+            self.schedule_workspace_save(cx);
+        }
         if changed {
             cx.notify();
         }
@@ -5063,22 +5190,7 @@ impl AppState {
                 chat.conversation = Some(conversations::Log::open(&pane_uid, &model_key));
             }
             if chat.bridge.is_none() {
-                let bridge = match model.backend {
-                    agent_auth::ModelBackend::Rpi => {
-                        let selector = format!("{}/{}", model.provider, model.id);
-                        agent_bridge::AgentBridge::spawn_resumed(
-                            &cwd,
-                            chat.rpi_session_id.as_deref(),
-                            Some(&selector),
-                        )
-                        .or_else(|_| agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector)))
-                        .map(ModelBridge::Rpi)
-                    }
-                    agent_auth::ModelBackend::Omp => {
-                        let selector = format!("{}/{}", model.provider, model.id);
-                        omp_bridge::OmpBridge::spawn(&cwd, &selector).map(ModelBridge::Omp)
-                    }
-                };
+                let bridge = spawn_model_bridge(&model, &cwd, chat.rpi_session_id.as_deref());
                 match bridge {
                     Ok(mut bridge) => {
                         if !fast {
@@ -5112,6 +5224,7 @@ impl AppState {
                 }
             }
         }
+        self.schedule_workspace_save(cx);
         cx.notify();
     }
 
@@ -5291,6 +5404,7 @@ impl AppState {
     ) {
         if let Some(pane) = self.pane_mut(pane_id) {
             pane.chat.startup_error = None;
+            pane.chat.model_explicit = true;
             if let Some(model) = model.as_ref() {
                 pane.chat
                     .models
@@ -5311,15 +5425,17 @@ impl AppState {
                 for project in &mut self.projects {
                     for session in &mut project.sessions {
                         for pane in &mut session.panes {
-                            if pane.chat.selected_model.is_none() {
+                            if pane.chat.selected_model.is_none() && !pane.chat.model_explicit {
                                 pane.chat.selected_model = Some(default.clone());
                             }
                         }
                     }
                 }
             }
-            self.schedule_workspace_save(cx);
         }
+        // Persist the pane's own choice right away, not on the next 30 s
+        // autosave: reopening must show the same model this pane had.
+        self.schedule_workspace_save(cx);
         self.warm_agent_bridge(pane_id);
         self.close_agent_auth(pane_id, window, cx);
     }
@@ -5518,6 +5634,7 @@ impl AppState {
                     .is_some_and(|m| m.provider == provider)
                 {
                     pane.chat.selected_model = None;
+                    pane.chat.model_explicit = true;
                 }
 
                 // Refresh models
@@ -5536,6 +5653,7 @@ impl AppState {
         let mut changed = false;
         let mut authenticated = false;
         let mut streaming = false;
+        let mut titled_panes: Vec<usize> = Vec::new();
         let save_history = self.settings.restore.agent_history;
         for project in &mut self.projects {
             for session in &mut project.sessions {
@@ -5627,7 +5745,8 @@ impl AppState {
                                 if let Some(log) = pane.chat.conversation.as_mut() {
                                     if !matches!(
                                         &event,
-                                        agent_bridge::AgentEvent::Done
+                                        agent_bridge::AgentEvent::Title(_)
+                                            | agent_bridge::AgentEvent::Done
                                             | agent_bridge::AgentEvent::Closed
                                     ) {
                                         log.append_event(&event);
@@ -5651,6 +5770,10 @@ impl AppState {
                                 }
                                 agent_bridge::AgentEvent::Error(message) if startup_error => {
                                     pane.chat.startup_error = Some(message);
+                                }
+                                agent_bridge::AgentEvent::Title(title) => {
+                                    pane.chat.set_agent_title(title);
+                                    titled_panes.push(pane.id);
                                 }
                                 other => push_chat_event(&mut pane.chat.messages, other),
                             }
@@ -5684,7 +5807,8 @@ impl AppState {
                                     if let Some(log) = chat.conversation.as_mut() {
                                         if !matches!(
                                             &event,
-                                            agent_bridge::AgentEvent::Done
+                                            agent_bridge::AgentEvent::Title(_)
+                                                | agent_bridge::AgentEvent::Done
                                                 | agent_bridge::AgentEvent::Closed
                                         ) {
                                             log.append_event(&event);
@@ -5710,6 +5834,10 @@ impl AppState {
                                     }
                                     agent_bridge::AgentEvent::Error(message) if startup_error => {
                                         chat.startup_error = Some(message);
+                                    }
+                                    agent_bridge::AgentEvent::Title(title) => {
+                                        chat.agent_title = Some(title);
+                                        titled_panes.push(pane.id);
                                     }
                                     other => push_chat_event(&mut chat.messages, other),
                                 }
@@ -5762,10 +5890,44 @@ impl AppState {
                 }
             }
         }
+        for pane_id in titled_panes {
+            self.sync_session_title(pane_id, cx);
+        }
         if changed {
             cx.notify();
         }
         streaming
+    }
+
+    /// Mirror a pane's conversation name onto its session, so the sidebar names
+    /// the agent by what it is working on. Panes without a conversation title
+    /// (plain shells) keep the OSC-derived title.
+    fn sync_session_title(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&pane_id) else {
+            return;
+        };
+        let Some(session) = self
+            .projects
+            .get_mut(p_idx)
+            .and_then(|project| project.sessions.get_mut(s_idx))
+        else {
+            return;
+        };
+        let Some(title) = session
+            .panes
+            .iter()
+            .find(|pane| pane.id == pane_id)
+            .and_then(|pane| pane.chat.conversation_title())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if session.title.as_str() == title {
+            return;
+        }
+        session.title = SharedString::from(title);
+        session.display_title = truncate_title(&session.title);
+        self.mark_dirty(cx);
     }
 
     fn submit_agent_prompt(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -5802,6 +5964,14 @@ impl AppState {
         let trimmed = prompt.trim();
         if trimmed.is_empty() || pane.chat.visible_running() {
             return;
+        }
+        // Label the conversation from its first real prompt so the sidebar shows
+        // what this session is about instead of the shell's OSC title. The
+        // status poll picks it up on its next tick.
+        if pane.chat.conversation_title().is_none()
+            && let Some(title) = agent_title_from_prompt(trimmed)
+        {
+            pane.chat.set_prompt_title(title);
         }
         if trimmed == "/fast" {
             input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -5873,21 +6043,7 @@ impl AppState {
                 chat.conversation = Some(conversations::Log::open(&pane_uid, &model_key));
             }
             if chat.bridge.is_none() {
-                let bridge = match model.backend {
-                    agent_auth::ModelBackend::Rpi => {
-                        let selector = format!("{}/{}", model.provider, model.id);
-                        agent_bridge::AgentBridge::spawn_resumed(
-                            &cwd,
-                            chat.rpi_session_id.as_deref(),
-                            Some(&selector),
-                        )
-                        .or_else(|_| agent_bridge::AgentBridge::spawn_model(&cwd, Some(&selector)))
-                        .map(ModelBridge::Rpi)
-                    }
-                    agent_auth::ModelBackend::Omp => {
-                        omp_bridge::OmpBridge::spawn(&cwd, &model.id).map(ModelBridge::Omp)
-                    }
-                };
+                let bridge = spawn_model_bridge(&model, &cwd, chat.rpi_session_id.as_deref());
                 match bridge {
                     Ok(mut bridge) => {
                         if !fast {
@@ -13218,6 +13374,108 @@ mod resize_tests {
     }
 
     #[test]
+    fn agent_title_from_prompt_names_the_conversation() {
+        assert_eq!(
+            agent_title_from_prompt("  Refactor   the auth module\nand add tests"),
+            Some("Refactor the auth module".to_string())
+        );
+        // Slash commands are not conversation content.
+        assert_eq!(agent_title_from_prompt("/model"), None);
+        assert_eq!(agent_title_from_prompt("   \n\t "), None);
+
+        let long = "a".repeat(200);
+        let title = agent_title_from_prompt(&long).unwrap();
+        assert!(title.ends_with('…'));
+        assert_eq!(title.chars().count(), 65);
+    }
+
+    #[test]
+    fn agent_title_labels_the_sidebar_session() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            s.pane_mut(pane_id)
+                .unwrap()
+                .chat
+                .set_prompt_title("Refactor the auth module".into());
+            let foregrounds: HashMap<u32, Arc<[String]>> = HashMap::new();
+            s.poll_sessions_status_with(&foregrounds, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            let session = &s.projects[0].sessions[0];
+            assert_eq!(session.title.as_str(), "Refactor the auth module");
+            assert_eq!(session.display_title.as_str(), "Refactor the auth module");
+        });
+    }
+
+    #[test]
+    fn agent_reported_title_wins_over_the_prompt_title() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            let chat = &mut s.pane_mut(pane_id).unwrap().chat;
+            chat.set_prompt_title("Refactor the auth module".into());
+            chat.set_agent_title("🔐 AUTH: Add token refresh".into());
+            let foregrounds: HashMap<u32, Arc<[String]>> = HashMap::new();
+            s.poll_sessions_status_with(&foregrounds, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            assert_eq!(
+                s.projects[0].sessions[0].title.as_str(),
+                "🔐 AUTH: Add token refresh"
+            );
+        });
+    }
+
+    #[test]
+    fn titles_are_tracked_per_model_conversation() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        let deepseek = agent_auth::AgentModel {
+            provider: "commandcode".into(),
+            id: "deepseek/deepseek-v4-flash".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        let grok = agent_auth::AgentModel {
+            provider: "xai-oauth".into(),
+            id: "grok-4.7".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            let chat = &mut s.pane_mut(pane_id).unwrap().chat;
+            chat.selected_model = Some(deepseek.clone());
+            chat.set_agent_title("DeepSeek conversation".into());
+            chat.selected_model = Some(grok.clone());
+            chat.set_prompt_title("Grok conversation".into());
+            chat.selected_model = Some(deepseek.clone());
+            assert_eq!(chat.conversation_title(), Some("DeepSeek conversation"));
+            chat.selected_model = Some(grok);
+            assert_eq!(chat.conversation_title(), Some("Grok conversation"));
+        });
+    }
+
+    #[test]
+    fn plain_shell_sessions_keep_their_osc_title() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        cx.update_window_entity(&state, |s, _, cx| {
+            s.projects[0].sessions[0].panes[0].title = "~/project - fish".into();
+            s.projects[0].sessions[0].panes[0].display_title = "~/project - fish".into();
+            let foregrounds: HashMap<u32, Arc<[String]>> = HashMap::new();
+            s.poll_sessions_status_with(&foregrounds, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            assert_eq!(s.projects[0].sessions[0].title.as_str(), "~/project - fish");
+        });
+    }
+
+    #[test]
     fn agent_default_screen_shows_for_an_empty_chat() {
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
@@ -13242,6 +13500,223 @@ mod resize_tests {
             assert_eq!(pane.chat.selected_model.as_ref(), Some(&model));
             assert!(pane.chat.visible_messages().is_empty());
         });
+    }
+
+    #[test]
+    fn saving_a_workspace_records_each_panes_own_model() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let deepseek = agent_auth::AgentModel {
+            provider: "commandcode".into(),
+            id: "deepseek/deepseek-v4-flash".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        let grok = agent_auth::AgentModel {
+            provider: "xai-oauth".into(),
+            id: "grok-4.7".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.split_pane(1, gpui::Axis::Horizontal, window, cx);
+            // Set the models directly so no agent process is spawned.
+            let panes = &mut s.projects[0].sessions[0].panes;
+            panes[0].chat.selected_model = Some(deepseek.clone());
+            panes[0].chat.model_explicit = true;
+            panes[1].chat.selected_model = Some(grok.clone());
+            panes[1].chat.model_explicit = true;
+            s.schedule_workspace_save(cx);
+        });
+        let saved = state.read_with(&cx, |s, cx| s.saved_workspace(cx));
+        let models: Vec<_> = saved.projects[0].sessions[0]
+            .panes
+            .iter()
+            .map(|pane| pane.chat.selected_model.clone())
+            .collect();
+        assert_eq!(models, vec![Some(deepseek), Some(grok)]);
+    }
+
+    #[test]
+    fn restored_panes_keep_their_own_model() {
+        // The reported bug: pick deepseek in pane A and grok in pane B, restart,
+        // and both came back pinned to the app default instead of their own.
+        let workspace = workspace_state::SavedWorkspace {
+            version: workspace_state::CURRENT_VERSION,
+            active_project: Some(std::env::current_dir().unwrap()),
+            projects: vec![workspace_state::SavedProject {
+                id: 1,
+                path: std::env::current_dir().unwrap(),
+                name: "kathamo".into(),
+                expanded: true,
+                active_session: 0,
+                sessions: vec![workspace_state::SavedSession {
+                    id: 2,
+                    uid: "s-1".into(),
+                    title: "agent".into(),
+                    display_title: "agent".into(),
+                    logo: String::new(),
+                    maximized_pane_id: None,
+                    focused_pane: Some(4),
+                    tree: workspace_state::SavedPaneNode::Split {
+                        id: 6,
+                        axis: workspace_state::SavedAxis::Horizontal,
+                        left: Box::new(workspace_state::SavedPaneNode::Leaf { pane: 4 }),
+                        right: Box::new(workspace_state::SavedPaneNode::Leaf { pane: 5 }),
+                    },
+                    panes: vec![
+                        workspace_state::SavedPane {
+                            id: 4,
+                            uid: "p-1".into(),
+                            title: "a".into(),
+                            display_title: "a".into(),
+                            chat_active: true,
+                            chat: workspace_state::SavedChat {
+                                selected_model: Some(agent_auth::AgentModel {
+                                    provider: "commandcode".into(),
+                                    id: "deepseek/deepseek-v4-flash".into(),
+                                    backend: agent_auth::ModelBackend::Omp,
+                                }),
+                                model_explicit: true,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                        workspace_state::SavedPane {
+                            id: 5,
+                            uid: "p-2".into(),
+                            title: "b".into(),
+                            display_title: "b".into(),
+                            chat_active: true,
+                            chat: workspace_state::SavedChat {
+                                selected_model: Some(agent_auth::AgentModel {
+                                    provider: "xai-oauth".into(),
+                                    id: "grok-4.7".into(),
+                                    backend: agent_auth::ModelBackend::Omp,
+                                }),
+                                model_explicit: true,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    ],
+                }],
+            }],
+        };
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let default = agent_auth::AgentModel {
+            provider: "google-antigravity".into(),
+            id: "gemini-3.8-flash".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        cx.update_window_entity(&state, |s, _, cx| {
+            s.default_agent_model = Some(default.clone());
+            s.startup_loaded = false;
+            s.apply_saved_workspace(
+                RestoreData {
+                    workspace: workspace.clone(),
+                    scrollbacks: HashMap::new(),
+                    transcripts: HashMap::new(),
+                },
+                cx,
+            );
+        });
+        state.read_with(&cx, |s, _| {
+            let models: Vec<_> = s.projects[0].sessions[0]
+                .panes
+                .iter()
+                .map(|pane| pane.chat.selected_model.clone())
+                .collect();
+            assert_eq!(
+                models[0].as_ref().map(agent_model_label),
+                Some("commandcode · deepseek/deepseek-v4-flash".to_string())
+            );
+            assert_eq!(
+                models[1].as_ref().map(agent_model_label),
+                Some("xai-oauth · grok-4.7".to_string())
+            );
+            assert!(
+                models.iter().all(|model| model.as_ref() != Some(&default)),
+                "restored panes must not be re-pinned to the app default"
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_automatic_pane_does_not_adopt_the_default_on_restore() {
+        let workspace = workspace_state::SavedWorkspace {
+            version: workspace_state::CURRENT_VERSION,
+            active_project: Some(std::env::current_dir().unwrap()),
+            projects: vec![workspace_state::SavedProject {
+                id: 1,
+                path: std::env::current_dir().unwrap(),
+                name: "kathamo".into(),
+                expanded: true,
+                active_session: 0,
+                sessions: vec![workspace_state::SavedSession {
+                    id: 2,
+                    uid: "s-1".into(),
+                    title: "agent".into(),
+                    display_title: "agent".into(),
+                    logo: String::new(),
+                    maximized_pane_id: None,
+                    focused_pane: Some(4),
+                    tree: workspace_state::SavedPaneNode::Leaf { pane: 4 },
+                    panes: vec![workspace_state::SavedPane {
+                        id: 4,
+                        uid: "p-1".into(),
+                        title: "a".into(),
+                        display_title: "a".into(),
+                        chat_active: true,
+                        chat: workspace_state::SavedChat {
+                            model_explicit: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }],
+                }],
+            }],
+        };
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        cx.update_window_entity(&state, |s, _, cx| {
+            s.default_agent_model = Some(agent_auth::AgentModel {
+                provider: "xai-oauth".into(),
+                id: "grok-4.7".into(),
+                backend: agent_auth::ModelBackend::Omp,
+            });
+            s.startup_loaded = false;
+            s.apply_saved_workspace(
+                RestoreData {
+                    workspace,
+                    scrollbacks: HashMap::new(),
+                    transcripts: HashMap::new(),
+                },
+                cx,
+            );
+        });
+        state.read_with(&cx, |s, _| {
+            let pane = &s.projects[0].sessions[0].panes[0];
+            assert_eq!(
+                pane.chat.selected_model, None,
+                "an explicit Automatic stays Automatic"
+            );
+            assert!(pane.chat.model_explicit);
+        });
+    }
+
+    #[test]
+    fn model_selector_always_names_the_provider() {
+        // `commandcode` model ids carry their own slash; prefixing the provider
+        // is what stops the backend from guessing a different one.
+        let model = agent_auth::AgentModel {
+            provider: "commandcode".into(),
+            id: "deepseek/deepseek-v4-flash".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        assert_eq!(
+            agent_model_selector(&model),
+            "commandcode/deepseek/deepseek-v4-flash"
+        );
     }
 
     #[test]

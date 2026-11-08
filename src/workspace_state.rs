@@ -84,6 +84,10 @@ pub struct SavedModelChat {
     pub model: Option<AgentModel>,
     pub rpi_session_id: Option<String>,
     pub conversation: String,
+    /// Conversation name reported by the agent for this model.
+    pub agent_title: Option<String>,
+    /// Conversation name derived from this model's first prompt.
+    pub prompt_title: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -92,6 +96,14 @@ pub struct SavedChat {
     #[serde(default = "default_true")]
     pub fast_mode: bool,
     pub selected_model: Option<AgentModel>,
+    /// True when `selected_model` is a deliberate choice, so `None` can mean
+    /// "Automatic (rpi)" instead of "never picked one".
+    #[serde(default)]
+    pub model_explicit: bool,
+    /// Conversation name reported by the agent itself, when it generates one.
+    pub agent_title: Option<String>,
+    /// Name derived from the first prompt, shown until the agent reports one.
+    pub prompt_title: Option<String>,
     pub rpi_session_id: Option<String>,
     pub models: Vec<SavedModelChat>,
 }
@@ -101,6 +113,9 @@ impl Default for SavedChat {
         Self {
             fast_mode: true,
             selected_model: None,
+            model_explicit: false,
+            agent_title: None,
+            prompt_title: None,
             rpi_session_id: None,
             models: Vec::new(),
         }
@@ -654,8 +669,27 @@ mod tests {
                             chat_active: true,
                             chat: SavedChat {
                                 fast_mode: false,
+                                selected_model: Some(AgentModel {
+                                    provider: "xai-oauth".into(),
+                                    id: "grok-4.7".into(),
+                                    backend: crate::agent_auth::ModelBackend::Omp,
+                                }),
+                                model_explicit: true,
+                                agent_title: None,
+                                prompt_title: None,
                                 rpi_session_id: Some("session-1".into()),
-                                ..Default::default()
+                                models: vec![SavedModelChat {
+                                    model: Some(AgentModel {
+                                        provider: "commandcode".into(),
+                                        id: "deepseek/deepseek-v4-flash".into(),
+                                        backend: crate::agent_auth::ModelBackend::Omp,
+                                    }),
+                                    rpi_session_id: None,
+                                    conversation: "omp_commandcode_deepseek_deepseek-v4-flash"
+                                        .into(),
+                                    agent_title: Some("🧠 DEEP: Wire the flash model".into()),
+                                    prompt_title: None,
+                                }],
                             },
                             ..Default::default()
                         },
@@ -673,6 +707,53 @@ mod tests {
         let text = serde_json::to_string(&workspace).unwrap();
         let restored = load_from_text(&text);
         assert_eq!(restored, workspace);
+    }
+
+    #[test]
+    fn explicit_automatic_model_survives_a_round_trip() {
+        // `None` alone is ambiguous: never-picked vs deliberately "Automatic
+        // (rpi)". The flag is what distinguishes them after a restart.
+        let workspace = SavedWorkspace {
+            version: CURRENT_VERSION,
+            active_project: Some(PathBuf::from("/tmp/one")),
+            projects: vec![SavedProject {
+                id: 1,
+                path: PathBuf::from("/tmp/one"),
+                name: "one".into(),
+                expanded: true,
+                active_session: 0,
+                sessions: vec![SavedSession {
+                    id: 2,
+                    uid: "s-1".into(),
+                    title: "agent".into(),
+                    display_title: "agent".into(),
+                    logo: String::new(),
+                    maximized_pane_id: None,
+                    focused_pane: Some(4),
+                    tree: SavedPaneNode::Leaf { pane: 4 },
+                    panes: vec![SavedPane {
+                        id: 4,
+                        uid: "p-1".into(),
+                        title: "zsh".into(),
+                        display_title: "zsh".into(),
+                        chat_active: true,
+                        chat: SavedChat {
+                            model_explicit: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }],
+                }],
+            }],
+        };
+        let text = serde_json::to_string(&workspace).unwrap();
+        let restored = load_from_text(&text);
+        let chat = &restored.projects[0].sessions[0].panes[0].chat;
+        assert_eq!(chat.selected_model, None);
+        assert!(
+            chat.model_explicit,
+            "an explicit Automatic must stay explicit"
+        );
     }
 
     #[test]

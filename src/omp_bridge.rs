@@ -1,5 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -22,6 +22,16 @@ pub struct OmpBridge {
     next_id: u64,
     pending_prompt: Option<String>,
     closed: bool,
+    /// Where OMP persists this session, learned from `get_state`. OMP writes its
+    /// auto-generated conversation title into the first line of that file.
+    session_file: Option<PathBuf>,
+    title: Option<String>,
+    /// OMP only names a session when asked, so the first completed turn
+    /// triggers its title generator once.
+    title_requested: bool,
+    /// A title request is running as background work. A prompt that arrives
+    /// meanwhile cancels it rather than failing as "already processing".
+    title_in_flight: bool,
 }
 
 impl OmpBridge {
@@ -136,6 +146,8 @@ impl OmpBridge {
                 "type": "set_thinking_level", "id": "kathamo-thinking-level", "level": "low"
             }),
         );
+        // Learn where this session is stored so its generated title can be read.
+        let _ = write_command(&stdin, &json!({"type": "get_state", "id": "kathamo-state"}));
         Ok(Self {
             child,
             stdin,
@@ -143,12 +155,23 @@ impl OmpBridge {
             next_id: 0,
             pending_prompt: None,
             closed: false,
+            session_file: None,
+            title: None,
+            title_requested: false,
+            title_in_flight: false,
         })
     }
 
     pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
         if self.pending_prompt.is_some() {
             return Err("An OMP prompt is already running".into());
+        }
+        // A title request is background work, never worth blocking a prompt
+        // for. Cancel it and let the next completed turn ask again.
+        if self.title_in_flight {
+            self.title_in_flight = false;
+            self.title_requested = false;
+            let _ = self.send(json!({"type": "abort"}));
         }
         let id = self.send(json!({"type": "prompt", "message": prompt}))?;
         self.pending_prompt = Some(id);
@@ -172,6 +195,28 @@ impl OmpBridge {
         command["id"] = json!(id);
         write_command(&self.stdin, &command)?;
         Ok(id)
+    }
+
+    /// Read the session file header and publish the title if it is new. Used
+    /// when OMP has already named the session itself.
+    fn publish_session_title(&mut self, events: &mut Vec<AgentEvent>) {
+        if self.title.is_some() {
+            return;
+        }
+        if let Some(title) = self.read_session_title() {
+            self.title = Some(title.clone());
+            events.push(AgentEvent::Title(title));
+        }
+    }
+
+    /// OMP records the generated conversation title in the first line of its
+    /// session file as `{"type":"title","title":"..."}`. It is not part of the
+    /// RPC event stream, so the file is the only way to learn it.
+    fn read_session_title(&self) -> Option<String> {
+        let file = std::fs::File::open(self.session_file.as_ref()?).ok()?;
+        let mut first = String::new();
+        BufReader::new(file).read_line(&mut first).ok()?;
+        parse_title_line(&first)
     }
 
     pub fn poll(&mut self) -> Vec<AgentEvent> {
@@ -208,11 +253,49 @@ impl OmpBridge {
             .as_deref()
             .is_some_and(|id| record["id"].as_str() == Some(id));
         match record["type"].as_str().unwrap_or("") {
+            "response" if record["command"] == "get_state" => {
+                if let Some(path) = record["data"]["sessionFile"].as_str() {
+                    self.session_file = Some(PathBuf::from(path));
+                }
+            }
+            // OMP's canonical announcement of a session rename or generated
+            // title. This is the event the TUI itself listens to.
+            "session_info_update" => {
+                if let Some(title) = record["title"].as_str()
+                    && self.title.as_deref() != Some(title)
+                {
+                    self.title = Some(title.to_string());
+                    events.push(AgentEvent::Title(title.to_string()));
+                }
+                // The rename finished, so prompts are accepted again.
+                self.title_in_flight = false;
+            }
+            // A rename that produced no title (e.g. OMP declined a low-signal
+            // prompt). End the background request so prompts flow again.
+            "command_output" => {
+                self.title_in_flight = false;
+                if let Some(text) = record["text"].as_str()
+                    && let Some(title) = text.strip_prefix("Session renamed to ")
+                {
+                    let title = title.trim();
+                    let title = title.strip_suffix('.').unwrap_or(title).to_string();
+                    if !title.is_empty() && self.title.as_deref() != Some(title.as_str()) {
+                        self.title = Some(title.clone());
+                        events.push(AgentEvent::Title(title));
+                    }
+                }
+            }
             "response" if record["id"] == "kathamo-event-filter" => {}
             "response" if record["success"] == false => {
                 let command = record["command"].as_str().unwrap_or("command");
                 let detail = record["error"].as_str().unwrap_or("Unknown error");
-                events.push(AgentEvent::Error(format!("OMP {command}: {detail}")));
+                // A failed title request must not surface as an agent error or
+                // leave prompts permanently blocked.
+                if self.title_in_flight && is_busy_rejection(detail) {
+                    self.title_in_flight = false;
+                } else {
+                    events.push(AgentEvent::Error(format!("OMP {command}: {detail}")));
+                }
                 if matching_prompt && command == "prompt" {
                     self.pending_prompt = None;
                     events.push(AgentEvent::Done);
@@ -238,6 +321,16 @@ impl OmpBridge {
                     )));
                 }
                 self.pending_prompt = None;
+                // OMP only names a session when asked. Ask once, after the
+                // first completed turn, so the sidebar gets the agent's own
+                // title instead of a prompt excerpt.
+                if !self.title_requested {
+                    self.title_requested = true;
+                    self.title_in_flight = true;
+                    let _ = self.send(json!({"type": "prompt", "message": "/rename"}));
+                }
+                // The file header is the fallback when OMP already named it.
+                self.publish_session_title(events);
                 events.push(AgentEvent::Done);
             }
             "message_update" => {
@@ -340,6 +433,24 @@ impl Drop for OmpBridge {
     }
 }
 
+/// Parse the `{"type":"title","title":"..."}` header OMP writes as the first
+/// line of a session file. Returns `None` until OMP has generated a title.
+fn parse_title_line(line: &str) -> Option<String> {
+    let record: Value = serde_json::from_str(line.trim()).ok()?;
+    if record["type"] != "title" {
+        return None;
+    }
+    let title = record["title"].as_str()?.trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
+/// True when OMP rejected a prompt because background work (a title request)
+/// was still running. That is ours, not the user's, so it must not surface as
+/// an agent error.
+fn is_busy_rejection(detail: &str) -> bool {
+    detail.contains("already processing")
+}
+
 fn write_command(stdin: &Mutex<ChildStdin>, command: &Value) -> Result<(), String> {
     let mut input = stdin
         .lock()
@@ -350,4 +461,43 @@ fn write_command(stdin: &Mutex<ChildStdin>, command: &Value) -> Result<(), Strin
         .write_all(b"\n")
         .and_then(|_| input.flush())
         .map_err(|error| format!("Failed to send OMP command: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_title_is_read_from_the_header_line() {
+        assert_eq!(
+            parse_title_line(r#"{"type":"title","v":1,"title":"🔌 PROV: Add All OMP Providers"}"#),
+            Some("🔌 PROV: Add All OMP Providers".to_string())
+        );
+    }
+
+    #[test]
+    fn a_title_request_does_not_block_or_error_a_real_prompt() {
+        // OMP rejects a prompt while the rename is still running; Kathamo
+        // cancels it first, and any such rejection is never shown to the user.
+        assert!(is_busy_rejection(
+            "Agent is already processing. Use steer() or followUp() to queue messages, or wait for completion."
+        ));
+        assert!(!is_busy_rejection("No API key configured"));
+    }
+
+    #[test]
+    fn an_empty_or_missing_title_is_not_reported() {
+        // OMP writes a placeholder header before it has named the session.
+        assert_eq!(
+            parse_title_line(r#"{"type":"title","v":1,"title":""}"#),
+            None
+        );
+        assert_eq!(
+            parse_title_line(r#"{"type":"title","v":1,"title":"   "}"#),
+            None
+        );
+        // Anything other than the title header is not a title.
+        assert_eq!(parse_title_line(r#"{"type":"session","id":"abc"}"#), None);
+        assert_eq!(parse_title_line("not json"), None);
+    }
 }

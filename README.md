@@ -150,10 +150,15 @@ The dialog requires a Unix PTY; on other platforms use the provider's CLI login.
 
 Select **Models** in the agent input bar or enter `/model` to see the available
 rpi models and OMP Antigravity models. Select a row for the current pane, or
-choose **Set default** to use that provider and model in new panes and after
-restarting Kathamo. Existing panes keep their selection. **Reset default to rpi
-automatic model** clears the saved default. Each selected model has a separate
-conversation within the pane.
+choose **Set default** to use that provider and model in new panes. Each pane
+keeps the model shown in its input bar across restarts, so panes can run
+different models side by side. **Reset default to rpi automatic model** clears
+the saved default. Each selected model has a separate conversation within the
+pane, and each conversation names its sidebar entry. For OMP models Kathamo asks
+OMP's title generator once after the first completed turn, so the tab shows the
+agent's own name (e.g. `🔄 REFSH: Refactor auth for token refresh`); until that
+arrives, or if the backend does not generate titles, the first prompt supplies
+the name. Plain shell tabs keep their shell title.
 
 Google Antigravity additionally requires [oh-my-pi](https://github.com/can1357/oh-my-pi)
 (`omp`) on `PATH`. In `/auth`, select **google-antigravity** if it is not ready,

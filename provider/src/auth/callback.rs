@@ -119,11 +119,7 @@ impl CallbackServer {
 
         // Send a friendly styled HTML response
         let success = payload.code.is_some() && payload.error.is_none();
-        let html = if success {
-            SUCCESS_HTML
-        } else {
-            ERROR_HTML
-        };
+        let html = if success { SUCCESS_HTML } else { ERROR_HTML };
 
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

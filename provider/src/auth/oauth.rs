@@ -1,5 +1,5 @@
 use crate::auth::callback::CallbackServer;
-use crate::auth::pkce::{generate_pkce, generate_state, PkceChallenge};
+use crate::auth::pkce::{PkceChallenge, generate_pkce, generate_state};
 use crate::auth::storage::save_local_credential;
 use crate::types::{ProviderSpec, StoredCredential};
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,10 @@ pub fn build_authorization_url(
     query_params.push(format!("state={}", urlencoding_encode(state)));
 
     if let Some(pkce) = pkce {
-        query_params.push(format!("code_challenge={}", urlencoding_encode(&pkce.challenge)));
+        query_params.push(format!(
+            "code_challenge={}",
+            urlencoding_encode(&pkce.challenge)
+        ));
         query_params.push(format!("code_challenge_method={}", pkce.method));
     }
 
@@ -235,9 +238,13 @@ pub fn run_interactive_oauth(
         pkce.as_ref().map(|p| p.verifier.as_str()),
     )?;
 
-    let expires = tokens
-        .expires_in
-        .map(|s| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + s);
+    let expires = tokens.expires_in.map(|s| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + s
+    });
 
     let cred = StoredCredential::OAuth {
         access: tokens.access_token,
@@ -247,7 +254,12 @@ pub fn run_interactive_oauth(
         account_id: None,
         org_id: None,
         org_name: None,
-        authorized_at: Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()),
+        authorized_at: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        ),
     };
 
     let _ = save_local_credential(&spec.id, cred.clone());
@@ -257,15 +269,27 @@ pub fn run_interactive_oauth(
 fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        Command::new("open").arg(url).spawn().map(|_| ()).map_err(|e| e.to_string())
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
     #[cfg(target_os = "windows")]
     {
-        Command::new("cmd").args(["/c", "start", url]).spawn().map(|_| ()).map_err(|e| e.to_string())
+        Command::new("cmd")
+            .args(["/c", "start", url])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        Command::new("xdg-open").arg(url).spawn().map(|_| ()).map_err(|e| e.to_string())
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }
 

@@ -41,8 +41,8 @@ mod integrations;
 mod kathamo_compat;
 mod logos;
 mod omp_bridge;
-pub mod provider;
 mod paths;
+pub mod provider;
 mod settings;
 mod shell_history;
 #[path = "blocks/shell_integration.rs"]
@@ -453,14 +453,7 @@ fn is_agent_tool(name: &str) -> bool {
 fn is_shell_tool(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "shell"
-            | "bash"
-            | "run"
-            | "run_command"
-            | "exec"
-            | "execute"
-            | "terminal"
-            | "command"
+        "shell" | "bash" | "run" | "run_command" | "exec" | "execute" | "terminal" | "command"
     )
 }
 
@@ -507,7 +500,11 @@ struct ToolView {
 fn tool_view(name: &str, input: &str) -> ToolView {
     let parsed = serde_json::from_str::<serde_json::Value>(input.trim()).ok();
     let object = parsed.as_ref().and_then(|value| value.as_object());
-    let field = |key: &str| object.and_then(|map| map.get(key)).and_then(|value| value.as_str());
+    let field = |key: &str| {
+        object
+            .and_then(|map| map.get(key))
+            .and_then(|value| value.as_str())
+    };
     let clip = |text: &str, limit: usize| clip_tool_text(text, limit).0;
 
     let lower = name.to_ascii_lowercase();
@@ -796,12 +793,7 @@ fn tool_content_body(tool: &ChatTool) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn chat_tool_content(
-    pane_id: usize,
-    index: usize,
-    tool: &ChatTool,
-    tokens: ThemeTokens,
-) -> Div {
+fn chat_tool_content(pane_id: usize, index: usize, tool: &ChatTool, tokens: ThemeTokens) -> Div {
     let mut body = div()
         .w_full()
         .min_w_0()
@@ -916,19 +908,17 @@ fn chat_tool_header(
         );
     }
 
-    header
-        .child(div().flex_1())
-        .child(
-            svg()
-                .path(if expanded {
-                    "icons/chevron-down.svg"
-                } else {
-                    "icons/chevron-right.svg"
-                })
-                .size(px(12.0))
-                .flex_shrink_0()
-                .text_color(tokens.text_muted),
-        )
+    header.child(div().flex_1()).child(
+        svg()
+            .path(if expanded {
+                "icons/chevron-down.svg"
+            } else {
+                "icons/chevron-right.svg"
+            })
+            .size(px(12.0))
+            .flex_shrink_0()
+            .text_color(tokens.text_muted),
+    )
 }
 
 fn chat_tool_error_card(
@@ -941,7 +931,9 @@ fn chat_tool_error_card(
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let header = div()
-        .id(SharedString::from(format!("tool-error-row-{pane_id}-{index}")))
+        .id(SharedString::from(format!(
+            "tool-error-row-{pane_id}-{index}"
+        )))
         .w_full()
         .min_w_0()
         .flex()
@@ -1031,9 +1023,7 @@ fn chat_tool_card(
     let agent = is_agent_tool(&tool.name);
 
     if failed {
-        return chat_tool_error_card(
-            pane_id, index, &view, tool, expanded, tokens, on_toggle,
-        );
+        return chat_tool_error_card(pane_id, index, &view, tool, expanded, tokens, on_toggle);
     }
 
     let header = chat_tool_header(
@@ -1098,7 +1088,9 @@ fn chat_thinking_row(
     };
 
     let mut header = div()
-        .id(SharedString::from(format!("thinking-row-{pane_id}-{index}")))
+        .id(SharedString::from(format!(
+            "thinking-row-{pane_id}-{index}"
+        )))
         .w_full()
         .min_w_0()
         .h(px(28.0))
@@ -4575,7 +4567,10 @@ impl AppState {
     }
 
     fn focus_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pane_ref(pane_id).is_some_and(|p| p.chat.auth.is_some()) {
+        if self
+            .pane_ref(pane_id)
+            .is_some_and(|p| p.chat.auth.is_some())
+        {
             return;
         }
         self.active_view = ActiveView::Workspace;
@@ -5276,10 +5271,8 @@ impl AppState {
             .pane_cwd_path(pane)
             .unwrap_or_else(|| PathBuf::from("."));
         self.focused_pane_id = Some(pane_id);
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Enter API key or credential")
-        });
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Enter API key or credential"));
         let provider_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Other provider ID"));
         let filter = cx.new(|cx| {
@@ -8086,12 +8079,17 @@ impl AppState {
                         this.start_completion(pane_id, window, cx);
                     }
                 }))
-                .on_action(cx.listener(move |this, _: &gpui_component::input::Escape, window, cx| {
-                    if this.pane_ref(pane_id).is_some_and(|p| p.chat.auth.is_some()) {
-                        cx.stop_propagation();
-                        this.close_agent_auth(pane_id, window, cx);
-                    }
-                }))
+                .on_action(cx.listener(
+                    move |this, _: &gpui_component::input::Escape, window, cx| {
+                        if this
+                            .pane_ref(pane_id)
+                            .is_some_and(|p| p.chat.auth.is_some())
+                        {
+                            cx.stop_propagation();
+                            this.close_agent_auth(pane_id, window, cx);
+                        }
+                    },
+                ))
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                     this.handle_pane_input_key(pane_id, event, window, cx);
                 }))
@@ -8811,11 +8809,7 @@ impl AppState {
                             .px(px(10.0))
                             .py(px(3.5))
                             .rounded(px(5.0))
-                            .bg(if ready {
-                                chip_bg
-                            } else {
-                                btn_contrast_bg
-                            })
+                            .bg(if ready { chip_bg } else { btn_contrast_bg })
                             .border_1()
                             .border_color(if ready {
                                 modal_divider
@@ -8942,14 +8936,22 @@ impl AppState {
                             .items_center()
                             .gap(px(8.0))
                             .min_w_0()
-                            .child(div().size(px(14.0)).flex_shrink_0().flex().items_center().justify_center().when(is_selected, |slot| {
-                                slot.child(
-                                    svg()
-                                        .path("icons/status-check.svg")
-                                        .size(px(11.5))
-                                        .text_color(tokens.block_success),
-                                )
-                            }))
+                            .child(
+                                div()
+                                    .size(px(14.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(is_selected, |slot| {
+                                        slot.child(
+                                            svg()
+                                                .path("icons/status-check.svg")
+                                                .size(px(11.5))
+                                                .text_color(tokens.block_success),
+                                        )
+                                    }),
+                            )
                             .child(
                                 div()
                                     .font_family(MONO_FONT)
@@ -8977,39 +8979,41 @@ impl AppState {
                                 view.border_1()
                                     .border_color(modal_divider)
                                     .text_color(tokens.text_secondary)
-                                    .hover(move |view| view.text_color(tokens.text_primary).bg(chip_bg))
+                                    .hover(move |view| {
+                                        view.text_color(tokens.text_primary).bg(chip_bg)
+                                    })
                             })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.select_agent_model(
-                                         pane_id,
-                                         Some(default_model.clone()),
-                                         true,
-                                         window,
-                                         cx,
-                                     );
-                                 }),
-                             ),
-                     )
-                     .on_mouse_down(
-                         MouseButton::Left,
-                         cx.listener(move |this, _, window, cx| {
-                             cx.stop_propagation();
-                             this.select_agent_model(
-                                 pane_id,
-                                 Some(selected_model.clone()),
-                                 false,
-                                 window,
-                                 cx,
-                             );
-                         }),
-                     )
-                     .into_any_element(),
-             );
-         }
-         deferred(
+                                        pane_id,
+                                        Some(default_model.clone()),
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.select_agent_model(
+                                pane_id,
+                                Some(selected_model.clone()),
+                                false,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        deferred(
              div().id(("auth-layer", pane_id)).absolute().size_full().top_0().left_0()
                  .debug_selector(|| "agent-auth-layer".into())
                  .occlude()
@@ -10060,11 +10064,7 @@ impl AppState {
                     .child(prefix),
             );
         }
-        label_element = label_element.child(
-            div()
-                .text_color(tokens.text_primary)
-                .child(label),
-        );
+        label_element = label_element.child(div().text_color(tokens.text_primary).child(label));
         header = header.child(label_element);
 
         if running {
@@ -10494,7 +10494,10 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    if this.pane_ref(pane_id).is_some_and(|p| p.chat.auth.is_some()) {
+                    if this
+                        .pane_ref(pane_id)
+                        .is_some_and(|p| p.chat.auth.is_some())
+                    {
                         return;
                     }
                     this.focus_pane(pane_id, window, cx);
@@ -15311,10 +15314,7 @@ mod kathamo_bottom_input_tests {
             "completed reasoning starts folded"
         );
         let row = cx.debug_bounds("thinking-row-0").expect("thinking row");
-        cx.simulate_click(
-            row.origin + point(px(20.0), px(10.0)),
-            Modifiers::default(),
-        );
+        cx.simulate_click(row.origin + point(px(20.0), px(10.0)), Modifiers::default());
         cx.draw_frame().expect("draw expanded reasoning");
         let body = cx
             .debug_bounds("thinking-body-0")
@@ -15578,7 +15578,13 @@ mod kathamo_bottom_input_tests {
             let pane = s.pane_ref(id).unwrap();
             let auth = pane.chat.auth.as_ref().unwrap();
             let auth_v = auth.input.read(cx).value().to_string();
-            let bottom_v = pane.input_state.as_ref().unwrap().read(cx).value().to_string();
+            let bottom_v = pane
+                .input_state
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .value()
+                .to_string();
             (auth_v, bottom_v)
         });
         assert_eq!(auth_val, "my-secret-key-123");
@@ -15605,7 +15611,9 @@ mod kathamo_bottom_input_tests {
         let is_now_ready = state.read_with(&cx, |s, _| {
             let pane = s.pane_ref(id).unwrap();
             let auth = pane.chat.auth.as_ref().unwrap();
-            auth.providers.iter().any(|p| p.id == "commandcode" && p.ready)
+            auth.providers
+                .iter()
+                .any(|p| p.id == "commandcode" && p.ready)
         });
         assert!(!is_now_ready, "commandcode must be disconnected");
     }
@@ -15882,7 +15890,6 @@ mod kathamo_bottom_input_tests {
             assert!(s.pane_ref(id).unwrap().chat.auth.is_none());
         });
     }
-
 
     #[test]
     fn kathamo_bottom_input_history_and_execution() {

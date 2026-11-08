@@ -1,6 +1,6 @@
 use provider::{
-    all_models, all_providers, api_key_providers, check_all_auth, check_auth, get_provider,
-    oauth_providers, search_models, summary, AuthType,
+    AuthType, all_models, all_providers, api_key_providers, check_all_auth, check_auth,
+    get_provider, oauth_providers, search_models, summary,
 };
 
 #[test]
@@ -16,7 +16,11 @@ fn test_all_103_providers_presence_and_auth_integrity() {
     assert_eq!(sum.total_providers, 103);
     assert_eq!(sum.oauth_providers, oauth_providers().len());
     assert_eq!(sum.api_key_providers, api_key_providers().len());
-    assert!(sum.total_models > 5000, "Catalog should have 5000+ models across providers, found: {}", sum.total_models);
+    assert!(
+        sum.total_models > 5000,
+        "Catalog should have 5000+ models across providers, found: {}",
+        sum.total_models
+    );
 
     for p in providers {
         assert!(!p.id.is_empty(), "Provider ID must not be empty");
@@ -24,21 +28,50 @@ fn test_all_103_providers_presence_and_auth_integrity() {
 
         match p.auth_type() {
             AuthType::OAuthCode => {
-                let login = p.login.as_ref().expect("OAuthCode provider must have login config");
-                assert!(login.client_id.is_some() || p.id == "openrouter" || p.id == "devin", "Provider {} must have client_id", p.id);
-                assert!(login.authorize_url.is_some(), "Provider {} must have authorize_url", p.id);
-                assert!(login.token_url.is_some(), "Provider {} must have token_url", p.id);
+                let login = p
+                    .login
+                    .as_ref()
+                    .expect("OAuthCode provider must have login config");
+                assert!(
+                    login.client_id.is_some() || p.id == "openrouter" || p.id == "devin",
+                    "Provider {} must have client_id",
+                    p.id
+                );
+                assert!(
+                    login.authorize_url.is_some(),
+                    "Provider {} must have authorize_url",
+                    p.id
+                );
+                assert!(
+                    login.token_url.is_some(),
+                    "Provider {} must have token_url",
+                    p.id
+                );
             }
             AuthType::DeviceCode => {
-                let login = p.login.as_ref().expect("DeviceCode provider must have login config");
-                assert!(login.client_id.is_some(), "Provider {} must have client_id", p.id);
+                let login = p
+                    .login
+                    .as_ref()
+                    .expect("DeviceCode provider must have login config");
+                assert!(
+                    login.client_id.is_some(),
+                    "Provider {} must have client_id",
+                    p.id
+                );
             }
             AuthType::ApiKey => {
                 assert!(p.supports_api_key(), "ApiKey provider must support API key");
             }
             AuthType::Custom => {
-                let login = p.login.as_ref().expect("Custom provider must have login config");
-                assert!(login.hook.is_some() || login.client_id.is_some(), "Provider {} must have hook or client_id", p.id);
+                let login = p
+                    .login
+                    .as_ref()
+                    .expect("Custom provider must have login config");
+                assert!(
+                    login.hook.is_some() || login.client_id.is_some(),
+                    "Provider {} must have hook or client_id",
+                    p.id
+                );
             }
             AuthType::None => {}
         }
@@ -51,7 +84,11 @@ fn test_critical_providers_configured_accurately() {
     let anthropic = get_provider("anthropic").expect("anthropic must exist");
     assert!(anthropic.name.contains("Anthropic"));
     assert!(anthropic.supports_api_key());
-    assert!(anthropic.env_vars.contains(&"ANTHROPIC_API_KEY".to_string()));
+    assert!(
+        anthropic
+            .env_vars
+            .contains(&"ANTHROPIC_API_KEY".to_string())
+    );
 
     // OpenAI & OpenAI Codex
     let openai = get_provider("openai").expect("openai must exist");
@@ -60,8 +97,14 @@ fn test_critical_providers_configured_accurately() {
     let codex = get_provider("openai-codex").expect("openai-codex must exist");
     assert!(codex.supports_oauth());
     let codex_login = codex.login.as_ref().unwrap();
-    assert_eq!(codex_login.client_id.as_deref(), Some("app_EMoamEEZ73f0CkXaXp7hrann"));
-    assert_eq!(codex_login.authorize_url.as_deref(), Some("https://auth.openai.com/oauth/authorize"));
+    assert_eq!(
+        codex_login.client_id.as_deref(),
+        Some("app_EMoamEEZ73f0CkXaXp7hrann")
+    );
+    assert_eq!(
+        codex_login.authorize_url.as_deref(),
+        Some("https://auth.openai.com/oauth/authorize")
+    );
 
     // Google Antigravity & Gemini CLI
     let antigravity = get_provider("google-antigravity").expect("google-antigravity must exist");

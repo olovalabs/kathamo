@@ -61,13 +61,14 @@ pub fn get_omp_token(provider_id: &str) -> Option<String> {
 
 fn credentials_file_path() -> Option<PathBuf> {
     if let Some(custom) = std::env::var_os("KATHAMO_DATA_DIR").filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(custom).join("config").join("credentials.json"));
+        return Some(
+            PathBuf::from(custom)
+                .join("config")
+                .join("credentials.json"),
+        );
     }
-    directories::BaseDirs::new().map(|dirs| {
-        dirs.config_dir()
-            .join("kathamo")
-            .join("credentials.json")
-    })
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.config_dir().join("kathamo").join("credentials.json"))
 }
 
 /// Load credentials map from Kathamo's credentials store.
@@ -217,7 +218,9 @@ pub fn disconnect_provider(provider_id: &str) -> Result<(), String> {
         if db_path.exists() {
             let _ = Command::new("sqlite3")
                 .arg(&db_path)
-                .arg(format!("DELETE FROM auth_credentials WHERE provider='{provider_id}';"))
+                .arg(format!(
+                    "DELETE FROM auth_credentials WHERE provider='{provider_id}';"
+                ))
                 .output();
         }
     }

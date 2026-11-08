@@ -76,8 +76,12 @@ pub fn initiate_device_flow(
         ));
     }
 
-    let response: DeviceAuthResponse = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Invalid device authorization response: {e}. Output: {}", String::from_utf8_lossy(&output.stdout)))?;
+    let response: DeviceAuthResponse = serde_json::from_slice(&output.stdout).map_err(|e| {
+        format!(
+            "Invalid device authorization response: {e}. Output: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })?;
 
     Ok(response)
 }

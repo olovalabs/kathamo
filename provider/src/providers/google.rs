@@ -13,11 +13,13 @@ pub fn spec() -> &'static ProviderSpec {
 }
 
 pub fn antigravity_spec() -> &'static ProviderSpec {
-    get_provider(GOOGLE_ANTIGRAVITY_PROVIDER_ID).expect("google-antigravity provider must exist in catalog")
+    get_provider(GOOGLE_ANTIGRAVITY_PROVIDER_ID)
+        .expect("google-antigravity provider must exist in catalog")
 }
 
 pub fn gemini_cli_spec() -> &'static ProviderSpec {
-    get_provider(GOOGLE_GEMINI_CLI_PROVIDER_ID).expect("google-gemini-cli provider must exist in catalog")
+    get_provider(GOOGLE_GEMINI_CLI_PROVIDER_ID)
+        .expect("google-gemini-cli provider must exist in catalog")
 }
 
 pub fn headers(api_key: &str) -> HashMap<String, String> {

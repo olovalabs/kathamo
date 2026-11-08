@@ -3,12 +3,13 @@ use crate::types::{ModelSpec, ProviderSpec};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-static PROVIDERS_BY_ID: LazyLock<HashMap<&'static str, &'static ProviderSpec>> = LazyLock::new(|| {
-    ALL_PROVIDERS
-        .iter()
-        .map(|spec| (spec.id.as_str(), spec))
-        .collect()
-});
+static PROVIDERS_BY_ID: LazyLock<HashMap<&'static str, &'static ProviderSpec>> =
+    LazyLock::new(|| {
+        ALL_PROVIDERS
+            .iter()
+            .map(|spec| (spec.id.as_str(), spec))
+            .collect()
+    });
 
 /// Get a slice of all 103 compiled provider specifications from oh-my-pi.
 pub fn all_providers() -> &'static [ProviderSpec] {

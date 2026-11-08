@@ -32,7 +32,6 @@ pub struct AgentModel {
     pub backend: ModelBackend,
 }
 
-
 /// Read the rpi model catalog. This performs blocking IO.
 fn rpi_models(cwd: &Path) -> Result<Vec<(String, String)>, String> {
     let output = Command::new("rpi")
@@ -255,7 +254,6 @@ pub fn providers(cwd: &Path) -> Result<Vec<Provider>, String> {
     Ok(result)
 }
 
-
 pub enum LoginEvent {
     Output(String),
     Finished(Result<(), String>),
@@ -290,11 +288,7 @@ impl Login {
             .take_writer()
             .map_err(|e| format!("Could not write to the authentication terminal: {e}"))?;
         let is_omp_provider = crate::provider::get_provider(provider).is_some();
-        let backend = if is_omp_provider {
-            "omp"
-        } else {
-            "rpi"
-        };
+        let backend = if is_omp_provider { "omp" } else { "rpi" };
         let mut command = CommandBuilder::new(backend);
         if backend == "omp" {
             command.args(["login", provider]);
@@ -493,8 +487,13 @@ theme:
 
     #[test]
     fn discovers_all_omp_providers() {
-        let list = providers(&std::path::PathBuf::from(".")).expect("providers discovery must succeed");
-        assert!(list.len() >= 103, "Must discover all 103 omp providers, found: {}", list.len());
+        let list =
+            providers(&std::path::PathBuf::from(".")).expect("providers discovery must succeed");
+        assert!(
+            list.len() >= 103,
+            "Must discover all 103 omp providers, found: {}",
+            list.len()
+        );
         let ids: Vec<&str> = list.iter().map(|p| p.id.as_str()).collect();
         assert!(ids.contains(&"anthropic"));
         assert!(ids.contains(&"openai-codex"));
@@ -506,7 +505,12 @@ theme:
 
     #[test]
     fn discovers_all_omp_models() {
-        let models = available_models(&std::path::PathBuf::from(".")).expect("models discovery must succeed");
-        assert!(models.len() > 1000, "Must discover thousands of models, found: {}", models.len());
+        let models = available_models(&std::path::PathBuf::from("."))
+            .expect("models discovery must succeed");
+        assert!(
+            models.len() > 1000,
+            "Must discover thousands of models, found: {}",
+            models.len()
+        );
     }
 }

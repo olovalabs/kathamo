@@ -9,8 +9,8 @@ pub mod types;
 pub use auth::storage::{disconnect_provider, restore_stored_credentials, save_api_key};
 pub use auth::{check_all_auth, check_auth};
 pub use catalog::{
-    all_models, all_providers, api_key_providers, default_model_for, get_provider,
-    oauth_providers, provider_ids, provider_models, search_models, summary, CatalogSummary,
+    CatalogSummary, all_models, all_providers, api_key_providers, default_model_for, get_provider,
+    oauth_providers, provider_ids, provider_models, search_models, summary,
 };
 pub use models::format_model_label;
 pub use types::{
@@ -33,7 +33,10 @@ mod tests {
         let sum = summary();
         assert_eq!(sum.total_providers, 103);
         assert!(sum.oauth_providers >= 20, "Should have 20+ OAuth providers");
-        assert!(sum.api_key_providers >= 60, "Should have 60+ API key providers");
+        assert!(
+            sum.api_key_providers >= 60,
+            "Should have 60+ API key providers"
+        );
         assert!(sum.total_models > 1000, "Should have thousands of models");
     }
 
@@ -95,7 +98,10 @@ mod tests {
     #[test]
     fn test_model_search() {
         let results = search_models("claude-sonnet");
-        assert!(!results.is_empty(), "Search should find Claude Sonnet models");
+        assert!(
+            !results.is_empty(),
+            "Search should find Claude Sonnet models"
+        );
 
         let gpt_results = search_models("gpt-5");
         assert!(!gpt_results.is_empty(), "Search should find GPT-5 models");

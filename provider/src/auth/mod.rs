@@ -48,9 +48,9 @@ pub fn check_auth_with_active(
     if let Some(cred) = storage::get_local_credential(&spec.id) {
         let source = match cred {
             crate::types::StoredCredential::OAuth { .. } => "Stored OAuth token".to_string(),
-            crate::types::StoredCredential::ApiKey { ref source, .. } => {
-                source.clone().unwrap_or_else(|| "Stored API key".to_string())
-            }
+            crate::types::StoredCredential::ApiKey { ref source, .. } => source
+                .clone()
+                .unwrap_or_else(|| "Stored API key".to_string()),
         };
         if let crate::types::StoredCredential::ApiKey { ref key, .. } = cred {
             for var in &spec.env_vars {

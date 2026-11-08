@@ -1,5 +1,5 @@
-use std::sync::LazyLock;
 use crate::types::ProviderSpec;
+use std::sync::LazyLock;
 
 pub static PROVIDERS_JSON: &str = include_str!("data/providers.json");
 

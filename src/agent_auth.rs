@@ -3,7 +3,6 @@
 //! rpi handles its own providers; Google Antigravity uses omp's OAuth store
 //! and login flow. Both interactive commands run in a controlling terminal.
 
-use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
@@ -33,12 +32,6 @@ pub struct AgentModel {
     pub backend: ModelBackend,
 }
 
-#[derive(Deserialize)]
-struct Status {
-    provider: String,
-    ready: bool,
-    source: Option<String>,
-}
 
 /// Read the rpi model catalog. This performs blocking IO.
 fn rpi_models(cwd: &Path) -> Result<Vec<(String, String)>, String> {
@@ -88,169 +81,153 @@ fn rpi_models(cwd: &Path) -> Result<Vec<(String, String)>, String> {
 /// Discover models from rpi and omp, keeping Antigravity on its omp backend.
 /// This performs blocking IO; a missing omp omits its catalog.
 pub fn available_models(cwd: &Path) -> Result<Vec<AgentModel>, String> {
-    let mut models: Vec<_> = rpi_models(cwd)?
-        .into_iter()
-        .filter(|(provider, _)| provider != "google-antigravity")
-        .map(|(provider, id)| AgentModel {
-            provider,
-            id,
-            backend: ModelBackend::Rpi,
-        })
-        .collect();
-    models.extend(
-        optional_antigravity_models(cwd)?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|id| AgentModel {
-                provider: "google-antigravity".into(),
-                id,
-                backend: ModelBackend::Omp,
-            }),
-    );
+    let mut models: Vec<AgentModel> = Vec::new();
+
+    // 1. Models from rpi (if rpi is installed and succeeds)
+    if let Ok(rpi_list) = rpi_models(cwd) {
+        for (provider, id) in rpi_list {
+            if crate::provider::get_provider(&provider).is_none() {
+                models.push(AgentModel {
+                    provider,
+                    id,
+                    backend: ModelBackend::Rpi,
+                });
+            }
+        }
+    }
+
+    // 2. All 103 providers from omp catalog
+    for (spec, model) in crate::provider::all_models() {
+        models.push(AgentModel {
+            provider: spec.id.clone(),
+            id: model.id.clone(),
+            backend: ModelBackend::Omp,
+        });
+    }
+
     models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
     models.dedup();
     Ok(models)
 }
 
+/// The model OMP would use by default, from `modelRoles.default` in its config.
+/// Only providers Kathamo can drive through OMP are returned.
+/// This performs blocking file IO.
+pub fn omp_default_model() -> Option<AgentModel> {
+    let selector = omp_default_selector()?;
+    let (provider, model) = selector.split_once('/')?;
+    let id = strip_thinking_suffix(model);
+    if id.is_empty() {
+        return None;
+    }
+    Some(AgentModel {
+        provider: provider.to_owned(),
+        id: id.to_owned(),
+        backend: ModelBackend::Omp,
+    })
+}
+
+fn omp_default_selector() -> Option<String> {
+    let path = omp_config_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    model_roles_default(&text)
+}
+
+fn omp_config_path() -> Option<std::path::PathBuf> {
+    if let Some(value) = std::env::var_os("PI_CODING_AGENT_DIR") {
+        let path = std::path::PathBuf::from(value);
+        if path.is_absolute() {
+            return Some(path.join("config.yml"));
+        }
+    }
+    let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
+    Some(home.join(".omp").join("agent").join("config.yml"))
+}
+
+/// Extract `modelRoles.default` from an OMP config.yml without pulling in a
+/// YAML parser for one scalar.
+fn model_roles_default(text: &str) -> Option<String> {
+    let mut in_roles = false;
+    let mut roles_indent = 0usize;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if !in_roles {
+            if trimmed.starts_with("modelRoles:") {
+                in_roles = true;
+                roles_indent = indent;
+            }
+            continue;
+        }
+        if indent <= roles_indent {
+            break;
+        }
+        let Some(value) = trimmed.strip_prefix("default:") else {
+            continue;
+        };
+        let value = value.split(" #").next().unwrap_or(value).trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        return Some(value.to_owned());
+    }
+    None
+}
+
+/// OMP selectors may carry a thinking level (`provider/model:high`).
+fn strip_thinking_suffix(model: &str) -> &str {
+    let Some((id, suffix)) = model.rsplit_once(':') else {
+        return model;
+    };
+    if matches!(
+        suffix,
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto"
+    ) {
+        id
+    } else {
+        model
+    }
+}
+
 /// Discover catalog and configured provider IDs, then ask rpi for their local
 /// authentication status. This performs blocking IO.
 pub fn providers(cwd: &Path) -> Result<Vec<Provider>, String> {
-    let mut ids: BTreeSet<String> = rpi_models(cwd)?
-        .into_iter()
-        .map(|(provider, _)| provider)
-        .collect();
-    ids.extend(configured_providers()?);
-    // This provider uses omp even if rpi also advertises the same identifier.
-    ids.remove("google-antigravity");
-    let mut result = Vec::with_capacity(ids.len() + 1);
-    for id in ids {
-        let output = Command::new("rpi")
-            .args(["auth", "check", "--provider", id.as_str(), "--json"])
-            .current_dir(cwd)
-            .output()
-            .map_err(|e| format!("Could not check authentication for {id}: {e}"))?;
-        // Exit status 1 is rpi's normal not-ready result, not an error.
-        if !matches!(output.status.code(), Some(0 | 1)) {
-            return Err(format!(
-                "Could not check authentication for {id}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        let status: Status = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("Could not read authentication status for {id}: {e}"))?;
-        if status.provider != id {
-            return Err(format!(
-                "rpi returned authentication status for the wrong provider: {id}"
-            ));
-        }
+    let mut result = Vec::new();
+    let all_specs = crate::provider::all_providers();
+    let active_omp = crate::provider::auth::storage::omp_authenticated_providers();
+
+    for spec in all_specs {
+        let status = crate::provider::auth::check_auth_with_active(&spec.id, &active_omp);
         result.push(Provider {
-            id: status.provider,
+            id: spec.id.clone(),
             ready: status.ready,
             source: status.source,
         });
     }
-    result.push(antigravity_provider(cwd));
+
+    // Also include any extra custom providers from rpi if present
+    if let Ok(rpi_ids) = rpi_models(cwd) {
+        for (id, _) in rpi_ids {
+            if !result.iter().any(|p| p.id == id) {
+                result.push(Provider {
+                    id,
+                    ready: true,
+                    source: Some("rpi".to_string()),
+                });
+            }
+        }
+    }
+
     result.sort_by(|a, b| a.id.cmp(&b.id));
+    result.dedup_by(|a, b| a.id == b.id);
     Ok(result)
 }
 
-fn antigravity_provider(cwd: &Path) -> Provider {
-    // --list asks omp's actual credential store (including a configured broker)
-    // without retrieving tokens. Account identities are never shown in the UI.
-    let output = Command::new("omp")
-        .args(["token", "google-antigravity", "--list"])
-        .current_dir(cwd)
-        .output();
-    let (ready, source) = match output {
-        Ok(output) if output.status.success() => (true, "omp OAuth"),
-        Ok(output)
-            if output.status.code() == Some(1)
-                && String::from_utf8_lossy(&output.stderr)
-                    .contains("No OAuth accounts found for provider") =>
-        {
-            (false, "omp OAuth")
-        }
-        Ok(_) => (false, "omp authentication status unavailable"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (false, "omp not installed"),
-        Err(_) => (false, "omp authentication status unavailable"),
-    };
-    Provider {
-        id: "google-antigravity".into(),
-        ready,
-        source: Some(source.into()),
-    }
-}
-
-fn optional_antigravity_models(cwd: &Path) -> Result<Option<Vec<String>>, String> {
-    #[derive(Deserialize)]
-    struct Catalog {
-        models: Vec<Model>,
-    }
-    #[derive(Deserialize)]
-    struct Model {
-        provider: String,
-        kind: String,
-        id: String,
-    }
-
-    let output = match Command::new("omp")
-        .args(["models", "google-antigravity", "--json"])
-        .current_dir(cwd)
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("Could not run omp to list Antigravity models: {e}")),
-    };
-    if !output.status.success() {
-        return Err(format!(
-            "Could not load Antigravity models from omp ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let catalog: Catalog = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Could not read Antigravity models from omp: {e}"))?;
-    Ok(Some(
-        catalog
-            .models
-            .into_iter()
-            .filter(|model| model.provider == "google-antigravity" && model.kind == "chat")
-            .map(|model| model.id)
-            .collect(),
-    ))
-}
-
-fn configured_providers() -> Result<Vec<String>, String> {
-    let dir = match std::env::var_os("RPI_CODING_AGENT_DIR") {
-        Some(value) => {
-            let path = std::path::PathBuf::from(value);
-            if !path.is_absolute() {
-                return Err("RPI_CODING_AGENT_DIR must be an absolute path".into());
-            }
-            path
-        }
-        None => directories::BaseDirs::new()
-            .ok_or("Could not locate the rpi configuration directory")?
-            .home_dir()
-            .join(".rpi")
-            .join("agent"),
-    };
-    let path = dir.join("models.json");
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("Could not read rpi models.json: {error}")),
-    };
-    let json: serde_json::Value =
-        jsonc_parser::parse_to_serde_value(&text, &jsonc_parser::ParseOptions::default())
-            .map_err(|_| "Could not parse rpi models.json".to_string())?;
-    Ok(json
-        .get("providers")
-        .and_then(serde_json::Value::as_object)
-        .map(|providers| providers.keys().cloned().collect())
-        .unwrap_or_default())
-}
 
 pub enum LoginEvent {
     Output(String),
@@ -285,14 +262,15 @@ impl Login {
             .master
             .take_writer()
             .map_err(|e| format!("Could not write to the authentication terminal: {e}"))?;
-        let backend = if provider == "google-antigravity" {
+        let is_omp_provider = crate::provider::get_provider(provider).is_some();
+        let backend = if is_omp_provider {
             "omp"
         } else {
             "rpi"
         };
         let mut command = CommandBuilder::new(backend);
         if backend == "omp" {
-            command.args(["login", "google-antigravity"]);
+            command.args(["login", provider]);
         } else {
             command.args(["auth", "login", "--provider", provider]);
         }
@@ -441,4 +419,67 @@ fn read_output(
         }
     }
     // A trailing partial match is deliberately discarded.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_the_omp_default_model_role() {
+        let config = "\
+symbolPreset: unicode
+modelRoles:
+  smol: google-antigravity/gemini-2.5-flash
+  default: \"google-antigravity/gemini-3.8-flash:high\"
+  plan: openai-codex/gpt-5.5
+theme:
+  dark: titanium
+";
+        assert_eq!(
+            model_roles_default(config).as_deref(),
+            Some("google-antigravity/gemini-3.8-flash:high")
+        );
+        assert_eq!(model_roles_default("theme:\n  dark: titanium\n"), None);
+        assert_eq!(
+            model_roles_default("modelRoles:\n  default: google-antigravity/x:high # note\n")
+                .as_deref(),
+            Some("google-antigravity/x:high")
+        );
+    }
+
+    #[test]
+    fn strips_only_known_thinking_suffixes() {
+        assert_eq!(
+            strip_thinking_suffix("gemini-3.8-flash:high"),
+            "gemini-3.8-flash"
+        );
+        assert_eq!(
+            strip_thinking_suffix("gemini-3.8-flash"),
+            "gemini-3.8-flash"
+        );
+        assert_eq!(
+            strip_thinking_suffix("provider/model:v2"),
+            "provider/model:v2"
+        );
+    }
+
+    #[test]
+    fn discovers_all_omp_providers() {
+        let list = providers(&std::path::PathBuf::from(".")).expect("providers discovery must succeed");
+        assert!(list.len() >= 103, "Must discover all 103 omp providers, found: {}", list.len());
+        let ids: Vec<&str> = list.iter().map(|p| p.id.as_str()).collect();
+        assert!(ids.contains(&"anthropic"));
+        assert!(ids.contains(&"openai-codex"));
+        assert!(ids.contains(&"google-antigravity"));
+        assert!(ids.contains(&"github-copilot"));
+        assert!(ids.contains(&"deepseek"));
+        assert!(ids.contains(&"xai-oauth"));
+    }
+
+    #[test]
+    fn discovers_all_omp_models() {
+        let models = available_models(&std::path::PathBuf::from(".")).expect("models discovery must succeed");
+        assert!(models.len() > 1000, "Must discover thousands of models, found: {}", models.len());
+    }
 }

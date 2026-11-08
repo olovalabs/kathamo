@@ -26,11 +26,15 @@ pub struct OmpBridge {
 
 impl OmpBridge {
     pub fn spawn(cwd: &Path, model: &str) -> Result<Self, String> {
-        let model = model.strip_prefix("google-antigravity/").unwrap_or(model);
+        let model = model.trim();
         if model.is_empty() {
-            return Err("No Google Antigravity model was selected".into());
+            return Err("No model was selected".into());
         }
-        let selector = format!("google-antigravity/{model}");
+        let selector = if model.contains('/') {
+            model.to_string()
+        } else {
+            format!("google-antigravity/{model}")
+        };
         let mut command = Command::new("omp");
         command
             .args(["--mode", "rpc", "--model", &selector])

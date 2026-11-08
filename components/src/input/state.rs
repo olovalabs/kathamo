@@ -1212,8 +1212,8 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.focus(window, cx);
         self.clear_inline_completion(cx);
-
         if let Some(ime_marked_range) = &self.ime_marked_range {
             if ime_marked_range.len() == 0 {
                 self.ime_marked_range = None;

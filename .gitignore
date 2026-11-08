@@ -1,5 +1,6 @@
 # Build and dependency artifacts
-/target
+target/
+**/target/
 
 # IDE and editor files
 .idea/

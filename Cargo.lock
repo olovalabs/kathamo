@@ -4498,6 +4498,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "portable-pty",
+ "provider",
  "regex",
  "rfd",
  "rust-embed",
@@ -6363,6 +6364,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "provider"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "directories",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

@@ -177,8 +177,6 @@ impl ChatMessage {
     }
 }
 
-const TOOL_TEXT_PREVIEW_LIMIT: usize = 600;
-
 fn fence_open(line: &str) -> Option<(u8, usize)> {
     let line = line.trim_end_matches(['\r', '\n']);
     let marker = *line.as_bytes().first()?;
@@ -358,6 +356,7 @@ fn chat_markdown(
     text: impl Into<SharedString>,
     base: Pixels,
     paragraph_gap: Rems,
+    color: Hsla,
     tokens: ThemeTokens,
     window: &mut Window,
     cx: &mut App,
@@ -432,12 +431,604 @@ fn chat_markdown(
         .selectable(true)
         .w_full()
         .text_size(base)
-        .text_color(tokens.text_primary)
+        .text_color(color)
 }
 
-/// One collapsed tool-call card, matching Wake's tool cluster:
-/// chevron + tool name + inline argument preview + state badge on the header,
-/// then up to 600 characters of Input/Output in monospace panels.
+/// Human-facing tool title, matching opencode's labels.
+fn title_case(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn is_agent_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "task" | "subagent" | "agent" | "delegate" | "spawn_agent" | "spawn_subagent"
+    )
+}
+
+fn is_shell_tool(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "shell"
+            | "bash"
+            | "run"
+            | "run_command"
+            | "exec"
+            | "execute"
+            | "terminal"
+            | "command"
+    )
+}
+
+fn tool_title(name: &str) -> String {
+    match name.to_ascii_lowercase().as_str() {
+        "read" | "read_file" => "Read".into(),
+        "list" | "ls" | "list_dir" => "List".into(),
+        "glob" => "Glob".into(),
+        "grep" | "search" | "rg" => "Grep".into(),
+        "webfetch" | "web_fetch" | "fetch" => "Webfetch".into(),
+        "websearch" | "web_search" | "search_web" => "Web Search".into(),
+        "shell" | "bash" | "run" | "run_command" | "exec" | "execute" | "terminal" | "command" => {
+            "Shell".into()
+        }
+        "edit" | "str_replace" | "str_replace_editor" | "apply_patch" => "Edit".into(),
+        "write" | "write_file" | "create_file" => "Write".into(),
+        "patch" => "Patch".into(),
+        "task" | "subagent" | "agent" | "delegate" | "spawn_agent" | "spawn_subagent" => {
+            "Agent".into()
+        }
+        "question" | "ask" | "questions" => "Questions".into(),
+        "skill" => "Skill".into(),
+        "todowrite" | "todo_write" | "todos" => "Todos".into(),
+        "browser" => "Browser".into(),
+        _ => title_case(name),
+    }
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+struct ToolView {
+    title: String,
+    subtitle: String,
+    args: Vec<String>,
+}
+
+/// The opencode-style header for a tool: title, subtitle and quarantined args.
+fn tool_view(name: &str, input: &str) -> ToolView {
+    let parsed = serde_json::from_str::<serde_json::Value>(input.trim()).ok();
+    let object = parsed.as_ref().and_then(|value| value.as_object());
+    let field = |key: &str| object.and_then(|map| map.get(key)).and_then(|value| value.as_str());
+    let clip = |text: &str, limit: usize| clip_tool_text(text, limit).0;
+
+    let lower = name.to_ascii_lowercase();
+    let mut title = tool_title(name);
+    let mut subtitle = String::new();
+    let mut args = Vec::new();
+
+    if is_agent_tool(name) {
+        if let Some(agent) = field("agent")
+            .or_else(|| field("subagent_type"))
+            .or_else(|| field("subagentType"))
+            .or_else(|| field("type"))
+        {
+            title = format!("{} Agent", title_case(agent));
+        }
+        subtitle = field("description")
+            .or_else(|| field("prompt"))
+            .map(|value| clip(first_line(value), 80))
+            .unwrap_or_default();
+    } else if is_shell_tool(name) {
+        if let Some(command) = field("command").or_else(|| field("cmd")) {
+            subtitle = clip(first_line(command), 120);
+        }
+    } else {
+        match lower.as_str() {
+            "read" | "read_file" => {
+                if let Some(path) = field("path") {
+                    subtitle = file_name(path).to_string();
+                }
+                if let Some(offset) = object.and_then(|map| map.get("offset")) {
+                    args.push(format!("offset={offset}"));
+                }
+                if let Some(limit) = object.and_then(|map| map.get("limit")) {
+                    args.push(format!("limit={limit}"));
+                }
+            }
+            "list" | "ls" | "list_dir" => {
+                subtitle = field("path").unwrap_or(".").to_string();
+            }
+            "glob" => {
+                subtitle = field("path").unwrap_or(".").to_string();
+                if let Some(pattern) = field("pattern") {
+                    args.push(format!("pattern={pattern}"));
+                }
+            }
+            "grep" | "search" | "rg" => {
+                subtitle = field("path").unwrap_or(".").to_string();
+                if let Some(pattern) = field("pattern") {
+                    args.push(format!("pattern={pattern}"));
+                }
+                if let Some(include) = field("include") {
+                    args.push(format!("include={include}"));
+                }
+            }
+            "webfetch" | "web_fetch" | "fetch" => {
+                subtitle = field("url").unwrap_or_default().to_string();
+            }
+            "websearch" | "web_search" | "search_web" => {
+                subtitle = field("query").unwrap_or_default().to_string();
+            }
+            "edit" | "str_replace" | "str_replace_editor" | "apply_patch" | "write"
+            | "write_file" | "create_file" | "patch" => {
+                if let Some(path) = field("path") {
+                    subtitle = file_name(path).to_string();
+                }
+            }
+            _ => {
+                subtitle = format_tool_summary(name, input);
+            }
+        }
+    }
+
+    ToolView {
+        title,
+        subtitle,
+        args,
+    }
+}
+
+/// Header text for a run of thinking and tool calls, mirroring opencode's
+/// collapsed "Used N Read, Grep" row. Returns `(prefix, title, thinking)`.
+fn tool_group_label(parts: &[(usize, &ChatMessage)], running: bool) -> (String, String, bool) {
+    let thoughts = parts
+        .iter()
+        .filter(|(_, message)| message.role == ChatRole::Thinking)
+        .count();
+    let mut titles: Vec<String> = Vec::new();
+    let mut tool_count = 0usize;
+    for (_, message) in parts {
+        if let Some(tool) = message.tool.as_ref() {
+            tool_count += 1;
+            let title = tool_title(&tool.name);
+            if !titles.contains(&title) {
+                titles.push(title);
+            }
+        }
+    }
+
+    if tool_count == 0 {
+        if running && thoughts > 0 {
+            return (String::new(), "Thinking".to_string(), true);
+        }
+        let count = thoughts.max(1);
+        return (
+            format!("Used {count} "),
+            format!("Thought{}", if count == 1 { "" } else { "s" }),
+            false,
+        );
+    }
+
+    let names = if titles.len() > 3 {
+        format!("{}, …", titles[..3].join(", "))
+    } else {
+        titles.join(", ")
+    };
+    (format!("Used {tool_count} "), names, false)
+}
+
+fn chat_copy_button(
+    id: SharedString,
+    text: String,
+    tip: SharedString,
+    tokens: ThemeTokens,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(5.0))
+        .cursor(CursorStyle::PointingHand)
+        .text_color(tokens.text_muted)
+        .hover(move |style| {
+            style
+                .bg(tokens.sidebar_item_hover)
+                .text_color(tokens.text_primary)
+        })
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        })
+        .on_click(move |_, _, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+        })
+        .child(
+            svg()
+                .path("icons/copy.svg")
+                .size(px(12.0))
+                .text_color(tokens.text_muted),
+        )
+}
+
+fn chat_console_section(
+    copy_id: SharedString,
+    text: &str,
+    command: bool,
+    tokens: ThemeTokens,
+) -> Div {
+    let tip: SharedString = if command {
+        "Copy command".into()
+    } else {
+        "Copy output".into()
+    };
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_start()
+        .gap(px(8.0))
+        .px(px(12.0))
+        .py(px(8.0))
+        .whitespace_normal()
+        .font_family(MONO_FONT)
+        .text_size(px(12.0))
+        .line_height(relative(1.6))
+        .text_color(if command {
+            tokens.text_primary
+        } else {
+            tokens.text_secondary
+        })
+        .child(div().flex_1().min_w_0().child(text.to_string()))
+        .child(chat_copy_button(copy_id, text.to_string(), tip, tokens))
+}
+
+fn chat_console_output(
+    pane_id: usize,
+    index: usize,
+    command: &str,
+    output: &str,
+    tokens: ThemeTokens,
+) -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(tokens.border_subtle)
+        .bg(tokens.window_bg)
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .when(!command.trim().is_empty(), |card| {
+            card.child(chat_console_section(
+                SharedString::from(format!("copy-tool-cmd-{pane_id}-{index}")),
+                command,
+                true,
+                tokens,
+            ))
+        })
+        .when(!output.trim().is_empty(), |card| {
+            card.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .border_t_1()
+                    .border_color(tokens.border_subtle)
+                    .child(chat_console_section(
+                        SharedString::from(format!("copy-tool-output-{pane_id}-{index}")),
+                        output,
+                        false,
+                        tokens,
+                    )),
+            )
+        })
+}
+
+fn chat_tool_output_block(text: &str, is_error: bool, tokens: ThemeTokens) -> Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(if is_error {
+            tokens.block_failure.opacity(0.35)
+        } else {
+            tokens.border_subtle
+        })
+        .bg(if is_error {
+            tokens.block_failure.opacity(0.06)
+        } else {
+            tokens.card_bg
+        })
+        .px(px(12.0))
+        .py(px(8.0))
+        .whitespace_normal()
+        .font_family(MONO_FONT)
+        .text_size(px(12.0))
+        .line_height(relative(1.6))
+        .text_color(if is_error {
+            tokens.block_failure
+        } else {
+            tokens.text_secondary
+        })
+        .child(text.to_string())
+}
+
+fn shell_command(tool: &ChatTool) -> String {
+    serde_json::from_str::<serde_json::Value>(&tool.input)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("command")
+                .or_else(|| value.get("cmd"))
+                .and_then(|command| command.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            if tool.input.trim_start().starts_with('{') {
+                String::new()
+            } else {
+                tool.input.trim().to_string()
+            }
+        })
+}
+
+fn tool_content_body(tool: &ChatTool) -> Option<String> {
+    let lower = tool.name.to_ascii_lowercase();
+    if !matches!(
+        lower.as_str(),
+        "write"
+            | "write_file"
+            | "create_file"
+            | "edit"
+            | "str_replace"
+            | "str_replace_editor"
+            | "patch"
+            | "apply_patch"
+    ) {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&tool.input).ok()?;
+    let object = value.as_object()?;
+    object
+        .get("content")
+        .and_then(|value| value.as_str())
+        .or_else(|| object.get("newString").and_then(|value| value.as_str()))
+        .or_else(|| object.get("new_string").and_then(|value| value.as_str()))
+        .map(str::to_owned)
+}
+
+fn chat_tool_content(
+    pane_id: usize,
+    index: usize,
+    tool: &ChatTool,
+    tokens: ThemeTokens,
+) -> Div {
+    let mut body = div()
+        .w_full()
+        .min_w_0()
+        .ml(px(12.0))
+        .pl(px(12.0))
+        .border_l_1()
+        .border_color(tokens.border_subtle)
+        .py(px(6.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0));
+
+    if is_shell_tool(&tool.name) {
+        let command = shell_command(tool);
+        body = body.child(chat_console_output(
+            pane_id,
+            index,
+            &command,
+            &tool.output,
+            tokens,
+        ));
+    } else if !tool.output.trim().is_empty() {
+        let is_error = tool.state == ToolState::Failed;
+        body = body.child(chat_tool_output_block(&tool.output, is_error, tokens));
+    } else if let Some(content) = tool_content_body(tool) {
+        body = body.child(chat_tool_output_block(&content, false, tokens));
+    } else if tool.state == ToolState::Running {
+        body = body.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(tokens.text_muted)
+                .child("Running…"),
+        );
+    }
+    body
+}
+
+fn chat_tool_header(
+    pane_id: usize,
+    index: usize,
+    view: &ToolView,
+    running: bool,
+    expanded: bool,
+    agent: bool,
+    tokens: ThemeTokens,
+    on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let mut header = div()
+        .id(SharedString::from(format!("tool-row-{pane_id}-{index}")))
+        .w_full()
+        .min_w_0()
+        .h(px(28.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .cursor(CursorStyle::PointingHand)
+        .on_mouse_down(MouseButton::Left, on_toggle);
+
+    if agent && running {
+        header = header.child(
+            gpui_component::Icon::new(gpui_component::IconName::LoaderCircle)
+                .size(px(14.0))
+                .text_color(tokens.text_muted)
+                .with_animation(
+                    SharedString::from(format!("agent-tool-spinner-{pane_id}-{index}")),
+                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                    |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                ),
+        );
+    }
+
+    let title = div()
+        .flex_shrink_0()
+        .text_size(px(13.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(tokens.text_primary)
+        .child(view.title.clone());
+    let title = if running && !agent {
+        title
+            .with_animation(
+                SharedString::from(format!("tool-title-pulse-{pane_id}-{index}")),
+                Animation::new(std::time::Duration::from_millis(1100)).repeat(),
+                |element, delta| {
+                    let pulse = (delta * std::f32::consts::PI).sin().abs();
+                    element.opacity(0.55 + 0.45 * pulse)
+                },
+            )
+            .into_any_element()
+    } else {
+        title.into_any_element()
+    };
+    header = header.child(title);
+
+    if !view.subtitle.is_empty() {
+        header = header.child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.0))
+                .text_color(tokens.text_muted)
+                .child(view.subtitle.clone()),
+        );
+    }
+    for arg in &view.args {
+        header = header.child(
+            div()
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(13.0))
+                .text_color(tokens.text_muted)
+                .child(arg.clone()),
+        );
+    }
+
+    header
+        .child(div().flex_1())
+        .child(
+            svg()
+                .path(if expanded {
+                    "icons/chevron-down.svg"
+                } else {
+                    "icons/chevron-right.svg"
+                })
+                .size(px(12.0))
+                .flex_shrink_0()
+                .text_color(tokens.text_muted),
+        )
+}
+
+fn chat_tool_error_card(
+    pane_id: usize,
+    index: usize,
+    view: &ToolView,
+    tool: &ChatTool,
+    expanded: bool,
+    tokens: ThemeTokens,
+    on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    let header = div()
+        .id(SharedString::from(format!("tool-error-row-{pane_id}-{index}")))
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(10.0))
+        .py(px(7.0))
+        .cursor(CursorStyle::PointingHand)
+        .on_mouse_down(MouseButton::Left, on_toggle)
+        .child(
+            gpui_component::Icon::new(gpui_component::IconName::TriangleAlert)
+                .size(px(14.0))
+                .text_color(tokens.block_failure),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(13.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(tokens.block_failure)
+                .child(view.title.clone()),
+        )
+        .when(!view.subtitle.is_empty(), |header| {
+            header.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .text_color(tokens.text_muted)
+                    .child(view.subtitle.clone()),
+            )
+        })
+        .child(div().flex_1())
+        .child(
+            svg()
+                .path(if expanded {
+                    "icons/chevron-down.svg"
+                } else {
+                    "icons/chevron-right.svg"
+                })
+                .size(px(12.0))
+                .flex_shrink_0()
+                .text_color(tokens.block_failure),
+        );
+
+    let mut card = div()
+        .w_full()
+        .min_w_0()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(tokens.block_failure.opacity(0.35))
+        .bg(tokens.block_failure.opacity(0.06))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .child(header);
+
+    if expanded {
+        card = card.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .px(px(10.0))
+                .pb(px(8.0))
+                .whitespace_normal()
+                .font_family(MONO_FONT)
+                .text_size(px(12.0))
+                .line_height(relative(1.6))
+                .text_color(tokens.block_failure)
+                .child(tool.output.clone()),
+        );
+    }
+    card
+}
+
 fn chat_tool_card(
     pane_id: usize,
     index: usize,
@@ -446,232 +1037,143 @@ fn chat_tool_card(
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let expanded = tool.expanded;
-    let summary = format_tool_summary(&tool.name, &tool.input);
+    let running = tool.state == ToolState::Running;
     let failed = tool.state == ToolState::Failed;
-    let mono = MONO_FONT;
+    let view = tool_view(&tool.name, &tool.input);
+    let agent = is_agent_tool(&tool.name);
 
-    let mut card = div()
-        .w_full()
-        .min_w_0()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(tokens.border_subtle)
-        .bg(tokens.card_hover)
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .id(SharedString::from(format!(
-                    "tool-card-header-{pane_id}-{index}"
-                )))
-                .w_full()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(12.0))
-                .py(px(8.0))
-                .cursor(CursorStyle::PointingHand)
-                .text_size(px(11.5))
-                .text_color(tokens.text_muted)
-                .hover(move |style| style.text_color(tokens.text_primary))
-                .on_mouse_down(MouseButton::Left, on_toggle)
-                .child(
-                    svg()
-                        .path(if expanded {
-                            "icons/chevron-down.svg"
-                        } else {
-                            "icons/chevron-right.svg"
-                        })
-                        .size(px(11.0))
-                        .flex_shrink_0()
-                        .text_color(tokens.text_muted),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(tokens.text_primary)
-                        .child(tool.name.clone()),
-                )
-                .when(!summary.is_empty(), |header| {
-                    header.child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .font_family(mono)
-                            .child(summary),
-                    )
-                })
-                .child(div().flex_1())
-                .when(failed, |header| {
-                    header.child(
-                        div()
-                            .flex_shrink_0()
-                            .px(px(7.0))
-                            .rounded(px(4.0))
-                            .text_size(px(11.0))
-                            .text_color(tokens.block_failure)
-                            .bg(tokens.block_failure.opacity(0.12))
-                            .child("Failed"),
-                    )
-                })
-                .when(tool.state == ToolState::Running, |header| {
-                    header.child(
-                        div()
-                            .flex_shrink_0()
-                            .px(px(7.0))
-                            .rounded(px(4.0))
-                            .text_size(px(11.0))
-                            .text_color(tokens.block_warning)
-                            .bg(tokens.block_warning.opacity(0.12))
-                            .child("Running…"),
-                    )
-                }),
+    if failed {
+        return chat_tool_error_card(
+            pane_id, index, &view, tool, expanded, tokens, on_toggle,
         );
-
-    if expanded {
-        let mut body = div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .border_t_1()
-            .border_color(tokens.border_subtle)
-            .px(px(12.0))
-            .py(px(10.0));
-
-        let display_input = serde_json::from_str::<serde_json::Value>(&tool.input)
-            .ok()
-            .and_then(|v| serde_json::to_string_pretty(&v).ok())
-            .unwrap_or_else(|| tool.input.clone());
-        if !display_input.trim().is_empty() {
-            body = body.child(chat_tool_section(
-                SharedString::from(format!("copy-tool-input-{pane_id}-{index}")),
-                "Input",
-                &display_input,
-                false,
-                tokens,
-            ));
-        }
-
-        if !tool.output.trim().is_empty() {
-            body = body.child(chat_tool_section(
-                SharedString::from(format!("copy-tool-{pane_id}-{index}")),
-                "Output",
-                &tool.output,
-                failed,
-                tokens,
-            ));
-        } else if tool.state == ToolState::Running {
-            body = body.child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(tokens.text_muted)
-                    .child("Running…"),
-            );
-        }
-
-        card = card.child(body);
     }
 
+    let header = chat_tool_header(
+        pane_id, index, &view, running, expanded, agent, tokens, on_toggle,
+    );
+
+    let mut card = div().w_full().min_w_0().flex().flex_col();
+    if agent {
+        card = card.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .rounded(px(8.0))
+                .bg(tokens.card_bg)
+                .px(px(10.0))
+                .py(px(6.0))
+                .child(header),
+        );
+    } else {
+        card = card.child(header);
+    }
+
+    if expanded {
+        card = card.child(chat_tool_content(pane_id, index, tool, tokens));
+    }
     card
 }
 
-fn chat_tool_section(
-    copy_id: SharedString,
-    label: &'static str,
-    body: &str,
-    is_error: bool,
+fn chat_thinking_row(
+    pane_id: usize,
+    index: usize,
+    message: &ChatMessage,
+    running: bool,
     tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+    on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let (shown, truncated) = clip_tool_text(body, TOOL_TEXT_PREVIEW_LIMIT);
-    let full = body.to_string();
-    let copy_tooltip: SharedString = format!("Copy full {}", label.to_lowercase()).into();
+    let expanded = message.expanded;
+    let heading = clip_tool_text(first_line(&message.text), 80).0;
+    let label = if running { "Thinking" } else { "Thought" };
 
-    div()
+    let title = div()
+        .flex_shrink_0()
+        .text_size(px(13.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(tokens.text_primary)
+        .child(label);
+    let title = if running {
+        title
+            .with_animation(
+                SharedString::from(format!("thinking-title-pulse-{pane_id}-{index}")),
+                Animation::new(std::time::Duration::from_millis(1100)).repeat(),
+                |element, delta| {
+                    let pulse = (delta * std::f32::consts::PI).sin().abs();
+                    element.opacity(0.55 + 0.45 * pulse)
+                },
+            )
+            .into_any_element()
+    } else {
+        title.into_any_element()
+    };
+
+    let mut header = div()
+        .id(SharedString::from(format!("thinking-row-{pane_id}-{index}")))
+        .w_full()
+        .min_w_0()
+        .h(px(28.0))
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .cursor(CursorStyle::PointingHand)
+        .on_mouse_down(MouseButton::Left, on_toggle)
+        .child(title);
+
+    if !expanded && !heading.is_empty() {
+        header = header.child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.0))
+                .text_color(tokens.text_muted)
+                .child(heading),
+        );
+    }
+
+    header = header.child(div().flex_1()).child(
+        svg()
+            .path(if expanded {
+                "icons/chevron-down.svg"
+            } else {
+                "icons/chevron-right.svg"
+            })
+            .size(px(12.0))
+            .flex_shrink_0()
+            .text_color(tokens.text_muted),
+    );
+
+    let mut row = div()
         .w_full()
         .min_w_0()
         .flex()
         .flex_col()
-        .gap(px(4.0))
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .text_size(px(11.0))
-                .text_color(if is_error {
-                    tokens.block_failure
-                } else {
-                    tokens.text_muted
-                })
-                .child(label)
-                .when(truncated, |header| {
-                    header.child(
-                        div()
-                            .text_color(tokens.text_muted)
-                            .child(format!("First {} characters", TOOL_TEXT_PREVIEW_LIMIT)),
-                    )
-                })
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .id(copy_id)
-                        .size(px(20.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(4.0))
-                        .cursor(CursorStyle::PointingHand)
-                        .text_color(tokens.text_muted)
-                        .hover(move |style| {
-                            style
-                                .bg(tokens.sidebar_item_hover)
-                                .text_color(tokens.text_primary)
-                        })
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(copy_tooltip.clone())
-                                .build(window, cx)
-                        })
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(full.clone()));
-                        })
-                        .child(
-                            svg()
-                                .path("icons/copy.svg")
-                                .size(px(12.0))
-                                .text_color(tokens.text_muted),
-                        ),
-                ),
-        )
-        .child(
+        .child(header);
+
+    if expanded {
+        row = row.child(
             div()
                 .w_full()
                 .min_w_0()
-                .px(px(10.0))
-                .py(px(7.0))
-                .rounded(px(5.0))
-                .bg(if is_error {
-                    tokens.block_failure.opacity(0.08)
-                } else {
-                    tokens.card_bg
-                })
-                .whitespace_normal()
-                .text_size(px(11.5))
-                .line_height(relative(1.6))
-                .font_family(MONO_FONT)
-                .text_color(if is_error {
-                    tokens.block_failure
-                } else {
-                    tokens.text_secondary
-                })
-                .child(shown),
-        )
+                .ml(px(12.0))
+                .pl(px(12.0))
+                .border_l_1()
+                .border_color(tokens.border_subtle)
+                .py(px(6.0))
+                .child(chat_markdown(
+                    SharedString::from(format!("thinking-body-{pane_id}-{index}")),
+                    message.text.clone(),
+                    px(12.5),
+                    rems(0.4),
+                    tokens.text_muted,
+                    tokens,
+                    window,
+                    cx,
+                )),
+        );
+    }
+    row
 }
 
 fn update_chat_tool(
@@ -873,6 +1375,7 @@ struct AuthModal {
     model_discovery: Option<std::sync::mpsc::Receiver<Result<Vec<agent_auth::AgentModel>, String>>>,
     model_error: Option<String>,
     provider_input: Entity<InputState>,
+    filter: Entity<InputState>,
     input: Entity<InputState>,
     login: Option<agent_auth::Login>,
     selected: Option<String>,
@@ -959,6 +1462,9 @@ struct PaneChat {
     models: HashMap<agent_auth::AgentModel, ModelChat>,
     fast_mode: bool,
     pub autoscroll: bool,
+    /// Opencode-style tool groups the reader has opened, keyed by the first
+    /// message index in the group.
+    pub expanded_tool_groups: HashSet<usize>,
     rpi_session_id: Option<String>,
     conversation: Option<conversations::Log>,
     startup_error: Option<String>,
@@ -981,6 +1487,7 @@ impl Default for PaneChat {
             models: HashMap::new(),
             fast_mode: true,
             autoscroll: true,
+            expanded_tool_groups: HashSet::new(),
             rpi_session_id: None,
             conversation: None,
             startup_error: None,
@@ -4535,6 +5042,20 @@ impl AppState {
         }
     }
 
+    fn toggle_chat_tool_group_expanded(
+        &mut self,
+        pane_id: usize,
+        start: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            if !pane.chat.expanded_tool_groups.remove(&start) {
+                pane.chat.expanded_tool_groups.insert(start);
+            }
+            cx.notify();
+        }
+    }
+
     fn warm_agent_bridge(&mut self, pane_id: usize) {
         let save_history = self.settings.restore.agent_history;
         let Some(pane) = self.pane_ref(pane_id) else {
@@ -4661,6 +5182,13 @@ impl AppState {
         });
         let provider_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Other provider ID"));
+        let filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(if page == AgentDialogPage::Models {
+                "Search models"
+            } else {
+                "Search providers"
+            })
+        });
         let focus = cx.focus_handle();
         if page == AgentDialogPage::Auth {
             provider_input.update(cx, |state, cx| state.focus(window, cx));
@@ -4677,6 +5205,7 @@ impl AppState {
             model_discovery: None,
             model_error: None,
             provider_input,
+            filter,
             input,
             login: None,
             selected: None,
@@ -4743,6 +5272,17 @@ impl AppState {
             auth.selected = None;
             auth.output.clear();
             auth.error = None;
+        }
+        if auth.page != page {
+            let placeholder = if page == AgentDialogPage::Models {
+                "Search models"
+            } else {
+                "Search providers"
+            };
+            auth.filter.update(cx, |state, cx| {
+                state.set_placeholder(placeholder, window, cx);
+                state.set_value("", window, cx);
+            });
         }
         auth.page = page;
         if page == AgentDialogPage::Models {
@@ -4889,6 +5429,10 @@ impl AppState {
             return;
         };
         if auth.page != AgentDialogPage::Auth {
+            return;
+        }
+        // Enter while searching filters the list; it must not submit a key.
+        if auth.filter.read(cx).focus_handle().is_focused(window) {
             return;
         }
 
@@ -7916,6 +8460,32 @@ impl AppState {
         )
     }
 
+    /// The pane whose provider/model dialog is open, if any.
+    fn open_agent_auth_pane(&self) -> Option<usize> {
+        self.projects
+            .iter()
+            .flat_map(|project| project.sessions.iter())
+            .flat_map(|session| session.panes.iter())
+            .find(|pane| pane.chat.auth.is_some())
+            .map(|pane| pane.id)
+    }
+
+    /// Window-level host for the provider/model dialog. Rendering it at the
+    /// root (instead of inside a pane) lets its backdrop cover the sidebar and
+    /// title bar, so nothing behind it receives clicks, hover or scroll.
+    fn render_agent_auth_layer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(pane_id) = self.open_agent_auth_pane() else {
+            return div().into_any_element();
+        };
+        let Some(auth) = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.chat.auth.as_ref())
+        else {
+            return div().into_any_element();
+        };
+        self.render_agent_auth(pane_id, auth, cx)
+    }
+
     fn render_agent_auth(
         &self,
         pane_id: usize,
@@ -7926,8 +8496,18 @@ impl AppState {
         let current_model = self
             .pane_ref(pane_id)
             .and_then(|pane| pane.chat.selected_model.clone());
+        let filter_query = auth.filter.read(cx).value().trim().to_lowercase();
 
-        let mut providers: Vec<&agent_auth::Provider> = auth.providers.iter().collect();
+        let mut providers: Vec<&agent_auth::Provider> = auth
+            .providers
+            .iter()
+            .filter(|provider| {
+                filter_query.is_empty()
+                    || provider.id.to_lowercase().contains(&filter_query)
+                    || crate::provider::get_provider(&provider.id)
+                        .is_some_and(|spec| spec.name.to_lowercase().contains(&filter_query))
+            })
+            .collect();
         providers.sort_by_key(|provider| (!provider.ready, provider.id.clone()));
         let provider_rows = providers
             .iter()
@@ -8045,6 +8625,7 @@ impl AppState {
                     )
             })
             .collect::<Vec<_>>();
+        let has_matching_providers = !provider_rows.is_empty();
         let connected_models: Vec<&agent_auth::AgentModel> = auth
             .models
             .iter()
@@ -8055,9 +8636,19 @@ impl AppState {
             })
             .collect();
         let has_connected_models = !connected_models.is_empty();
+        let matching_models: Vec<&agent_auth::AgentModel> = connected_models
+            .iter()
+            .copied()
+            .filter(|model| {
+                filter_query.is_empty()
+                    || model.id.to_lowercase().contains(&filter_query)
+                    || model.provider.to_lowercase().contains(&filter_query)
+            })
+            .collect();
+        let has_matching_models = !matching_models.is_empty();
         let mut model_rows: Vec<AnyElement> = Vec::new();
         let mut last_provider: Option<&str> = None;
-        for (index, model) in connected_models.iter().enumerate() {
+        for (index, model) in matching_models.iter().enumerate() {
             if last_provider != Some(model.provider.as_str()) {
                 last_provider = Some(model.provider.as_str());
                 model_rows.push(
@@ -8172,6 +8763,8 @@ impl AppState {
         }
         deferred(
             div().id(("auth-layer", pane_id)).absolute().size_full().top_0().left_0()
+                .debug_selector(|| "agent-auth-layer".into())
+                .occlude()
                 .flex().items_center().justify_center()
                 .bg(rgba(0x00000088))
                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
@@ -8277,6 +8870,17 @@ impl AppState {
                                         ),
                                 ),
                         )
+                        .child(
+                            div()
+                                .id(("auth-filter", pane_id))
+                                .debug_selector(|| "agent-dialog-filter".into())
+                                .child(
+                                    Input::new(&auth.filter)
+                                        .appearance(true)
+                                        .bordered(true)
+                                        .cleanable(true),
+                                ),
+                        )
                         .when(auth.page == AgentDialogPage::Auth, |view| {
                             view.child(
                                 div()
@@ -8301,6 +8905,19 @@ impl AppState {
                                     .flex_col()
                                     .gap(px(1.0))
                                     .children(provider_rows),
+                            )
+                            .when(
+                                !filter_query.is_empty()
+                                    && !has_matching_providers
+                                    && !auth.providers.is_empty(),
+                                |view| {
+                                    view.child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .text_color(tokens.text_muted)
+                                            .child("No matching providers."),
+                                    )
+                                },
                             )
                             .when(
                                 auth.discovery.is_none() && auth.providers.is_empty(),
@@ -8570,6 +9187,11 @@ impl AppState {
                                             .text_color(tokens.text_muted)
                                             .child(if auth.discovery.is_some() && !has_connected_models {
                                                 "Checking provider connections…"
+                                            } else if has_connected_models
+                                                && !has_matching_models
+                                                && !filter_query.is_empty()
+                                            {
+                                                "No matching models"
                                             } else if has_connected_models {
                                                 "Models from connected providers"
                                             } else {
@@ -8618,7 +9240,7 @@ impl AppState {
                                 )
                             })
                             .when(
-                                auth.model_discovery.is_none() && has_connected_models,
+                                auth.model_discovery.is_none() && has_matching_models,
                                 |view| {
                                     view.child(
                                         div()
@@ -8748,6 +9370,310 @@ impl AppState {
         ).priority(210).into_any_element()
     }
 
+    fn render_chat_message(
+        &self,
+        pane_id: usize,
+        conversation: &str,
+        index: usize,
+        message: &ChatMessage,
+        running: bool,
+        tokens: ThemeTokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let inner: AnyElement = match message.role {
+            ChatRole::User => div()
+                .w_full()
+                .flex()
+                .justify_end()
+                .child(
+                    div()
+                        .max_w(px(540.0))
+                        .min_w_0()
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .rounded(px(12.0))
+                        .bg(tokens.card_hover)
+                        .text_size(px(13.5))
+                        .line_height(relative(1.85))
+                        .child(chat_markdown(
+                            SharedString::from(format!(
+                                "agent-user-{pane_id}-{conversation}-{index}"
+                            )),
+                            message.text.clone(),
+                            px(13.5),
+                            rems(0.5),
+                            tokens.text_primary,
+                            tokens,
+                            window,
+                            cx,
+                        )),
+                )
+                .into_any_element(),
+            ChatRole::Assistant => {
+                let id =
+                    SharedString::from(format!("agent-markdown-{pane_id}-{conversation}-{index}"));
+                let mut body = div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .text_size(px(13.0))
+                    .line_height(relative(1.9))
+                    .text_color(tokens.text_primary);
+
+                if message.streaming {
+                    // Re-parse only settled blocks while text is arriving; the live tail
+                    // stays plain so every token does not re-shape the whole message.
+                    let (settled, tail) = split_streaming_markdown(&message.text);
+                    if !settled.trim().is_empty() {
+                        body = body.child(chat_markdown(
+                            id.clone(),
+                            settled.to_string(),
+                            px(13.0),
+                            rems(0.6),
+                            tokens.text_primary,
+                            tokens,
+                            window,
+                            cx,
+                        ));
+                    }
+                    if !tail.is_empty() {
+                        // The live block gets its own TextView: only this block is
+                        // re-parsed per token, while settled blocks stay cached.
+                        body = body.child(chat_markdown(
+                            SharedString::from(format!(
+                                "agent-markdown-{pane_id}-{conversation}-{index}-live"
+                            )),
+                            tail.to_string(),
+                            px(13.0),
+                            rems(0.6),
+                            tokens.text_primary,
+                            tokens,
+                            window,
+                            cx,
+                        ));
+                    }
+                } else {
+                    body = body.child(chat_markdown(
+                        id,
+                        message.text.clone(),
+                        px(13.0),
+                        rems(0.6),
+                        tokens.text_primary,
+                        tokens,
+                        window,
+                        cx,
+                    ));
+                }
+
+                body.into_any_element()
+            }
+            ChatRole::Thinking => {
+                let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_chat_tool_expanded(pane_id, index, cx);
+                });
+                chat_thinking_row(
+                    pane_id, index, message, running, tokens, window, cx, on_toggle,
+                )
+                .into_any_element()
+            }
+            ChatRole::Status => div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .max_w(px(520.0))
+                        .truncate()
+                        .px(px(10.0))
+                        .py(px(3.0))
+                        .rounded_full()
+                        .bg(tokens.card_hover)
+                        .text_size(px(11.0))
+                        .text_color(tokens.text_muted)
+                        .child(message.text.clone()),
+                )
+                .into_any_element(),
+            ChatRole::Tool => {
+                if let Some(tool) = &message.tool {
+                    let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_chat_tool_expanded(pane_id, index, cx);
+                    });
+                    chat_tool_card(pane_id, index, tool, tokens, on_toggle).into_any_element()
+                } else {
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(4.0))
+                        .text_size(px(12.0))
+                        .text_color(tokens.text_muted)
+                        .child(message.text.clone())
+                        .into_any_element()
+                }
+            }
+            ChatRole::Error => div()
+                .w_full()
+                .min_w_0()
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(8.0))
+                .bg(tokens.block_failure.opacity(0.08))
+                .border_1()
+                .border_color(tokens.block_failure.opacity(0.35))
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(tokens.block_failure)
+                        .child("Error"),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .whitespace_normal()
+                        .font_family(MONO_FONT)
+                        .text_size(px(11.5))
+                        .line_height(relative(1.6))
+                        .text_color(tokens.block_failure)
+                        .child(message.text.clone()),
+                )
+                .into_any_element(),
+        };
+
+        div().w_full().min_w_0().child(inner).into_any_element()
+    }
+
+    fn render_chat_tool_group(
+        &self,
+        pane_id: usize,
+        conversation: &str,
+        start: usize,
+        parts: &[(usize, &ChatMessage)],
+        open: bool,
+        running: bool,
+        tokens: ThemeTokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (prefix, label, thinking) = tool_group_label(parts, running);
+        let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            this.toggle_chat_tool_group_expanded(pane_id, start, cx);
+        });
+
+        let mut header = div()
+            .id(SharedString::from(format!("tool-group-{pane_id}-{start}")))
+            .w_full()
+            .min_w_0()
+            .h(px(28.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .cursor(CursorStyle::PointingHand)
+            .on_mouse_down(MouseButton::Left, on_toggle);
+
+        let title_element = div()
+            .text_color(tokens.text_primary)
+            .child(label);
+        let title_element = if running && thinking {
+            title_element
+                .with_animation(
+                    SharedString::from(format!("tool-group-pulse-{pane_id}-{start}")),
+                    Animation::new(std::time::Duration::from_millis(1100)).repeat(),
+                    |element, delta| {
+                        let pulse = (delta * std::f32::consts::PI).sin().abs();
+                        element.opacity(0.55 + 0.45 * pulse)
+                    },
+                )
+                .into_any_element()
+        } else {
+            title_element.into_any_element()
+        };
+
+        let mut label_element = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM);
+        if !prefix.is_empty() {
+            label_element = label_element.child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(tokens.text_secondary)
+                    .child(prefix),
+            );
+        }
+        label_element = label_element.child(title_element);
+        header = header.child(label_element);
+
+        if running {
+            header = header.child(
+                gpui_component::Icon::new(gpui_component::IconName::LoaderCircle)
+                    .size(px(13.0))
+                    .text_color(tokens.text_muted)
+                    .with_animation(
+                        SharedString::from(format!("tool-group-spinner-{pane_id}-{start}")),
+                        Animation::new(std::time::Duration::from_millis(900)).repeat(),
+                        |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                    ),
+            );
+        }
+
+        header = header.child(div().flex_1()).child(
+            svg()
+                .path(if open {
+                    "icons/chevron-down.svg"
+                } else {
+                    "icons/chevron-right.svg"
+                })
+                .size(px(12.0))
+                .flex_shrink_0()
+                .text_color(tokens.text_muted),
+        );
+
+        let mut group = div().w_full().min_w_0().flex().flex_col().child(header);
+        if open {
+            let mut children = div()
+                .w_full()
+                .min_w_0()
+                .ml(px(12.0))
+                .pl(px(12.0))
+                .border_l_1()
+                .border_color(tokens.border_subtle)
+                .py(px(4.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0));
+            for (index, part) in parts {
+                children = children.child(self.render_chat_message(
+                    pane_id,
+                    conversation,
+                    *index,
+                    part,
+                    running,
+                    tokens,
+                    window,
+                    cx,
+                ));
+            }
+            group = group.child(children);
+        }
+        group.into_any_element()
+    }
+
     fn render_agent_chat(
         &self,
         pane: &TerminalPane,
@@ -8766,253 +9692,47 @@ impl AppState {
             pane.chat.scroll.scroll_to_bottom();
         }
 
-        let messages = pane
-            .chat
-            .visible_messages()
-            .iter()
-            .enumerate()
-            .map(|(index, message)| {
-                let inner: AnyElement = match message.role {
-                    ChatRole::User => div()
-                        .w_full()
-                        .flex()
-                        .justify_end()
-                        .child(
-                            div()
-                                .max_w(px(540.0))
-                                .min_w_0()
-                                .px(px(14.0))
-                                .py(px(8.0))
-                                .rounded(px(12.0))
-                                .bg(tokens.card_hover)
-                                .text_size(px(13.5))
-                                .line_height(relative(1.85))
-                                .child(chat_markdown(
-                                    SharedString::from(format!(
-                                        "agent-user-{pane_id}-{conversation}-{index}"
-                                    )),
-                                    message.text.clone(),
-                                    px(13.5),
-                                    rems(0.5),
-                                    tokens,
-                                    window,
-                                    cx,
-                                )),
-                        )
-                        .into_any_element(),
-                    ChatRole::Assistant => {
-                        let id = SharedString::from(format!(
-                            "agent-markdown-{pane_id}-{conversation}-{index}"
-                        ));
-                        let mut body = div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .text_size(px(13.0))
-                            .line_height(relative(1.9))
-                            .text_color(tokens.text_primary);
-
-                        if message.streaming {
-                            // Re-parse only settled blocks while text is arriving; the live tail
-                            // stays plain so every token does not re-shape the whole message.
-                            let (settled, tail) = split_streaming_markdown(&message.text);
-                            if !settled.trim().is_empty() {
-                                body = body.child(chat_markdown(
-                                    id.clone(),
-                                    settled.to_string(),
-                                    px(13.0),
-                                    rems(0.6),
-                                    tokens,
-                                    window,
-                                    cx,
-                                ));
-                            }
-                            if !tail.is_empty() {
-                                // The live block gets its own TextView: only this block is
-                                // re-parsed per token, while settled blocks stay cached.
-                                body = body.child(chat_markdown(
-                                    SharedString::from(format!(
-                                        "agent-markdown-{pane_id}-{conversation}-{index}-live"
-                                    )),
-                                    tail.to_string(),
-                                    px(13.0),
-                                    rems(0.6),
-                                    tokens,
-                                    window,
-                                    cx,
-                                ));
-                            }
-                        } else {
-                            body = body.child(chat_markdown(
-                                id,
-                                message.text.clone(),
-                                px(13.0),
-                                rems(0.6),
-                                tokens,
-                                window,
-                                cx,
-                            ));
-                        }
-
-                        body.into_any_element()
-                    }
-                    ChatRole::Thinking => {
-                        let is_expanded = message.expanded;
-                        let summary =
-                            clip_tool_text(message.text.lines().next().unwrap_or("").trim(), 88).0;
-                        let mut panel = div()
-                            .w_full()
-                            .min_w_0()
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(tokens.border_subtle)
-                            .bg(tokens.card_hover)
-                            .overflow_hidden()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "thinking-header-{pane_id}-{index}"
-                                    )))
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .px(px(12.0))
-                                    .py(px(8.0))
-                                    .cursor(CursorStyle::PointingHand)
-                                    .text_size(px(11.5))
-                                    .text_color(tokens.text_muted)
-                                    .hover(move |style| style.text_color(tokens.text_primary))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
-                                            cx.stop_propagation();
-                                            this.toggle_chat_tool_expanded(pane_id, index, cx);
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path(if is_expanded {
-                                                "icons/chevron-down.svg"
-                                            } else {
-                                                "icons/chevron-right.svg"
-                                            })
-                                            .size(px(11.0))
-                                            .flex_shrink_0()
-                                            .text_color(tokens.text_muted),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(tokens.text_primary)
-                                            .child("Thinking"),
-                                    )
-                                    .when(!is_expanded && !summary.is_empty(), |header| {
-                                        header.child(
-                                            div()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .whitespace_nowrap()
-                                                .child(summary),
-                                        )
-                                    }),
-                            );
-                        if is_expanded {
-                            panel = panel.child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .pl(px(30.0))
-                                    .pr(px(12.0))
-                                    .pb(px(12.0))
-                                    .whitespace_normal()
-                                    .text_size(px(11.5))
-                                    .line_height(relative(1.7))
-                                    .text_color(tokens.text_muted)
-                                    .child(message.text.clone()),
-                            );
-                        }
-                        panel.into_any_element()
-                    }
-                    ChatRole::Status => div()
-                        .w_full()
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div()
-                                .max_w(px(520.0))
-                                .truncate()
-                                .px(px(10.0))
-                                .py(px(3.0))
-                                .rounded_full()
-                                .bg(tokens.card_hover)
-                                .text_size(px(11.0))
-                                .text_color(tokens.text_muted)
-                                .child(message.text.clone()),
-                        )
-                        .into_any_element(),
-                    ChatRole::Tool => {
-                        if let Some(tool) = &message.tool {
-                            let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_chat_tool_expanded(pane_id, index, cx);
-                            });
-                            chat_tool_card(pane_id, index, tool, tokens, on_toggle)
-                                .into_any_element()
-                        } else {
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .px(px(10.0))
-                                .py(px(6.0))
-                                .rounded(px(5.0))
-                                .text_size(px(11.0))
-                                .text_color(tokens.text_muted)
-                                .child(message.text.clone())
-                                .into_any_element()
-                        }
-                    }
-                    ChatRole::Error => div()
-                        .w_full()
-                        .min_w_0()
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .rounded(px(8.0))
-                        .bg(tokens.block_failure.opacity(0.08))
-                        .border_1()
-                        .border_color(tokens.block_failure.opacity(0.35))
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(tokens.block_failure)
-                                .child("Error"),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .whitespace_normal()
-                                .font_family(MONO_FONT)
-                                .text_size(px(11.5))
-                                .line_height(relative(1.6))
-                                .text_color(tokens.block_failure)
-                                .child(message.text.clone()),
-                        )
-                        .into_any_element(),
-                };
-
-                div().w_full().min_w_0().child(inner).into_any_element()
-            })
-            .collect::<Vec<_>>();
+        let visible = pane.chat.visible_messages();
+        let running = pane.chat.visible_running();
+        let mut messages: Vec<AnyElement> = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < visible.len() {
+            let message = &visible[cursor];
+            if matches!(message.role, ChatRole::Tool | ChatRole::Thinking) {
+                let start = cursor;
+                let mut parts: Vec<(usize, &ChatMessage)> = Vec::new();
+                while cursor < visible.len()
+                    && matches!(visible[cursor].role, ChatRole::Tool | ChatRole::Thinking)
+                {
+                    parts.push((cursor, &visible[cursor]));
+                    cursor += 1;
+                }
+                let open = pane.chat.expanded_tool_groups.contains(&start);
+                messages.push(self.render_chat_tool_group(
+                    pane_id,
+                    &conversation,
+                    start,
+                    &parts,
+                    open,
+                    running,
+                    tokens,
+                    window,
+                    cx,
+                ));
+                continue;
+            }
+            messages.push(self.render_chat_message(
+                pane_id,
+                &conversation,
+                cursor,
+                message,
+                running,
+                tokens,
+                window,
+                cx,
+            ));
+            cursor += 1;
+        }
         let default_screen: Option<AnyElement> = if pane.chat.visible_messages().is_empty() {
             let effective = pane.chat.selected_model.as_ref();
             let inherited =
@@ -9501,9 +10221,6 @@ impl AppState {
             .when(pane.should_show_bottom_input(cx), |this| {
                 this.child(self.render_kathamo_input_bar(pane, is_focused, cx))
             })
-            .when_some(pane.chat.auth.as_ref(), |this, auth| {
-                this.child(self.render_agent_auth(pane_id, auth, cx))
-            })
     }
 
     fn render_pane_node(
@@ -9607,6 +10324,12 @@ impl AppState {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
+
+        // The provider/model dialog is modal: no workspace shortcuts fire
+        // while it is open. Escape is handled by the capture listener.
+        if self.open_agent_auth_pane().is_some() {
+            return;
+        }
 
         if keystroke.key == "escape" && self.active_view == ActiveView::Settings {
             self.active_view = ActiveView::Workspace;
@@ -11653,17 +12376,12 @@ impl Render for AppState {
                     }
                     return;
                 }
-                if let Some(pane_id) = this.focused_pane_id {
-                    if this
-                        .pane_ref(pane_id)
-                        .is_some_and(|pane| pane.chat.auth.is_some())
-                    {
-                        if keystroke.key == "escape" {
-                            cx.stop_propagation();
-                            this.close_agent_auth(pane_id, window, cx);
-                        }
-                        return;
+                if let Some(pane_id) = this.open_agent_auth_pane() {
+                    if keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.close_agent_auth(pane_id, window, cx);
                     }
+                    return;
                 }
 
                 if this.active_view != ActiveView::Workspace
@@ -11738,6 +12456,9 @@ impl Render for AppState {
             })
             .when(self.image_viewer.is_some(), |this| {
                 this.child(self.render_image_viewer_layer(cx))
+            })
+            .when(self.open_agent_auth_pane().is_some(), |this| {
+                this.child(self.render_agent_auth_layer(cx))
             });
         diagnostics::render_end(diag_render);
         root
@@ -13513,7 +14234,7 @@ mod settings_and_theme_tests {
 #[cfg(test)]
 mod kathamo_bottom_input_tests {
     use super::*;
-    use gpui::{VisualContext, point};
+    use gpui::{Modifiers, VisualContext, point};
     use resize_tests::{DrawFrame, TestAppContext, open_app};
 
     #[test]
@@ -13665,6 +14386,64 @@ mod kathamo_bottom_input_tests {
         assert!(a.input == "input a" && a.output == "result a" && a.state == ToolState::Completed);
         assert!(b.input == "input b" && b.output == "result b" && b.state == ToolState::Failed);
         assert!(messages[2].role == ChatRole::Thinking);
+    }
+
+    #[test]
+    fn tool_view_matches_opencode_labels() {
+        let read = tool_view(
+            "read",
+            r#"{"path":"/tmp/project/src/main.rs","offset":10,"limit":20}"#,
+        );
+        assert_eq!(read.title, "Read");
+        assert_eq!(read.subtitle, "main.rs");
+        assert_eq!(read.args, vec!["offset=10", "limit=20"]);
+
+        let shell = tool_view("bash", r#"{"command":"cargo test\n--all"}"#);
+        assert_eq!(shell.title, "Shell");
+        assert_eq!(shell.subtitle, "cargo test");
+
+        let agent = tool_view("task", r#"{"agent":"build","description":"Fix the build"}"#);
+        assert_eq!(agent.title, "Build Agent");
+        assert_eq!(agent.subtitle, "Fix the build");
+
+        let grep = tool_view(
+            "grep",
+            r#"{"path":"src","pattern":"Tool","include":"*.rs"}"#,
+        );
+        assert_eq!(grep.title, "Grep");
+        assert_eq!(grep.subtitle, "src");
+        assert_eq!(grep.args, vec!["pattern=Tool", "include=*.rs"]);
+    }
+
+    #[test]
+    fn tool_group_label_uses_opencode_wording() {
+        use agent_bridge::AgentEvent;
+        let mut messages = Vec::new();
+        push_chat_event(&mut messages, AgentEvent::Thinking("Plan".into()));
+        for (id, name) in [("a", "read"), ("b", "grep")] {
+            push_chat_event(
+                &mut messages,
+                AgentEvent::ToolStart {
+                    id: Some(id.into()),
+                    name: name.into(),
+                    input: "{}".into(),
+                },
+            );
+        }
+        let parts: Vec<(usize, &ChatMessage)> = messages.iter().enumerate().collect();
+        let (prefix, title, thinking) = tool_group_label(&parts, false);
+        assert_eq!(format!("{prefix}{title}"), "Used 2 Read, Grep");
+        assert!(!thinking);
+
+        let mut thinking = Vec::new();
+        push_chat_event(&mut thinking, AgentEvent::Thinking("Plan".into()));
+        let parts: Vec<(usize, &ChatMessage)> = thinking.iter().enumerate().collect();
+        assert_eq!(
+            tool_group_label(&parts, true),
+            (String::new(), "Thinking".into(), true)
+        );
+        let (prefix, title, _) = tool_group_label(&parts, false);
+        assert_eq!(format!("{prefix}{title}"), "Used 1 Thought");
     }
 
     #[test]
@@ -14001,6 +14780,170 @@ mod kathamo_bottom_input_tests {
             let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
             assert_eq!(auth.models.len(), 2);
             assert_eq!(auth.providers.len(), 2);
+        });
+    }
+
+    #[test]
+    fn agent_dialog_backdrop_covers_the_window_and_blocks_background() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let (pane_id, sessions_before) = state.read_with(&cx, |s, _| {
+            (
+                s.projects[0].sessions[0].panes[0].id,
+                s.projects[0].sessions.len(),
+            )
+        });
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.open_agent_auth(pane_id, AgentDialogPage::Models, window, cx);
+        });
+        cx.draw_frame().expect("draw agent dialog");
+
+        let layer = cx
+            .debug_bounds("agent-auth-layer")
+            .expect("dialog backdrop renders");
+        assert_eq!(
+            layer.origin,
+            point(px(0.0), px(0.0)),
+            "the backdrop must start at the window origin, not the pane"
+        );
+        assert!(
+            layer.size.width > px(1100.0) && layer.size.height > px(700.0),
+            "the backdrop must span the whole window (sidebar and title bar included)"
+        );
+
+        let new_session = cx
+            .debug_bounds("project-new-session")
+            .expect("sidebar new-session button renders");
+        let click = point(
+            new_session.origin.x + new_session.size.width / 2.0,
+            new_session.origin.y + new_session.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(click, None, Modifiers::default());
+        cx.simulate_click(click, Modifiers::default());
+        cx.draw_frame().expect("draw after backdrop click");
+
+        state.read_with(&cx, |s, _| {
+            assert_eq!(
+                s.projects[0].sessions.len(),
+                sessions_before,
+                "clicks behind the dialog must not reach the sidebar"
+            );
+            assert!(
+                s.pane_ref(pane_id).unwrap().chat.auth.is_none(),
+                "the backdrop click still dismisses the dialog"
+            );
+        });
+    }
+
+    #[test]
+    fn agent_dialog_filters_providers_and_models() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        let connected = agent_auth::AgentModel {
+            provider: "google-antigravity".into(),
+            id: "gemini-connected".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+        let disconnected = agent_auth::AgentModel {
+            provider: "anthropic".into(),
+            id: "claude-disconnected".into(),
+            backend: agent_auth::ModelBackend::Rpi,
+        };
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.open_agent_auth(id, AgentDialogPage::Models, window, cx);
+            let auth = s.pane_mut(id).unwrap().chat.auth.as_mut().unwrap();
+            auth.discovery = None;
+            auth.model_discovery = None;
+            auth.providers = vec![
+                agent_auth::Provider {
+                    id: "anthropic".into(),
+                    ready: false,
+                    source: None,
+                },
+                agent_auth::Provider {
+                    id: "google-antigravity".into(),
+                    ready: true,
+                    source: Some("omp OAuth".into()),
+                },
+            ];
+            auth.models = vec![disconnected, connected];
+        });
+        cx.draw_frame().expect("draw model page");
+
+        let filter = cx
+            .debug_bounds("agent-dialog-filter")
+            .expect("filter input renders");
+        let center = point(
+            filter.origin.x + filter.size.width / 2.0,
+            filter.origin.y + filter.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(center, None, Modifiers::default());
+        cx.simulate_click(center, Modifiers::default());
+        cx.draw_frame().expect("draw focused filter");
+        cx.simulate_input("gemini");
+        cx.draw_frame().expect("draw filtered models");
+
+        assert!(
+            cx.debug_bounds("agent-model-0").is_some(),
+            "the matching model stays listed"
+        );
+        assert!(
+            cx.debug_bounds("agent-model-1").is_none(),
+            "non-matching models are filtered out"
+        );
+
+        // Enter belongs to the search field here, not the API-key form.
+        cx.simulate_keystrokes("enter");
+        cx.draw_frame().expect("draw after enter");
+        state.read_with(&cx, |s, _| {
+            let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
+            assert!(
+                auth.error.is_none(),
+                "pressing enter while searching must not submit a key"
+            );
+        });
+
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_agent_dialog_page(id, AgentDialogPage::Auth, window, cx);
+        });
+        cx.draw_frame().expect("draw provider page");
+        state.read_with(&cx, |s, cx| {
+            let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
+            assert_eq!(
+                auth.filter.read(cx).value().to_string(),
+                "",
+                "switching tabs clears the filter"
+            );
+        });
+
+        let filter = cx
+            .debug_bounds("agent-dialog-filter")
+            .expect("filter input renders on the provider page");
+        let center = point(
+            filter.origin.x + filter.size.width / 2.0,
+            filter.origin.y + filter.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(center, None, Modifiers::default());
+        cx.simulate_click(center, Modifiers::default());
+        cx.draw_frame().expect("draw focused provider filter");
+        cx.simulate_input("google");
+        cx.draw_frame().expect("draw filtered providers");
+
+        assert!(
+            cx.debug_bounds("auth-provider-0").is_some(),
+            "the matching provider stays listed"
+        );
+        assert!(
+            cx.debug_bounds("auth-provider-1").is_none(),
+            "non-matching providers are filtered out"
+        );
+        state.read_with(&cx, |s, _| {
+            let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
+            assert!(
+                auth.providers.iter().any(|p| p.id == "anthropic"),
+                "filtering hides rows without dropping provider data"
+            );
         });
     }
 

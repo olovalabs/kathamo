@@ -8653,99 +8653,124 @@ impl AppState {
             .collect();
         providers.sort_by_key(|provider| (!provider.ready, provider.id.clone()));
         let modal_bg: Hsla = if tokens.is_dark {
-            rgba(0x18181cff).into()
+            rgba(0x13141df2).into()
         } else {
-            rgba(0xffffffff).into()
+            rgba(0xffffffeb).into()
         };
         let modal_border: Hsla = if tokens.is_dark {
-            rgba(0xffffff15).into()
+            rgba(0xffffff22).into()
         } else {
-            rgba(0x00000014).into()
+            rgba(0x0000001c).into()
         };
         let modal_divider: Hsla = if tokens.is_dark {
-            rgba(0xffffff0e).into()
-        } else {
-            rgba(0x0000000e).into()
-        };
-        let row_hover_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff0c).into()
-        } else {
-            rgba(0x00000008).into()
-        };
-        let row_selected_bg: Hsla = if tokens.is_dark {
             rgba(0xffffff14).into()
         } else {
-            rgba(0x0000000e).into()
+            rgba(0x00000010).into()
         };
-        let chip_bg: Hsla = if tokens.is_dark {
+        let row_hover_bg: Hsla = if tokens.is_dark {
             rgba(0xffffff10).into()
         } else {
             rgba(0x0000000a).into()
         };
+        let row_selected_bg: Hsla = if tokens.is_dark {
+            rgba(0xffffff1c).into()
+        } else {
+            rgba(0x00000014).into()
+        };
+        let chip_bg: Hsla = if tokens.is_dark {
+            rgba(0xffffff14).into()
+        } else {
+            rgba(0x0000000c).into()
+        };
         let badge_success_bg: Hsla = if tokens.is_dark {
-            rgba(0x2eaf5a20).into()
+            rgba(0x2eaf5a28).into()
         } else {
             rgba(0x2eaf5a18).into()
         };
-        let dot_unconnected: Hsla = if tokens.is_dark {
-            rgba(0xffffff28).into()
+        let badge_success_border: Hsla = if tokens.is_dark {
+            rgba(0x2eaf5a45).into()
         } else {
-            rgba(0x00000028).into()
+            rgba(0x2eaf5a30).into()
+        };
+        let dot_unconnected: Hsla = if tokens.is_dark {
+            rgba(0xffffff33).into()
+        } else {
+            rgba(0x00000030).into()
         };
         let btn_contrast_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff18).into()
+            rgba(0xffffff20).into()
+        } else {
+            rgba(0x00000012).into()
+        };
+        let btn_contrast_border: Hsla = if tokens.is_dark {
+            rgba(0xffffff2e).into()
+        } else {
+            rgba(0x0000001a).into()
+        };
+        let btn_contrast_hover: Hsla = if tokens.is_dark {
+            rgba(0xffffff32).into()
+        } else {
+            rgba(0x00000020).into()
+        };
+        let close_btn_hover: Hsla = if tokens.is_dark {
+            rgba(0xffffff1c).into()
+        } else {
+            rgba(0x00000012).into()
+        };
+        let tabs_bg: Hsla = if tokens.is_dark {
+            rgba(0x00000055).into()
+        } else {
+            rgba(0x0000000a).into()
+        };
+        let tabs_border: Hsla = if tokens.is_dark {
+            rgba(0xffffff16).into()
         } else {
             rgba(0x00000010).into()
         };
-        let btn_contrast_hover: Hsla = if tokens.is_dark {
-            rgba(0xffffff28).into()
-        } else {
-            rgba(0x00000018).into()
-        };
-        let close_btn_hover: Hsla = if tokens.is_dark {
-            rgba(0xffffff14).into()
-        } else {
-            rgba(0x0000000e).into()
-        };
-        let tabs_bg: Hsla = if tokens.is_dark {
-            rgba(0x00000045).into()
-        } else {
-            rgba(0x00000008).into()
-        };
         let active_tab_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff14).into()
+            rgba(0xffffff1c).into()
         } else {
             rgba(0xffffffff).into()
         };
+        let active_tab_border: Hsla = if tokens.is_dark {
+            rgba(0xffffff28).into()
+        } else {
+            rgba(0x00000012).into()
+        };
         let card_sub_bg: Hsla = if tokens.is_dark {
-            rgba(0x00000030).into()
+            rgba(0x00000040).into()
         } else {
             rgba(0x00000006).into()
         };
         let esc_chip_bg: Hsla = if tokens.is_dark {
+            rgba(0xffffff18).into()
+        } else {
+            rgba(0x0000000c).into()
+        };
+        let esc_chip_border: Hsla = if tokens.is_dark {
+            rgba(0xffffff24).into()
+        } else {
+            rgba(0x00000016).into()
+        };
+        let open_providers_bg: Hsla = if tokens.is_dark {
+            rgba(0xffffff1c).into()
+        } else {
+            rgba(0x00000010).into()
+        };
+        let open_providers_hover: Hsla = if tokens.is_dark {
+            rgba(0xffffff2a).into()
+        } else {
+            rgba(0x0000001c).into()
+        };
+        let disconnect_bg: Hsla = if tokens.is_dark {
             rgba(0xffffff12).into()
         } else {
             rgba(0x0000000a).into()
         };
-        let esc_chip_border: Hsla = if tokens.is_dark {
-            rgba(0xffffff14).into()
-        } else {
-            rgba(0x00000012).into()
-        };
-        let open_providers_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff14).into()
-        } else {
-            rgba(0x0000000e).into()
-        };
-        let open_providers_hover: Hsla = if tokens.is_dark {
+        let modal_top_highlight: Hsla = if tokens.is_dark {
             rgba(0xffffff20).into()
         } else {
-            rgba(0x00000014).into()
-        };
-        let disconnect_bg: Hsla = if tokens.is_dark {
-            rgba(0xffffff0e).into()
-        } else {
-            rgba(0x00000008).into()
+            rgba(0xffffff90).into()
         };
         let provider_rows = providers
             .iter()
@@ -8806,6 +8831,8 @@ impl AppState {
                                         .py(px(1.5))
                                         .rounded(px(4.0))
                                         .bg(badge_success_bg)
+                                        .border_1()
+                                        .border_color(badge_success_border)
                                         .text_size(px(10.5))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(tokens.block_success)
@@ -8852,13 +8879,19 @@ impl AppState {
                     })
                     .child(
                         div()
-                            .px(px(9.0))
+                            .px(px(10.0))
                             .py(px(3.5))
                             .rounded(px(5.0))
                             .bg(if ready {
                                 chip_bg
                             } else {
                                 btn_contrast_bg
+                            })
+                            .border_1()
+                            .border_color(if ready {
+                                modal_divider
+                            } else {
+                                btn_contrast_border
                             })
                             .hover(move |v| {
                                 if !ready {
@@ -8943,7 +8976,8 @@ impl AppState {
                                 .py(px(1.0))
                                 .rounded(px(3.0))
                                 .bg(chip_bg)
-                                .text_size(px(9.5))
+                                .border_1()
+                                .border_color(modal_divider)
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(tokens.text_muted)
                                 .child(match model.backend {
@@ -9004,12 +9038,18 @@ impl AppState {
                             .text_size(px(10.5))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .cursor(CursorStyle::PointingHand)
-                            .when(is_default, move |view| view.bg(chip_bg).text_color(tokens.text_muted))
+                            .when(is_default, move |view| {
+                                view.bg(chip_bg)
+                                    .border_1()
+                                    .border_color(modal_divider)
+                                    .text_color(tokens.text_muted)
+                            })
                             .when(!is_default, move |view| {
-                                view.text_color(tokens.text_secondary)
+                                view.border_1()
+                                    .border_color(modal_divider)
+                                    .text_color(tokens.text_secondary)
                                     .hover(move |view| view.text_color(tokens.text_primary).bg(chip_bg))
                             })
-                            .child(if is_default { "Default" } else { "Set default" })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, window, cx| {
@@ -9054,8 +9094,14 @@ impl AppState {
                      div().id(("auth-panel", pane_id))
                          .track_focus(&auth.focus)
                          .w(px(540.0)).max_w(relative(0.95)).max_h(relative(0.9))
-                         .rounded(px(12.0)).border_1()
-                         .border_color(modal_border).bg(modal_bg).shadow_xl()
+                        .rounded(px(14.0)).border_1()
+                        .border_color(modal_border).bg(modal_bg).shadow_2xl()
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(1.0))
+                                .bg(modal_top_highlight),
+                        )
                          .flex().flex_col()
                          .overflow_hidden()
                          .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
@@ -9137,80 +9183,84 @@ impl AppState {
                              div()
                                  .mx(px(20.0))
                                  .mb(px(12.0))
-                                 .p(px(3.0))
-                                 .rounded(px(8.0))
+                                .p(px(3.0))
+                                .rounded(px(8.0))
                                 .bg(tabs_bg)
-                                 .border_1()
-                                 .border_color(modal_divider)
-                                 .flex()
-                                 .items_center()
-                                 .child(
-                                     div()
-                                         .id(("auth-tab", pane_id))
-                                         .debug_selector(|| "agent-auth-tab".into())
-                                         .flex_1()
-                                         .flex()
-                                         .items_center()
-                                         .justify_center()
-                                         .py(px(5.0))
-                                         .rounded(px(6.0))
-                                         .text_size(px(12.5))
-                                         .font_weight(gpui::FontWeight::MEDIUM)
-                                         .cursor(CursorStyle::PointingHand)
-                                         .text_color(if auth.page == AgentDialogPage::Auth {
-                                             tokens.text_primary
-                                         } else {
-                                             tokens.text_muted
-                                         })
-                                        .when(auth.page == AgentDialogPage::Auth, move |tab| {
-                                            tab.bg(active_tab_bg)
-                                                .shadow_sm()
+                                .border_1()
+                                .border_color(tabs_border)
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .id(("models-tab", pane_id))
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .py(px(5.0))
+                                        .rounded(px(6.0))
+                                        .text_size(px(12.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_color(if auth.page == AgentDialogPage::Models {
+                                            tokens.text_primary
+                                        } else {
+                                            tokens.text_muted
                                         })
-                                         .hover(|tab| tab.text_color(tokens.text_primary))
-                                         .child("Providers")
-                                         .on_mouse_down(
-                                             MouseButton::Left,
-                                             cx.listener(move |this, _, window, cx| {
-                                                 cx.stop_propagation();
-                                                 this.set_agent_dialog_page(
-                                                     pane_id,
-                                                     AgentDialogPage::Auth,
-                                                     window,
-                                                     cx,
-                                                 );
-                                             }),
-                                         ),
-                                 )
-                                 .child(
-                                     div()
-                                         .id(("models-tab", pane_id))
-                                         .flex_1()
-                                         .flex()
-                                         .items_center()
-                                         .justify_center()
-                                         .py(px(5.0))
-                                         .rounded(px(6.0))
-                                         .text_size(px(12.5))
-                                         .font_weight(gpui::FontWeight::MEDIUM)
-                                         .cursor(CursorStyle::PointingHand)
-                                         .text_color(if auth.page == AgentDialogPage::Models {
-                                             tokens.text_primary
-                                         } else {
-                                             tokens.text_muted
-                                         })
                                         .when(auth.page == AgentDialogPage::Models, move |tab| {
                                             tab.bg(active_tab_bg)
+                                                .border_1()
+                                                .border_color(active_tab_border)
                                                 .shadow_sm()
                                         })
-                                         .hover(|tab| tab.text_color(tokens.text_primary))
-                                         .child("Models")
-                                         .on_mouse_down(
-                                             MouseButton::Left,
-                                             cx.listener(move |this, _, window, cx| {
+                                        .hover(|tab| tab.text_color(tokens.text_primary))
+                                        .child("Models")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
                                                 cx.stop_propagation();
                                                 this.set_agent_dialog_page(
                                                     pane_id,
                                                     AgentDialogPage::Models,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(("auth-tab", pane_id))
+                                        .debug_selector(|| "agent-auth-tab".into())
+                                        .flex_1()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .py(px(5.0))
+                                        .rounded(px(6.0))
+                                        .text_size(px(12.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .cursor(CursorStyle::PointingHand)
+                                        .text_color(if auth.page == AgentDialogPage::Auth {
+                                            tokens.text_primary
+                                        } else {
+                                            tokens.text_muted
+                                        })
+                                        .when(auth.page == AgentDialogPage::Auth, move |tab| {
+                                            tab.bg(active_tab_bg)
+                                                .border_1()
+                                                .border_color(active_tab_border)
+                                                .shadow_sm()
+                                        })
+                                        .hover(|tab| tab.text_color(tokens.text_primary))
+                                        .child("Providers")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.set_agent_dialog_page(
+                                                    pane_id,
+                                                    AgentDialogPage::Auth,
                                                     window,
                                                     cx,
                                                 );
@@ -9716,6 +9766,8 @@ impl AppState {
                                                             .py(px(5.0))
                                                             .rounded(px(5.0))
                                                             .bg(open_providers_bg)
+                                                            .border_1()
+                                                            .border_color(btn_contrast_border)
                                                             .hover(move |v| {
                                                                 v.bg(open_providers_hover)
                                                             })
@@ -9799,10 +9851,16 @@ impl AppState {
                                             .child(
                                                 div()
                                                     .id(("use-rpi", pane_id))
+                                                    .px(px(8.0))
+                                                    .py(px(3.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(chip_bg)
+                                                    .border_1()
+                                                    .border_color(modal_divider)
                                                     .text_size(px(11.0))
                                                     .text_color(tokens.text_secondary)
                                                     .cursor(CursorStyle::PointingHand)
-                                                    .hover(|view| view.text_color(tokens.text_primary))
+                                                    .hover(|view| view.text_color(tokens.text_primary).bg(btn_contrast_bg))
                                                     .child("Use automatic model")
                                                     .on_mouse_down(
                                                         MouseButton::Left,
@@ -9817,10 +9875,16 @@ impl AppState {
                                             .child(
                                                 div()
                                                     .id(("reset-default-model", pane_id))
+                                                    .px(px(8.0))
+                                                    .py(px(3.0))
+                                                    .rounded(px(4.0))
+                                                    .bg(chip_bg)
+                                                    .border_1()
+                                                    .border_color(modal_divider)
                                                     .text_size(px(11.0))
                                                     .text_color(tokens.text_secondary)
                                                     .cursor(CursorStyle::PointingHand)
-                                                    .hover(|view| view.text_color(tokens.text_primary))
+                                                    .hover(|view| view.text_color(tokens.text_primary).bg(btn_contrast_bg))
                                                     .child("Reset default")
                                                     .on_mouse_down(
                                                         MouseButton::Left,
@@ -15824,8 +15888,14 @@ mod kathamo_bottom_input_tests {
         let (mut cx, state) = open_app(&mut app);
         let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
 
+        let model = agent_auth::AgentModel {
+            provider: "google-antigravity".into(),
+            id: "gemini-pro".into(),
+            backend: agent_auth::ModelBackend::Omp,
+        };
+
         cx.update_window_entity(&state, |s, window, cx| {
-            s.open_agent_auth(id, AgentDialogPage::Auth, window, cx);
+            s.open_agent_auth(id, AgentDialogPage::Models, window, cx);
             let auth = s.pane_mut(id).unwrap().chat.auth.as_mut().unwrap();
             auth.discovery = None;
             auth.model_discovery = None;
@@ -15841,12 +15911,23 @@ mod kathamo_bottom_input_tests {
                     source: Some("omp OAuth".into()),
                 },
             ];
+            auth.models = vec![model];
         });
-        cx.draw_frame().expect("draw opencode style auth dialog");
+        cx.draw_frame().expect("draw opencode style models dialog");
 
         assert!(cx.debug_bounds("agent-auth-layer").is_some());
         assert!(cx.debug_bounds("agent-dialog-filter").is_some());
-        assert!(cx.debug_bounds("agent-auth-tab").is_some());
+        assert!(cx.debug_bounds("agent-model-0").is_some());
+
+        // Switch to providers tab
+        let tab_bounds = cx.debug_bounds("agent-auth-tab").unwrap();
+        let center = point(
+            tab_bounds.origin.x + tab_bounds.size.width / 2.0,
+            tab_bounds.origin.y + tab_bounds.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(center, None, Modifiers::default());
+        cx.simulate_click(center, Modifiers::default());
+        cx.draw_frame().expect("draw providers page");
         assert!(cx.debug_bounds("auth-provider-0").is_some());
 
         cx.update_window_entity(&state, |s, window, cx| {

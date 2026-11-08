@@ -587,13 +587,9 @@ fn tool_view(name: &str, input: &str) -> ToolView {
     }
 }
 
-/// Header text for a run of thinking and tool calls, mirroring opencode's
-/// collapsed "Used N Read, Grep" row. Returns `(prefix, title, thinking)`.
-fn tool_group_label(parts: &[(usize, &ChatMessage)], running: bool) -> (String, String, bool) {
-    let thoughts = parts
-        .iter()
-        .filter(|(_, message)| message.role == ChatRole::Thinking)
-        .count();
+/// Header text for a run of tool calls, mirroring opencode's collapsed
+/// "Used N Read, Grep" row. Returns `(prefix, title)`.
+fn tool_group_label(parts: &[(usize, &ChatMessage)]) -> (String, String) {
     let mut titles: Vec<String> = Vec::new();
     let mut tool_count = 0usize;
     for (_, message) in parts {
@@ -607,15 +603,7 @@ fn tool_group_label(parts: &[(usize, &ChatMessage)], running: bool) -> (String, 
     }
 
     if tool_count == 0 {
-        if running && thoughts > 0 {
-            return (String::new(), "Thinking".to_string(), true);
-        }
-        let count = thoughts.max(1);
-        return (
-            format!("Used {count} "),
-            format!("Thought{}", if count == 1 { "" } else { "s" }),
-            false,
-        );
+        return (String::new(), "Updates".to_string());
     }
 
     let names = if titles.len() > 3 {
@@ -623,7 +611,7 @@ fn tool_group_label(parts: &[(usize, &ChatMessage)], running: bool) -> (String, 
     } else {
         titles.join(", ")
     };
-    (format!("Used {tool_count} "), names, false)
+    (format!("Used {tool_count} "), names)
 }
 
 fn chat_copy_button(
@@ -1149,6 +1137,7 @@ fn chat_thinking_row(
         .min_w_0()
         .flex()
         .flex_col()
+        .debug_selector(move || format!("thinking-row-{index}"))
         .child(header);
 
     if expanded {
@@ -1161,6 +1150,7 @@ fn chat_thinking_row(
                 .border_l_1()
                 .border_color(tokens.border_subtle)
                 .py(px(6.0))
+                .debug_selector(move || format!("thinking-body-{index}"))
                 .child(chat_markdown(
                     SharedString::from(format!("thinking-body-{pane_id}-{index}")),
                     message.text.clone(),
@@ -1350,9 +1340,6 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
         }
     }
     let mut message = ChatMessage::new(role, text);
-    if role == ChatRole::Thinking {
-        message.expanded = false;
-    }
     if role == ChatRole::Assistant {
         message.streaming = true;
     }
@@ -9566,7 +9553,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (prefix, label, thinking) = tool_group_label(parts, running);
+        let (prefix, label) = tool_group_label(parts);
         let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
             cx.stop_propagation();
             this.toggle_chat_tool_group_expanded(pane_id, start, cx);
@@ -9583,24 +9570,6 @@ impl AppState {
             .cursor(CursorStyle::PointingHand)
             .on_mouse_down(MouseButton::Left, on_toggle);
 
-        let title_element = div()
-            .text_color(tokens.text_primary)
-            .child(label);
-        let title_element = if running && thinking {
-            title_element
-                .with_animation(
-                    SharedString::from(format!("tool-group-pulse-{pane_id}-{start}")),
-                    Animation::new(std::time::Duration::from_millis(1100)).repeat(),
-                    |element, delta| {
-                        let pulse = (delta * std::f32::consts::PI).sin().abs();
-                        element.opacity(0.55 + 0.45 * pulse)
-                    },
-                )
-                .into_any_element()
-        } else {
-            title_element.into_any_element()
-        };
-
         let mut label_element = div()
             .flex_shrink_0()
             .flex()
@@ -9616,7 +9585,11 @@ impl AppState {
                     .child(prefix),
             );
         }
-        label_element = label_element.child(title_element);
+        label_element = label_element.child(
+            div()
+                .text_color(tokens.text_primary)
+                .child(label),
+        );
         header = header.child(label_element);
 
         if running {
@@ -9644,7 +9617,13 @@ impl AppState {
                 .text_color(tokens.text_muted),
         );
 
-        let mut group = div().w_full().min_w_0().flex().flex_col().child(header);
+        let mut group = div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .debug_selector(move || format!("tool-group-{start}"))
+            .child(header);
         if open {
             let mut children = div()
                 .w_full()
@@ -9698,35 +9677,41 @@ impl AppState {
         let mut cursor = 0usize;
         while cursor < visible.len() {
             let message = &visible[cursor];
-            if matches!(message.role, ChatRole::Tool | ChatRole::Thinking) {
+            // Reasoning stays outside the tool group so live thoughts are always
+            // visible instead of hiding behind a collapsed "Used N tools" row.
+            if message.role == ChatRole::Tool && message.tool.is_some() {
                 let start = cursor;
                 let mut parts: Vec<(usize, &ChatMessage)> = Vec::new();
                 while cursor < visible.len()
-                    && matches!(visible[cursor].role, ChatRole::Tool | ChatRole::Thinking)
+                    && visible[cursor].role == ChatRole::Tool
+                    && visible[cursor].tool.is_some()
                 {
                     parts.push((cursor, &visible[cursor]));
                     cursor += 1;
                 }
                 let open = pane.chat.expanded_tool_groups.contains(&start);
+                let live = running && cursor == visible.len();
                 messages.push(self.render_chat_tool_group(
                     pane_id,
                     &conversation,
                     start,
                     &parts,
                     open,
-                    running,
+                    live,
                     tokens,
                     window,
                     cx,
                 ));
                 continue;
             }
+            // Only the newest thinking block is live; older blocks read as thoughts.
+            let live = running && cursor + 1 == visible.len();
             messages.push(self.render_chat_message(
                 pane_id,
                 &conversation,
                 cursor,
                 message,
-                running,
+                live,
                 tokens,
                 window,
                 cx,
@@ -14419,7 +14404,6 @@ mod kathamo_bottom_input_tests {
     fn tool_group_label_uses_opencode_wording() {
         use agent_bridge::AgentEvent;
         let mut messages = Vec::new();
-        push_chat_event(&mut messages, AgentEvent::Thinking("Plan".into()));
         for (id, name) in [("a", "read"), ("b", "grep")] {
             push_chat_event(
                 &mut messages,
@@ -14431,19 +14415,106 @@ mod kathamo_bottom_input_tests {
             );
         }
         let parts: Vec<(usize, &ChatMessage)> = messages.iter().enumerate().collect();
-        let (prefix, title, thinking) = tool_group_label(&parts, false);
+        let (prefix, title) = tool_group_label(&parts);
         assert_eq!(format!("{prefix}{title}"), "Used 2 Read, Grep");
-        assert!(!thinking);
+    }
 
-        let mut thinking = Vec::new();
-        push_chat_event(&mut thinking, AgentEvent::Thinking("Plan".into()));
-        let parts: Vec<(usize, &ChatMessage)> = thinking.iter().enumerate().collect();
-        assert_eq!(
-            tool_group_label(&parts, true),
-            (String::new(), "Thinking".into(), true)
+    #[test]
+    fn live_reasoning_stays_expanded_until_the_answer_starts() {
+        use agent_bridge::AgentEvent;
+        let mut messages = Vec::new();
+        push_chat_event(&mut messages, AgentEvent::Thinking("Looking ".into()));
+        push_chat_event(&mut messages, AgentEvent::Thinking("closely".into()));
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].expanded, "live reasoning is visible");
+        assert_eq!(messages[0].text, "Looking closely");
+        push_chat_event(&mut messages, AgentEvent::Text("Done".into()));
+        assert!(
+            !messages[0].expanded,
+            "reasoning folds once the answer starts"
         );
-        let (prefix, title, _) = tool_group_label(&parts, false);
-        assert_eq!(format!("{prefix}{title}"), "Used 1 Thought");
+    }
+
+    #[test]
+    fn live_reasoning_is_rendered_outside_a_collapsed_tool_group() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            let pane = s.pane_mut(pane_id).unwrap();
+            pane.chat.running = true;
+            let reasoning = (0..20)
+                .map(|line| format!("reasoning line {line}\n"))
+                .collect::<String>();
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::Thinking(reasoning),
+            );
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::ToolStart {
+                    id: Some("t1".into()),
+                    name: "read".into(),
+                    input: r#"{"path":"src/main.rs"}"#.into(),
+                },
+            );
+        });
+        cx.draw_frame().expect("draw live reasoning");
+        let body = cx
+            .debug_bounds("thinking-body-0")
+            .expect("reasoning body is drawn outside the collapsed tool group");
+        assert!(
+            body.size.height > px(40.0),
+            "the full reasoning body is laid out, not a one-line preview: {:?}",
+            body.size.height
+        );
+        assert!(cx.debug_bounds("thinking-row-0").is_some());
+        assert!(
+            cx.debug_bounds("tool-group-1").is_some(),
+            "the tool group still renders after the reasoning"
+        );
+    }
+
+    #[test]
+    fn completed_reasoning_expands_on_click_to_show_the_full_body() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            let pane = s.pane_mut(pane_id).unwrap();
+            let reasoning = (0..20)
+                .map(|line| format!("reasoning line {line}\n"))
+                .collect::<String>();
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::Thinking(reasoning),
+            );
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::Text("Answer".into()),
+            );
+        });
+        cx.draw_frame().expect("draw folded reasoning");
+        assert!(
+            cx.debug_bounds("thinking-body-0").is_none(),
+            "completed reasoning starts folded"
+        );
+        let row = cx.debug_bounds("thinking-row-0").expect("thinking row");
+        cx.simulate_click(
+            row.origin + point(px(20.0), px(10.0)),
+            Modifiers::default(),
+        );
+        cx.draw_frame().expect("draw expanded reasoning");
+        let body = cx
+            .debug_bounds("thinking-body-0")
+            .expect("clicking the thought reveals the reasoning");
+        assert!(
+            body.size.height > px(40.0),
+            "the revealed body contains every line: {:?}",
+            body.size.height
+        );
     }
 
     #[test]

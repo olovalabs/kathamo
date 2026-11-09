@@ -2475,6 +2475,8 @@ pub struct Project {
     /// project keeps its own state, so several open projects can be browsed
     /// independently without switching away from the one being worked in.
     pub expanded: bool,
+    /// Number of session titles revealed in the sidebar; reset on launch.
+    visible_session_count: usize,
 }
 
 struct AppState {
@@ -3064,6 +3066,7 @@ impl AppState {
                 sessions,
                 active_session_idx,
                 expanded: project.expanded,
+                visible_session_count: 5,
             });
         }
 
@@ -3123,6 +3126,7 @@ impl AppState {
                     sessions: vec![session],
                     active_session_idx: 0,
                     expanded: true,
+                    visible_session_count: 5,
                 });
                 self.focused_pane_id = Some(id);
                 self.active_project_idx = 0;
@@ -4843,6 +4847,7 @@ impl AppState {
                 sessions: vec![session],
                 active_session_idx: 0,
                 expanded: true,
+                visible_session_count: 5,
             };
 
             self.projects.push(project);
@@ -12060,9 +12065,20 @@ impl AppState {
             .child(
                 div()
                     .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
                     .overflow_y_scrollbar()
                     .flex()
                     .flex_col()
+                    .child(
+                        div()
+                            .px(px(14.0))
+                            .pt(px(12.0))
+                            .pb(px(10.0))
+                            .text_size(px(13.0))
+                            .text_color(tokens.sidebar_section_header)
+                            .child("Projects"),
+                    )
                     .pb(px(10.0))
                     .children(project_rows)
                     .when(self.projects.is_empty(), |this| {
@@ -12083,6 +12099,7 @@ impl AppState {
         div()
             .id("sidebar-footer")
             .w_full()
+            .flex_shrink_0()
             .p(px(8.0))
             .border_t_1()
             .border_color(tokens.sidebar_footer_border)
@@ -12833,6 +12850,7 @@ impl AppState {
         let tokens = self.tokens(cx);
         div()
             .h(px(38.0))
+            .flex_shrink_0()
             .w_full()
             .flex()
             .items_center()
@@ -12921,18 +12939,13 @@ impl AppState {
             .iter()
             .filter(|s| matches!(s.status, SessionStatus::Blocked | SessionStatus::Error))
             .count();
-        let chevron = if project.expanded {
-            "icons/chevron-down.svg"
-        } else {
-            "icons/chevron-right.svg"
-        };
 
         let mut rows: Vec<gpui::AnyElement> = Vec::new();
         if project.expanded {
             if project.sessions.is_empty() {
                 rows.push(
                     div()
-                        .pl(px(34.0))
+                        .pl(px(18.0))
                         .pr(px(16.0))
                         .py(px(6.0))
                         .text_size(px(11.5))
@@ -12941,7 +12954,12 @@ impl AppState {
                         .into_any_element(),
                 );
             }
-            for (s_idx, session) in project.sessions.iter().enumerate() {
+            for (s_idx, session) in project
+                .sessions
+                .iter()
+                .take(project.visible_session_count)
+                .enumerate()
+            {
                 let is_active_session = is_active_project && s_idx == project.active_session_idx;
                 rows.push(self.render_session_entry(
                     project_idx,
@@ -12950,6 +12968,54 @@ impl AppState {
                     is_active_session,
                     cx,
                 ));
+            }
+            for (show_more, visible) in [
+                (true, project.sessions.len() > project.visible_session_count),
+                (false, project.visible_session_count > 5),
+            ] {
+                if !visible {
+                    continue;
+                }
+                let (id, label) = if show_more {
+                    ("project-show-more", "Show more")
+                } else {
+                    ("project-show-less", "Show less")
+                };
+                rows.push(
+                    div()
+                        .id((id, project.id))
+                        .debug_selector(move || id.to_string())
+                        .ml(px(6.0))
+                        .mr(px(6.0))
+                        .h(px(30.0))
+                        .pl(px(12.0))
+                        .rounded(px(8.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(12.0))
+                        .text_color(tokens.sidebar_muted)
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |s| {
+                            s.bg(tokens.sidebar_item_hover)
+                                .text_color(tokens.sidebar_fg)
+                        })
+                        .child(label)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(project) = this.projects.get_mut(project_idx) {
+                                    project.visible_session_count = if show_more {
+                                        project.visible_session_count.saturating_add(10)
+                                    } else {
+                                        5
+                                    };
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .into_any_element(),
+                );
             }
         }
 
@@ -13006,15 +13072,12 @@ impl AppState {
                 .gap(px(4.0))
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(12.5))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if is_active_project {
-                            tokens.sidebar_fg
-                        } else {
-                            tokens.sidebar_muted
-                        })
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::NORMAL)
+                        .text_color(tokens.sidebar_fg)
                         .child(project.name.clone()),
                 )
                 .child(
@@ -13035,8 +13098,8 @@ impl AppState {
                                     cx.notify();
                                 }),
                             )
-                            .opacity(if is_menu_open { 1.0 } else { 0.0 })
-                            .group_hover(group_name.clone(), |s| s.opacity(1.0)),
+                            .when(!is_menu_open, |this| this.invisible())
+                            .group_hover(group_name.clone(), |s| s.visible()),
                         )
                         .when(is_menu_open, |this| {
                             this.child(
@@ -13108,7 +13171,6 @@ impl AppState {
                             )
                         }),
                 )
-                .child(div().flex_1())
                 .when(needs_attention > 0, |this| {
                     this.child(
                         div()
@@ -13128,7 +13190,22 @@ impl AppState {
                             this.create_new_session_in_project(project_idx, window, cx);
                         }),
                     )
+                    .invisible()
+                    .group_hover(group_name.clone(), |s| s.visible())
                     .debug_selector(|| "project-new-session".to_string()),
+                )
+                .child(
+                    sidebar_icon_button(
+                        ("project-close", project.id),
+                        "icons/x.svg",
+                        12.0,
+                        &tokens,
+                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
+                            this.close_project(project_idx, window, cx);
+                        }),
+                    )
+                    .invisible()
+                    .group_hover(group_name.clone(), |s| s.visible()),
                 )
                 .into_any_element()
         };
@@ -13136,7 +13213,7 @@ impl AppState {
         div()
             .flex()
             .flex_col()
-            .mb(px(18.0))
+            .mb(px(12.0))
             .child(
                 div()
                     .id(("project-row", project.id))
@@ -13144,14 +13221,14 @@ impl AppState {
                     .ml(px(6.0))
                     .mr(px(6.0))
                     .mt(px(2.0))
-                    .h(px(32.0))
-                    .pl(px(4.0))
+                    .h(px(34.0))
+                    .pl(px(8.0))
                     .pr(px(4.0))
-                    .rounded(px(6.0))
+                    .rounded(px(8.0))
                     .cursor(CursorStyle::PointingHand)
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
+                    .gap(px(10.0))
                     .bg(rgba(0x00000000))
                     .hover(move |s| s.bg(tokens.sidebar_item_hover))
                     .child(
@@ -13165,8 +13242,8 @@ impl AppState {
                             .hover(move |s| s.bg(tokens.sidebar_icon_btn_hover))
                             .child(
                                 svg()
-                                    .path(chevron)
-                                    .size(px(12.0))
+                                    .path("icons/folder.svg")
+                                    .size(px(17.0))
                                     .text_color(tokens.sidebar_icon),
                             )
                             .on_mouse_down(
@@ -13388,12 +13465,13 @@ impl AppState {
 
         div()
             .id(("session-item", session.id))
+            .group("session-row")
             .ml(px(6.0))
             .mr(px(6.0))
-            .h(px(38.0))
+            .h(px(32.0))
             .pl(px(12.0))
             .pr(px(4.0))
-            .rounded(px(6.0))
+            .rounded(px(8.0))
             .cursor(CursorStyle::PointingHand)
             .tooltip(move |_, cx| {
                 let text = selected_evidence.clone();
@@ -13428,7 +13506,7 @@ impl AppState {
                         ) {
                             gpui::FontWeight::SEMIBOLD
                         } else {
-                            gpui::FontWeight::MEDIUM
+                            gpui::FontWeight::NORMAL
                         },
                     )
                     .text_color(if is_active_session {
@@ -13438,17 +13516,22 @@ impl AppState {
                     })
                     .child(session.display_title.clone()),
             )
-            .child(indicator)
+            .when(
+                !matches!(session.status, SessionStatus::Active | SessionStatus::Idle),
+                |this| this.child(indicator),
+            )
             .child(
                 sidebar_icon_button(
                     ("session-close", session.id),
                     "icons/x.svg",
-                    10.0,
+                    12.0,
                     &tokens,
                     cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
                         this.close_session(project_idx, session_idx, window, cx);
                     }),
                 )
+                .invisible()
+                .group_hover("session-row", |s| s.visible())
                 .debug_selector(|| "session-close".to_string()),
             )
             .on_mouse_down(
@@ -14851,6 +14934,7 @@ mod resize_tests {
                 }],
                 active_session_idx: 0,
                 expanded: true,
+                visible_session_count: 5,
             }],
             active_project_idx: 0,
             next_id: 2,
@@ -14929,6 +15013,57 @@ mod resize_tests {
         let cx = VisualTestContext::from_window(*handle.deref(), cx);
         cx.run_until_parked();
         (cx, state)
+    }
+
+    #[test]
+    fn sidebar_show_less_restores_five_after_partial_and_full_expansion() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_theme_preference(ThemePreference::Light, Some(window), cx);
+            for idx in 2..=17 {
+                let title: SharedString =
+                    format!("Session {idx:02}: conversation title").into();
+                s.projects[0].sessions.push(Session {
+                    id: idx,
+                    uid: paths::uid("s"),
+                    title: title.clone(),
+                    display_title: title,
+                    logo: logos::default_logo(),
+                    pane_tree: None,
+                    maximized_pane_id: None,
+                    panes: Vec::new(),
+                    status: SessionStatus::Idle,
+                });
+            }
+            s.rebuild_session_index();
+            cx.notify();
+        });
+        cx.simulate_mouse_move(point(px(600.0), px(400.0)), None, Modifiers::none());
+        cx.run_until_parked();
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("project-show-less").is_none());
+        for (selector, limit) in [
+            ("project-show-more", 15),
+            ("project-show-more", 25),
+            ("project-show-less", 5),
+            ("project-show-more", 15),
+            ("project-show-less", 5),
+        ] {
+            let bounds = cx.debug_bounds(selector).expect("pagination control");
+            let center = point(
+                bounds.origin.x + px(40.0),
+                bounds.origin.y + bounds.size.height / 2.0,
+            );
+            cx.simulate_mouse_move(center, None, Modifiers::none());
+            cx.simulate_click(center, Modifiers::none());
+            cx.draw_frame().unwrap();
+            state.read_with(&cx, |s, _| {
+                assert_eq!(s.projects[0].visible_session_count, limit);
+            });
+            assert_eq!(cx.debug_bounds("project-show-less").is_some(), limit > 5);
+            assert_eq!(cx.debug_bounds("project-show-more").is_some(), limit < 17);
+        }
     }
 
     #[test]

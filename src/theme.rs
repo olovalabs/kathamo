@@ -296,7 +296,7 @@ impl ThemeTokens {
             self.sidebar_fg = fg.into();
             self.sidebar_muted = text_disabled.into();
             self.sidebar_item_hover = rgba(0x1111110d).into();
-            self.sidebar_item_active = rgba(0x1111111a).into();
+            self.sidebar_item_active = rgba(0x11111108).into();
             self.sidebar_item_active_fg = fg.into();
             self.sidebar_section_header = text_disabled.into();
             self.sidebar_icon_btn_hover = rgba(0x1111111a).into();
@@ -366,7 +366,7 @@ impl ThemeTokens {
             sidebar_fg: rgba(0xe6edf3ff).into(),
             sidebar_muted: rgba(0x8b879eff).into(),
             sidebar_item_hover: rgba(0xffffff15).into(),
-            sidebar_item_active: rgba(0xffffff22).into(),
+            sidebar_item_active: rgba(0xffffff16).into(),
             sidebar_item_active_fg: rgba(0xffffffff).into(),
             sidebar_section_header: rgba(0x9a95adff).into(),
             sidebar_icon_btn_hover: rgba(0xffffff1a).into(),
@@ -429,20 +429,20 @@ impl ThemeTokens {
             titlebar_fg: rgba(0x1f2328ff).into(),
             titlebar_btn_hover: rgba(0xeaeef2ff).into(),
 
-            sidebar_bg: rgba(0xf6f8faff).into(),
-            sidebar_bg_start: rgba(0xf6f8faff).into(),
-            sidebar_bg_end: rgba(0xf6f8faff).into(),
+            sidebar_bg: rgba(0xffffffff).into(),
+            sidebar_bg_start: rgba(0xffffffff).into(),
+            sidebar_bg_end: rgba(0xffffffff).into(),
             sidebar_border: rgba(0xd1d9e0ff).into(),
             sidebar_fg: rgba(0x1f2328ff).into(),
             sidebar_muted: rgba(0x656d76ff).into(),
             sidebar_item_hover: rgba(0x0000000a).into(),
-            sidebar_item_active: rgba(0x00000014).into(),
+            sidebar_item_active: rgba(0x00000008).into(),
             sidebar_item_active_fg: rgba(0x1f2328ff).into(),
-            sidebar_section_header: rgba(0x656d76ff).into(),
+            sidebar_section_header: rgba(0x8c9095ff).into(),
             sidebar_icon_btn_hover: rgba(0x0000000e).into(),
             sidebar_icon: rgba(0x656d76ff).into(),
             sidebar_icon_hover: rgba(0x1f2328ff).into(),
-            sidebar_footer_bg: rgba(0xf0f2f5ff).into(),
+            sidebar_footer_bg: rgba(0xffffffff).into(),
             sidebar_footer_border: rgba(0xd1d9e0ff).into(),
 
             pane_bg: rgba(0xffffffff).into(),

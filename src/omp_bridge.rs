@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -46,6 +47,8 @@ pub struct OmpBridge {
     title_in_flight: bool,
     /// The session file is being read on a background thread.
     title_read_in_flight: bool,
+    live_workers: HashMap<String, crate::subagent_chat::LiveWorker>,
+    worker_changed: bool,
 }
 
 impl OmpBridge {
@@ -211,6 +214,11 @@ impl OmpBridge {
                 "type": "set_thinking_level", "id": "kathamo-thinking-level", "level": "low"
             }),
         );
+        // Worker messages are emitted separately from the parent transcript.
+        let _ = write_command(
+            &stdin,
+            &json!({"type": "set_subagent_subscription", "id": "kathamo-subagents", "level": "events"}),
+        );
         // Learn where this session is stored so its generated title can be read.
         let _ = write_command(&stdin, &json!({"type": "get_state", "id": "kathamo-state"}));
         Ok(Self {
@@ -226,6 +234,8 @@ impl OmpBridge {
             title_requested: false,
             title_in_flight: false,
             title_read_in_flight: false,
+            live_workers: HashMap::new(),
+            worker_changed: false,
         })
     }
 
@@ -325,6 +335,29 @@ impl OmpBridge {
         coalesce_events(events)
     }
 
+    pub fn take_worker_changes(&mut self) -> bool {
+        std::mem::take(&mut self.worker_changed)
+    }
+
+    pub fn live_worker(
+        &self,
+        worker: &crate::subagent_chat::Worker,
+        tool_id: Option<&str>,
+    ) -> Option<&crate::subagent_chat::LiveWorker> {
+        let live = self.live_workers.get(&worker.id)?;
+        let same_file = live
+            .transcript
+            .as_ref()
+            .zip(worker.transcript.as_ref())
+            .is_some_and(|(live, saved)| live == saved);
+        let same_call = live
+            .tool_id
+            .as_deref()
+            .zip(tool_id)
+            .is_some_and(|(live, saved)| live == saved);
+        (same_file || same_call).then_some(live)
+    }
+
     fn handle_record(
         &mut self,
         record: &Value,
@@ -417,6 +450,28 @@ impl OmpBridge {
                 self.publish_session_title();
                 events.push(AgentEvent::Done);
             }
+            "subagent_lifecycle" if record["payload"]["status"] == "started" => {
+                let payload = &record["payload"];
+                if let Some(id) = payload["id"].as_str() {
+                    let transcript = payload["sessionFile"].as_str().map(PathBuf::from);
+                    let tool_id = payload["parentToolCallId"].as_str().map(str::to_owned);
+                    let worker = self.live_workers.entry(id.to_owned()).or_default();
+                    if transcript != worker.transcript {
+                        *worker = Default::default();
+                    }
+                    worker.transcript = transcript;
+                    worker.tool_id = tool_id;
+                }
+            }
+            "subagent_event" => {
+                let payload = &record["payload"];
+                if let Some(worker) = payload["id"]
+                    .as_str()
+                    .and_then(|id| self.live_workers.get_mut(id))
+                {
+                    self.worker_changed |= worker.apply(&payload["event"]);
+                }
+            }
             "message_update" => {
                 if let Some(event) = event {
                     events.push(event);
@@ -425,6 +480,24 @@ impl OmpBridge {
             "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
                 if let Some(event) = event {
                     events.push(event);
+                }
+                if let Some(id) = record["toolCallId"].as_str() {
+                    let payload = if record["type"] == "tool_execution_update" {
+                        &record["partialResult"]
+                    } else {
+                        &record["result"]
+                    };
+                    let workers = crate::subagent_chat::structured(
+                        record["toolName"].as_str().unwrap_or(""),
+                        &payload["details"],
+                        self.session_file.as_deref(),
+                    );
+                    if !workers.is_empty() {
+                        events.push(AgentEvent::Subagents {
+                            tool_id: id.to_owned(),
+                            workers,
+                        });
+                    }
                 }
                 if approval_error {
                     events.push(AgentEvent::Error("OMP could not obtain tool approval in this view. Use an interactive OMP session or adjust your OMP approval settings.".into()));

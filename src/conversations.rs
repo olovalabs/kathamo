@@ -292,6 +292,18 @@ fn bounded_event(event: &AgentEvent) -> AgentEvent {
             output: cap_text(&output, MAX_ENTRY_BYTES),
             failed,
         },
+        AgentEvent::Subagents {
+            tool_id,
+            mut workers,
+        } => {
+            for worker in &mut workers {
+                worker.result = worker
+                    .result
+                    .take()
+                    .map(|text| cap_text(&text, MAX_ENTRY_BYTES));
+            }
+            AgentEvent::Subagents { tool_id, workers }
+        }
         AgentEvent::Error(text) => AgentEvent::Error(cap_text(&text, MAX_ENTRY_BYTES)),
         AgentEvent::Title(text) => AgentEvent::Title(cap_text(&text, 200)),
         AgentEvent::Done => AgentEvent::Done,

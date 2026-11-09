@@ -52,6 +52,7 @@ mod status;
 #[cfg(unix)]
 mod status_bus;
 mod stream_timing;
+mod subagent_chat;
 mod theme;
 mod workspace_state;
 
@@ -161,6 +162,7 @@ struct StreamView {
 
 #[derive(Clone)]
 struct ChatTool {
+    workers: Vec<subagent_chat::Worker>,
     id: Option<String>,
     name: String,
     /// Shared so a frame can hand it to a card or a copy closure without
@@ -1423,7 +1425,13 @@ fn update_chat_tool(
             None => tool.id.is_none() && tool.name == name,
         })
         .last();
+    let workers = if state == ToolState::Completed {
+        subagent_chat::legacy(&name, &output)
+    } else {
+        Vec::new()
+    };
     if let Some(tool) = existing {
+        subagent_chat::update_workers(&mut tool.workers, workers);
         let (full, preview, truncated) = tool_output_fields(output);
         tool.output = full;
         tool.preview = preview;
@@ -1436,6 +1444,7 @@ fn update_chat_tool(
             role: ChatRole::Tool,
             text: String::new(),
             tool: Some(ChatTool {
+                workers,
                 id,
                 name,
                 output: full,
@@ -1610,6 +1619,7 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                 role: ChatRole::Tool,
                 text: String::new(),
                 tool: Some(ChatTool {
+                    workers: Vec::new(),
                     id,
                     name,
                     output: SharedString::from(""),
@@ -1649,6 +1659,18 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                     ToolState::Completed
                 },
             );
+            return;
+        }
+        agent_bridge::AgentEvent::Subagents { tool_id, workers } => {
+            if let Some(tool) = messages
+                .iter_mut()
+                .rev()
+                .take_while(|message| message.role != ChatRole::User)
+                .filter_map(|message| message.tool.as_mut())
+                .find(|tool| tool.id.as_deref() == Some(tool_id.as_str()))
+            {
+                subagent_chat::update_workers(&mut tool.workers, workers);
+            }
             return;
         }
         agent_bridge::AgentEvent::Text(text) => (ChatRole::Assistant, text),
@@ -1788,7 +1810,16 @@ struct ModelChat {
     prompt_title: Option<String>,
 }
 
+struct WorkerView {
+    index: usize,
+    id: String,
+    scroll: gpui::ScrollHandle,
+    messages: Vec<subagent_chat::TranscriptMessage>,
+    _load: Option<gpui::Task<()>>,
+}
+
 struct PaneChat {
+    worker_view: Option<WorkerView>,
     active: bool,
     bridge: Option<agent_bridge::AgentBridge>,
     cwd: Option<PathBuf>,
@@ -1823,6 +1854,7 @@ impl Default for PaneChat {
     fn default() -> Self {
         Self {
             active: false,
+            worker_view: None,
             bridge: None,
             cwd: None,
             messages: Vec::new(),
@@ -5568,6 +5600,7 @@ impl AppState {
             std::mem::take(&mut pane.chat.terminal_draft)
         };
         pane.chat.active = active;
+        pane.chat.worker_view = None;
         pane.completion_menu = None;
         pane.history_index = None;
         pane.pending_draft.clear();
@@ -5725,6 +5758,7 @@ impl AppState {
                     .or_default()
                     .startup_error = None;
             }
+            pane.chat.worker_view = None;
             pane.chat.selected_model = model.clone();
         }
         if make_default {
@@ -6132,6 +6166,11 @@ impl AppState {
                             let mut closed = false;
                             let drain_start = std::time::Instant::now();
                             let drained = bridge.poll();
+                            if let ModelBridge::Omp(omp) = &mut bridge {
+                                changed |= omp.take_worker_changes()
+                                    && pane.chat.selected_model.as_ref() == Some(model)
+                                    && pane.chat.worker_view.is_some();
+                            }
                             crate::stream_timing::record_since("ui.drain", drain_start);
                             for event in drained {
                                 let apply_start = std::time::Instant::now();
@@ -6288,6 +6327,9 @@ impl AppState {
         let Some(pane) = self.pane_ref(pane_id) else {
             return;
         };
+        if pane.chat.worker_view.is_some() {
+            return;
+        }
         let cwd = self
             .pane_cwd_path(pane)
             .unwrap_or_else(|| PathBuf::from("."));
@@ -10499,12 +10541,332 @@ impl AppState {
         group.into_any_element()
     }
 
+    fn worker_avatar(&self, avatar: usize, pixel: f32) -> gpui::Div {
+        let (pattern, color) = subagent_chat::AVATARS[avatar];
+        div()
+            .relative()
+            .size(px(pixel * 5.0))
+            .flex_shrink_0()
+            .children(pattern.into_iter().enumerate().flat_map(|(y, row)| {
+                (0..5)
+                    .filter(move |x| row & (0b10000 >> x) != 0)
+                    .map(move |x| {
+                        div()
+                            .absolute()
+                            .left(px(x as f32 * pixel))
+                            .top(px(y as f32 * pixel))
+                            .size(px(pixel))
+                            .bg(rgba(color))
+                    })
+            }))
+    }
+
+    fn render_worker_row(
+        &self,
+        pane_id: usize,
+        row: &subagent_chat::Row<'_>,
+        tokens: ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let worker = row.worker;
+        let index = row.index;
+        let id = worker.id.clone();
+        let status = match worker.status_label() {
+            "Starting" => "is starting",
+            "Running" => "is working",
+            "Completed" => "finished",
+            "Failed" => "failed",
+            "Cancelled" => "was cancelled",
+            "Idle" => "is idle",
+            _ => "reported",
+        };
+        div()
+            .id(SharedString::from(format!(
+                "subagent-{pane_id}-{index}-{id}"
+            )))
+            .debug_selector({
+                let id = id.clone();
+                move || format!("subagent-row-{id}")
+            })
+            .w_full()
+            .min_w_0()
+            .h(px(30.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .rounded(px(4.0))
+            .text_size(px(14.0))
+            .cursor(CursorStyle::PointingHand)
+            .hover(move |style| style.bg(tokens.sidebar_item_hover))
+            .child(self.worker_avatar(row.avatar, 3.0))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_color(tokens.text_primary)
+                    .child(worker.display_title()),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_color(tokens.text_muted)
+                    .child(status),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_worker_view(pane_id, index, &id, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn open_worker_view(&mut self, pane_id: usize, index: usize, id: &str, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let rows = subagent_chat::rows(pane.chat.visible_messages());
+        let Some(row) = rows
+            .iter()
+            .find(|row| row.index == index && row.worker.id == id)
+        else {
+            return;
+        };
+        let path = row.worker.transcript.clone();
+        let tool_id = pane.chat.visible_messages()[index]
+            .tool
+            .as_ref()
+            .and_then(|tool| tool.id.clone());
+        let id = id.to_owned();
+        let worker_id = id.clone();
+        let load = cx.spawn(async move |this, cx| {
+            let path = match path {
+                Some(path) => Some(path),
+                None => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            subagent_chat::find_legacy_transcript(&worker_id, &tool_id?)
+                        })
+                        .await
+                }
+            };
+            let Some(path) = path else { return };
+            let mut previous = None;
+            loop {
+                let file = path.clone();
+                let snapshot = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let meta = std::fs::metadata(&file).ok()?;
+                        let stamp = (meta.len(), meta.modified().ok());
+                        if previous == Some(stamp) {
+                            return None;
+                        }
+                        Some((stamp, subagent_chat::read_transcript(&file)?))
+                    })
+                    .await;
+                if let Some((stamp, messages)) = snapshot {
+                    previous = Some(stamp);
+                    if this
+                        .update(cx, |this, cx| {
+                            if let Some(view) = this
+                                .pane_mut(pane_id)
+                                .and_then(|pane| pane.chat.worker_view.as_mut())
+                            {
+                                view.messages = messages;
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+            }
+        });
+        pane.chat.worker_view = Some(WorkerView {
+            index,
+            id,
+            scroll: gpui::ScrollHandle::new(),
+            messages: Vec::new(),
+            _load: Some(load),
+        });
+        cx.notify();
+    }
+
+    fn render_worker_view(
+        &self,
+        pane: &TerminalPane,
+        view: &WorkerView,
+        row: &subagent_chat::Row<'_>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pane_id = pane.id;
+        let live = pane
+            .chat
+            .selected_model
+            .as_ref()
+            .and_then(|model| pane.chat.models.get(model))
+            .and_then(|chat| match chat.bridge.as_ref()? {
+                ModelBridge::Omp(bridge) => bridge.live_worker(
+                    row.worker,
+                    pane.chat.visible_messages()[row.index]
+                        .tool
+                        .as_ref()?
+                        .id
+                        .as_deref(),
+                ),
+                ModelBridge::Rpi(_) => None,
+            });
+        if view.scroll.max_offset().y + view.scroll.offset().y <= px(24.0) {
+            view.scroll.scroll_to_bottom();
+        }
+        let tokens = self.tokens(cx);
+        let worker = row.worker;
+        let back = div()
+            .id(("subagent-back", pane_id))
+            .debug_selector(|| "subagent-back".to_string())
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .cursor(CursorStyle::PointingHand)
+            .hover(move |style| style.bg(tokens.sidebar_item_hover))
+            .text_size(px(12.0))
+            .text_color(tokens.text_secondary)
+            .child(
+                svg()
+                    .path("icons/arrow-left.svg")
+                    .size(px(13.0))
+                    .text_color(tokens.text_secondary),
+            )
+            .child("Back to parent chat")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(pane) = this.pane_mut(pane_id) {
+                    pane.chat.worker_view = None;
+                    cx.notify();
+                }
+            }));
+
+        let mut body = div()
+            .id(("subagent-transcript", pane_id))
+            .debug_selector(|| "subagent-transcript".to_string())
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&view.scroll)
+            .px(px(24.0))
+            .py(px(16.0))
+            .flex()
+            .flex_col()
+            .gap(px(14.0));
+        let conversation = format!("worker-{}-{}", view.index, view.id);
+        let messages = view.messages.iter().map(|entry| &entry.message).chain(
+            live.into_iter()
+                .flat_map(|worker| worker.unsaved_replies(&view.messages)),
+        );
+        let mut has_reply = false;
+        for (index, message) in messages.enumerate() {
+            has_reply |= message.role == ChatRole::Assistant;
+            body = body.child(self.render_chat_message(
+                pane_id,
+                &conversation,
+                index,
+                message,
+                message.streaming,
+                tokens,
+                window,
+                cx,
+            ));
+        }
+        if !has_reply {
+            if let Some(result) = row.result.filter(|result| !result.is_empty()) {
+                body = body.child(chat_markdown(
+                    format!("subagent-report-{pane_id}-{conversation}").into(),
+                    result.to_owned(),
+                    px(13.0),
+                    rems(0.6),
+                    tokens.text_primary,
+                    tokens,
+                    window,
+                    cx,
+                ));
+            } else if view.messages.is_empty() {
+                let text = match worker.status_label() {
+                    "Starting" | "Running" => "Waiting for the subagent’s first message…",
+                    _ => "No transcript or report was saved for this subagent.",
+                };
+                body = body.child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(tokens.text_muted)
+                        .child(text),
+                );
+            }
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .border_b_1()
+                    .border_color(tokens.border_subtle)
+                    .child(back)
+                    .child(
+                        div()
+                            .mt(px(9.0))
+                            .px(px(8.0))
+                            .pb(px(4.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(self.worker_avatar(row.avatar, 4.0))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(tokens.text_primary)
+                                            .child(worker.display_title()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(tokens.text_muted)
+                                            .child(format!("Subagent · {}", worker.status_label())),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(body)
+            .into_any_element()
+    }
+
     fn render_agent_chat(
         &self,
         pane: &TerminalPane,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
+        let visible = pane.chat.visible_messages();
+        let workers = subagent_chat::rows(visible);
+        if let Some(view) = &pane.chat.worker_view
+            && let Some(worker) = workers
+                .iter()
+                .find(|row| row.index == view.index && row.worker.id == view.id)
+        {
+            return self.render_worker_view(pane, view, worker, window, cx);
+        }
         let render_start = std::time::Instant::now();
         let tokens = self.tokens(cx);
         let conversation = format!("{:?}", pane.chat.selected_model);
@@ -10518,13 +10880,55 @@ impl AppState {
             pane.chat.scroll.scroll_to_bottom();
         }
 
-        let visible = pane.chat.visible_messages();
         let running = pane.chat.visible_running();
         let mut messages: Vec<AnyElement> = Vec::new();
         let row_start = std::time::Instant::now();
         let mut cursor = 0usize;
+        let mut worker_rows = workers.iter().peekable();
         while cursor < visible.len() {
             let message = &visible[cursor];
+            if message
+                .tool
+                .as_ref()
+                .is_some_and(|tool| !tool.workers.is_empty())
+            {
+                let start = cursor;
+                while cursor < visible.len()
+                    && visible[cursor]
+                        .tool
+                        .as_ref()
+                        .is_some_and(|tool| !tool.workers.is_empty())
+                {
+                    cursor += 1;
+                }
+                if worker_rows.peek().is_some_and(|row| row.index < cursor) {
+                    let mut rows = Vec::new();
+                    while let Some(row) = worker_rows.next_if(|row| row.index < cursor) {
+                        rows.push(self.render_worker_row(pane_id, row, tokens, cx));
+                    }
+                    messages.push(
+                        div()
+                            .debug_selector(move || format!("subagent-list-{start}"))
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .pb(px(10.0))
+                            .border_b_1()
+                            .border_color(tokens.border_subtle)
+                            .child(
+                                div()
+                                    .pb(px(7.0))
+                                    .text_size(px(14.0))
+                                    .text_color(tokens.text_muted)
+                                    .child("Subagents"),
+                            )
+                            .children(rows)
+                            .into_any_element(),
+                    );
+                }
+                continue;
+            }
             // Reasoning stays outside the tool group so live thoughts are always
             // visible instead of hiding behind a collapsed "Used N tools" row.
             if message.role == ChatRole::Tool && message.tool.is_some() {
@@ -10532,7 +10936,10 @@ impl AppState {
                 let mut parts: Vec<(usize, &ChatMessage)> = Vec::new();
                 while cursor < visible.len()
                     && visible[cursor].role == ChatRole::Tool
-                    && visible[cursor].tool.is_some()
+                    && visible[cursor]
+                        .tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.workers.is_empty())
                 {
                     parts.push((cursor, &visible[cursor]));
                     cursor += 1;
@@ -10839,6 +11246,7 @@ impl AppState {
             .child(chat_view)
             .child(scrollbar)
             .children(scroll_to_bottom_btn)
+            .into_any_element()
     }
     fn render_terminal_pane(
         &self,
@@ -11056,9 +11464,10 @@ impl AppState {
                         pane.terminal.clone().into_any_element()
                     }),
             )
-            .when(pane.should_show_bottom_input(cx), |this| {
-                this.child(self.render_kathamo_input_bar(pane, is_focused, cx))
-            })
+            .when(
+                pane.should_show_bottom_input(cx) && pane.chat.worker_view.is_none(),
+                |this| this.child(self.render_kathamo_input_bar(pane, is_focused, cx)),
+            )
     }
 
     fn render_pane_node(
@@ -15774,6 +16183,78 @@ mod kathamo_bottom_input_tests {
             !messages[0].expanded,
             "reasoning folds once the answer starts"
         );
+    }
+
+    #[test]
+    fn subagent_rows_open_a_separate_view_and_return_to_parent() {
+        use agent_bridge::AgentEvent;
+
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |state, _, cx| {
+            let pane = state.pane_mut(pane_id).unwrap();
+            pane.chat.active = true;
+            for (id, name, output) in [
+                (
+                    "spawn",
+                    "task",
+                    "Spawned 2 background agents using scout.
+- `FirstWorker` (job `FirstWorker`)
+- `SecondWorker` (job `SecondWorker`)",
+                ),
+                (
+                    "wait",
+                    "wait",
+                    "## Completed (1)
+
+### FirstWorker [task] — completed
+<task-result id=\"FirstWorker\">
+<output>
+First report
+</output>
+</task-result>
+
+## Still Running (1)
+- `SecondWorker` [task] — SecondWorker",
+                ),
+            ] {
+                push_chat_event(
+                    &mut pane.chat.messages,
+                    AgentEvent::ToolEnd {
+                        id: Some(id.into()),
+                        name: name.into(),
+                        output: output.into(),
+                        failed: false,
+                    },
+                );
+            }
+            let rows = subagent_chat::rows(&pane.chat.messages);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].worker.status_label(), "Completed");
+            assert_eq!(rows[0].result, Some("First report"));
+            assert_eq!(rows[1].worker.status_label(), "Running");
+            cx.notify();
+        });
+        cx.draw_frame().expect("draw parent chat");
+        assert!(cx.debug_bounds("tool-group-0").is_none());
+        assert!(cx.debug_bounds("subagent-list-0").is_some());
+        let row = cx
+            .debug_bounds("subagent-row-FirstWorker")
+            .expect("first worker");
+        assert!(cx.debug_bounds("subagent-row-SecondWorker").is_some());
+        cx.simulate_click(row.origin + point(px(20.0), px(10.0)), Modifiers::default());
+        cx.draw_frame().expect("draw worker chat");
+        assert!(cx.debug_bounds("subagent-transcript").is_some());
+        assert!(cx.debug_bounds("subagent-row-SecondWorker").is_none());
+        let back = cx.debug_bounds("subagent-back").expect("back button");
+        cx.simulate_click(
+            back.origin + point(px(20.0), px(10.0)),
+            Modifiers::default(),
+        );
+        cx.draw_frame().expect("draw parent chat again");
+        assert!(cx.debug_bounds("subagent-transcript").is_none());
+        assert!(cx.debug_bounds("subagent-row-FirstWorker").is_some());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use gpui::{
 };
 use std::{any::TypeId, rc::Rc};
 
-actions!(root, [Tab, TabPrev]);
+actions!(kroot, [Tab, TabPrev]);
 
 const CONTEXT: &str = "Root";
 pub(crate) fn init(cx: &mut App) {

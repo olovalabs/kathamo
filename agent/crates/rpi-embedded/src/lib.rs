@@ -131,6 +131,9 @@ pub struct SessionOptions {
     /// Restore this durable rpi session when present. If it no longer exists,
     /// the worker starts a fresh session instead of failing the pane.
     pub session_id: Option<String>,
+    /// Extra system-prompt text appended after the base prompt. The host uses
+    /// this to describe capabilities it renders itself, such as UI cards.
+    pub append_system_prompt: Option<String>,
 }
 
 impl SessionOptions {
@@ -140,6 +143,7 @@ impl SessionOptions {
             provider: None,
             model: None,
             session_id: None,
+            append_system_prompt: None,
         }
     }
 
@@ -159,6 +163,11 @@ impl SessionOptions {
 
     pub fn with_session(mut self, session_id: Option<&str>) -> Self {
         self.session_id = session_id.map(str::to_owned);
+        self
+    }
+
+    pub fn with_append_system_prompt(mut self, prompt: &str) -> Self {
+        self.append_system_prompt = Some(prompt.to_owned());
         self
     }
 }
@@ -336,6 +345,7 @@ async fn run_session(
         provider,
         model,
         session_id: resume,
+        append_system_prompt,
     } = options;
     let trusted = project_trusted(&cwd);
 
@@ -383,6 +393,9 @@ async fn run_session(
     args.provider = provider.clone();
     args.model = model.clone();
     args.session = resume.clone();
+    if let Some(prompt) = append_system_prompt {
+        args.append_system_prompt.push(prompt);
+    }
 
     let mut built = rpi_cli::session::build(&resolved, &args, &cwd, trusted).await;
     if built.is_err() && resume.is_some() {
@@ -1036,6 +1049,7 @@ mod tests {
             provider: Some("definitely-not-a-provider".into()),
             model: Some("missing-model".into()),
             session_id: None,
+            append_system_prompt: None,
         })
         .expect("worker starts");
 

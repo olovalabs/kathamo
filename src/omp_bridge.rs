@@ -65,6 +65,7 @@ impl OmpBridge {
         let mut command = Command::new("omp");
         command
             .args(["--mode", "rpc", "--model", &selector])
+            .args(["--append-system-prompt", crate::agent_ui::CATALOG_PROMPT])
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

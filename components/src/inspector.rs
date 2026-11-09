@@ -24,7 +24,7 @@ use crate::{
     v_flex, ActiveTheme, IconName, Selectable, Sizable, TITLE_BAR_HEIGHT,
 };
 
-actions!(inspector, [ToggleInspector]);
+actions!(kinspector, [ToggleInspector]);
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys(vec![

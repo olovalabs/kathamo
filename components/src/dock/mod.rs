@@ -26,7 +26,7 @@ pub(crate) fn init(cx: &mut App) {
     PanelRegistry::init(cx);
 }
 
-actions!(dock, [ToggleZoom, ClosePanel]);
+actions!(kdock, [ToggleZoom, ClosePanel]);
 
 pub enum DockEvent {
 

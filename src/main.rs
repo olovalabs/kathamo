@@ -29,6 +29,7 @@ use terminal::{ColorPalette, ShellEvent, TerminalConfig, TerminalView};
 mod agent_auth;
 mod agent_bridge;
 mod agent_rules;
+mod agent_ui;
 mod assets;
 mod attachments;
 mod attention;
@@ -2757,7 +2758,7 @@ impl AppState {
         self.default_agent_model = self.settings.default_agent_model.clone();
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
         self.palette = load_palette(self.palette_scheme, mode.is_dark());
-        gpui_component::Theme::change(mode, None, cx);
+        theme::apply_component_theme(mode, None, cx);
         sync_component_fonts(cx);
 
         let RestoreData {
@@ -3087,7 +3088,7 @@ impl AppState {
         let mode = self.theme_preference.resolve_mode(appearance);
         let is_dark = mode.is_dark();
         self.palette = load_palette(self.palette_scheme, is_dark);
-        gpui_component::Theme::change(mode, window, cx);
+        theme::apply_component_theme(mode, window, cx);
         sync_component_fonts(cx);
 
         for project in &mut self.projects {
@@ -6355,6 +6356,24 @@ impl AppState {
         session.title = SharedString::from(title);
         session.display_title = truncate_title(&session.title);
         self.mark_dirty(cx);
+    }
+
+    /// Send a prompt from an AI-rendered UI action button.
+    fn submit_ui_action(
+        &mut self,
+        pane_id: usize,
+        action: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(input) = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.input_state.clone())
+        else {
+            return;
+        };
+        input.update(cx, |state, cx| state.set_value(action, window, cx));
+        self.submit_agent_prompt(pane_id, window, cx);
     }
 
     fn submit_agent_prompt(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -10371,19 +10390,20 @@ impl AppState {
                         .map(|view| view.tail.clone())
                         .unwrap_or_else(|| SharedString::from(message.text.as_str()));
                     if !settled.trim().is_empty() {
-                        body = body.child(chat_markdown(
+                        body = body.child(agent_ui::render_assistant_body(
                             id.clone(),
                             settled,
                             px(13.0),
                             rems(0.6),
                             tokens.text_primary,
                             tokens,
+                            pane_id,
                             window,
                             cx,
                         ));
                     }
                     if !tail.is_empty() {
-                        body = body.child(chat_markdown(
+                        body = body.child(agent_ui::render_assistant_body(
                             SharedString::from(format!(
                                 "agent-markdown-{pane_id}-{conversation}-{index}-live"
                             )),
@@ -10392,18 +10412,20 @@ impl AppState {
                             rems(0.6),
                             tokens.text_primary,
                             tokens,
+                            pane_id,
                             window,
                             cx,
                         ));
                     }
                 } else {
-                    body = body.child(chat_markdown(
+                    body = body.child(agent_ui::render_assistant_body(
                         id,
-                        message.text.clone(),
+                        message.text.clone().into(),
                         px(13.0),
                         rems(0.6),
                         tokens.text_primary,
                         tokens,
+                        pane_id,
                         window,
                         cx,
                     ));
@@ -14060,9 +14082,15 @@ fn main() -> Result<()> {
             let load_history = app_settings.restore.agent_history && restore_enabled;
             let window_icon = image::load_from_memory(APP_ICON_PNG).ok().map(|image| Arc::new(image.into_rgba8()));
             gpui_component::init(cx);
+            // Kathamo uses two gpui-component generations: its own 0.5.1 fork
+            // and the 0.9 stack behind gpui-kit. Their action names collide, so
+            // initialize only gpui-kit's theme layer (globals + TextView
+            // defaults) and leave its action-registering inits alone.
+            gpui_kit::component::theme::init(cx);
+            gpui_kit::component::GlobalState::init(cx);
             init_kathamo_input_bindings(cx);
             let initial_mode = app_settings.theme.resolve_mode(cx.window_appearance());
-            gpui_component::Theme::change(initial_mode, None, cx);
+            theme::apply_component_theme(initial_mode, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
 
@@ -14558,8 +14586,10 @@ mod resize_tests {
     pub(crate) fn open_app(cx: &mut TestAppContext) -> (VisualTestContext, Entity<AppState>) {
         cx.update(|cx| {
             gpui_component::init(cx);
+            gpui_kit::component::theme::init(cx);
+            gpui_kit::component::GlobalState::init(cx);
             init_kathamo_input_bindings(cx);
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            theme::apply_component_theme(gpui_component::ThemeMode::Dark, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
         });
@@ -14744,6 +14774,77 @@ mod resize_tests {
             assert_eq!(pane.chat.selected_model.as_ref(), Some(&model));
             assert!(pane.chat.visible_messages().is_empty());
         });
+    }
+
+    #[test]
+    fn ai_ui_fence_renders_gpui_kit_components() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            s.pane_mut(pane_id).unwrap().chat.messages.push(ChatMessage::new(
+                ChatRole::Assistant,
+                r#"Here is the generated card:
+
+```ui
+{"root":"card","elements":{
+ "card":{"type":"Card","props":{"title":"Weekly report","footer":"generated"},"children":["heading","intro","code","divider","tags","alert","progress","check","switch","radio","rating","spinner","skeleton","avatar","icon","kbd","desc","table","list","steps","tabs","crumb","toggle","marker","pagination","bubble","diff","accordion","collapsible","grid","chart","actions"]},
+ "heading":{"type":"Heading","props":{"text":"Weekly report","level":2}},
+ "intro":{"type":"Text","props":{"text":"A **markdown** intro."}},
+ "code":{"type":"Code","props":{"text":"let x = 1;","lang":"rust"}},
+ "divider":{"type":"Divider","props":{"label":"Details"}},
+ "tags":{"type":"Row","props":{"gap":8},"children":["ok","warn"]},
+ "ok":{"type":"Tag","props":{"text":"healthy","tone":"success"}},
+ "warn":{"type":"Tag","props":{"text":"2 warnings","tone":"warning"}},
+ "alert":{"type":"Alert","props":{"tone":"info","title":"Note","message":"Rendered by the model."}},
+ "progress":{"type":"Progress","props":{"value":72,"label":"Coverage"}},
+ "check":{"type":"Checkbox","props":{"label":"Include archived","checked":true}},
+ "switch":{"type":"Switch","props":{"label":"Live updates","checked":false}},
+ "radio":{"type":"RadioGroup","props":{"options":["Daily","Weekly"],"selected":1}},
+ "rating":{"type":"Rating","props":{"value":4,"max":5}},
+ "spinner":{"type":"Spinner","props":{"size":"sm"}},
+ "skeleton":{"type":"Skeleton","props":{"height":12}},
+ "avatar":{"type":"Avatar","props":{"name":"Kathamo"}},
+ "icon":{"type":"Icon","props":{"name":"sparkles","size":"sm"}},
+ "kbd":{"type":"Kbd","props":{"keys":"cmd-k"}},
+ "desc":{"type":"DescriptionList","props":{"items":[{"label":"Owner","value":"platform"},{"label":"Window","value":"7 days"}]}},
+ "table":{"type":"Table","props":{"columns":["Metric","Value"],"rows":[["Users","1204"],["MRR","8200"]]}},
+ "list":{"type":"List","props":{"items":["first","second"],"ordered":true}},
+ "steps":{"type":"Stepper","props":{"steps":["Plan","Build","Ship"],"selected":1}},
+ "tabs":{"type":"Tabs","props":{"tabs":["Overview","Runs","Logs"],"selected":0}},
+ "crumb":{"type":"Breadcrumb","props":{"items":["Project","Reports","Weekly"]}},
+ "toggle":{"type":"Toggle","props":{"label":"Live updates","checked":true}},
+ "marker":{"type":"Marker","props":{"text":"Generated 5 minutes ago"}},
+ "pagination":{"type":"Pagination","props":{"page":2,"total":5}},
+ "bubble":{"type":"Bubble","props":{"text":"A chat bubble.","role":"assistant"}},
+ "diff":{"type":"Diff","props":{"patch":"+ added line\n- removed line"}},
+ "accordion":{"type":"Accordion","props":{"items":[{"title":"Details","content":"Inside the accordion.","open":true}]}},
+ "collapsible":{"type":"Collapsible","props":{"title":"More","content":"Collapsed content."}},
+ "grid":{"type":"Grid","props":{"cols":2,"gap":8},"children":["ok","warn"]},
+ "chart":{"type":"Chart","props":{"kind":"bar","height":120,"data":[{"label":"Mon","value":3},{"label":"Tue","value":5}]}},
+ "actions":{"type":"Row","props":{"gap":8},"children":["refresh"]},
+ "refresh":{"type":"Button","props":{"label":"Refresh","tone":"primary","action":"Refresh the report"}}
+}}
+```
+
+Done."#
+                    .into(),
+            ));
+        });
+        cx.draw_frame().expect("draw an AI-generated UI card");
+        for (preference, is_dark) in [
+            (ThemePreference::Light, false),
+            (ThemePreference::Dark, true),
+        ] {
+            cx.update_window_entity(&state, |s, window, cx| {
+                s.set_theme_preference(preference, Some(window), cx);
+                assert_eq!(s.tokens(cx).is_dark, is_dark);
+                assert_eq!(gpui_kit::component::Theme::global(cx).is_dark(), is_dark);
+            });
+            cx.draw_frame()
+                .expect("redraw the card after a theme change");
+        }
     }
 
     #[test]

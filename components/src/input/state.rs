@@ -32,13 +32,13 @@ use crate::{Root, history::History};
 use crate::{highlighter::DiagnosticSet, input::text_wrapper::LineItem};
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = input, no_json)]
+#[action(namespace = kinput, no_json)]
 pub struct Enter {
     pub secondary: bool,
 }
 
 actions!(
-    input,
+    kinput,
     [
         Backspace,
         Delete,

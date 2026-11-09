@@ -1,7 +1,22 @@
-use gpui::{Hsla, rgba};
+use gpui::{App, Hsla, Window, rgba};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use terminal::ColorPalette;
+
+/// Apply one appearance to the app chrome and generated chat components.
+pub(crate) fn apply_component_theme(
+    mode: gpui_component::ThemeMode,
+    window: Option<&mut Window>,
+    cx: &mut App,
+) {
+    gpui_component::Theme::change(mode, window, cx);
+    let kit_mode = if mode.is_dark() {
+        gpui_kit::component::ThemeMode::Dark
+    } else {
+        gpui_kit::component::ThemeMode::Light
+    };
+    gpui_kit::component::Theme::change(kit_mode, None, cx);
+}
 
 /// Which terminal color palette / block chrome to use.
 ///

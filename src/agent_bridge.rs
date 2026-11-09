@@ -188,7 +188,8 @@ impl EmbeddedBridge {
     ) -> Result<Self, String> {
         let options = SessionOptions::new(cwd)
             .with_selector(model)
-            .with_session(session);
+            .with_session(session)
+            .with_append_system_prompt(crate::agent_ui::CATALOG_PROMPT);
         let spawn_start = std::time::Instant::now();
         let mut session = EmbeddedSession::spawn(options).map_err(|error| {
             format!(

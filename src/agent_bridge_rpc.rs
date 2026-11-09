@@ -126,6 +126,7 @@ impl RpcAgentBridge {
                         let _ = sender.send(Incoming::Closed(Some(format!(
                             "Failed reading rpi output: {e}"
                         ))));
+                        crate::agent_bridge::signal_wake();
                         break;
                     }
                     Ok(_) => {}
@@ -137,6 +138,7 @@ impl RpcAgentBridge {
                         let _ = sender.send(Incoming::Event(AgentEvent::Error(format!(
                             "Invalid rpi RPC output: {e}"
                         ))));
+                        crate::agent_bridge::signal_wake();
                         continue;
                     }
                 };
@@ -161,6 +163,7 @@ impl RpcAgentBridge {
                 }
                 if record["type"] == "extension_ui_request" {
                     handle_extension_ui(&record, &reply_stdin, &sender);
+                    crate::agent_bridge::signal_wake();
                 } else {
                     let project_start = std::time::Instant::now();
                     let decoded = decode_event(&record);

@@ -38,12 +38,7 @@ mod request;
 #[cfg(feature = "providers")]
 pub(crate) const DELTA_FLUSH_BYTES: usize = 64;
 
-/// Longest a delta may sit unemitted.
-///
-/// A pure byte threshold would hide output for `DELTA_FLUSH_BYTES / rate` on a
-/// slow stream (a model emitting one character per 100ms would show nothing for
-/// six seconds). This bounds that: a slow stream flushes on the timer, a fast
-/// one on the byte count. 40ms is under three render frames, so it is
-/// imperceptible.
+/// Flush the first delta immediately. After that, amortize snapshots during
+/// bursts and release a pending batch within half of a 60 Hz frame.
 #[cfg(feature = "providers")]
-pub(crate) const DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+pub(crate) const DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);

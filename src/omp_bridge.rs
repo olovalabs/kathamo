@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 use crate::agent_bridge::{AgentEvent, coalesce_events, decode_message_update, decode_tool_event};
 
 enum Incoming {
-    /// A decoded record. `event` is the projected assistant delta or tool
-    /// lifecycle event, computed on the reader thread so the UI thread only
-    /// has to apply it.
+    /// Assistant deltas need no other fields from the RPC record.
+    Delta(AgentEvent),
+    /// A decoded record with its projected tool lifecycle event, if any.
     Record {
         record: Value,
         event: Option<AgentEvent>,
@@ -111,6 +111,7 @@ impl OmpBridge {
                     Ok(record) => record,
                     Err(_) => {
                         let _ = sender.send(Incoming::Error("Invalid omp RPC output".into()));
+                        crate::agent_bridge::signal_wake();
                         continue;
                     }
                 };
@@ -119,6 +120,15 @@ impl OmpBridge {
                     first_record = false;
                     crate::stream_timing::record_since("engine.omp.first_record", reader_start);
                 }
+                if record["type"] == "message_update" {
+                    if let Some(event) = decode_message_update(&record) {
+                        if sender.send(Incoming::Delta(event)).is_err() {
+                            return;
+                        }
+                        crate::agent_bridge::signal_wake();
+                    }
+                    continue;
+                }
                 if record["type"] == "extension_ui_request" {
                     match record["method"].as_str().unwrap_or("") {
                         "select" | "confirm" | "input" | "editor" | "ask" => {
@@ -126,6 +136,7 @@ impl OmpBridge {
                             let _ = sender.send(Incoming::Error(
                                 "OMP requested an interactive dialog or tool approval, which is not supported in this view; the request was cancelled.".into(),
                             ));
+                            crate::agent_bridge::signal_wake();
                             if let Err(error) = write_command(
                                 &reply_stdin,
                                 &json!({
@@ -133,6 +144,7 @@ impl OmpBridge {
                                 }),
                             ) {
                                 let _ = sender.send(Incoming::Error(error));
+                                crate::agent_bridge::signal_wake();
                             }
                         }
                         "notify" => {
@@ -147,17 +159,15 @@ impl OmpBridge {
                                     }
                                 };
                                 let _ = sender.send(event);
+                                crate::agent_bridge::signal_wake();
                             }
                         }
                         _ => {}
                     }
                 } else {
-                    // Project the two hot record kinds here rather than on the
-                    // UI thread. Tool payloads can be large, and this commonly
-                    // runs many times per frame during a burst.
+                    // Project tool payloads on the reader thread.
                     let project_start = std::time::Instant::now();
                     let event = match record["type"].as_str().unwrap_or("") {
-                        "message_update" => decode_message_update(&record),
                         "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
                             decode_tool_event(&record)
                         }
@@ -303,6 +313,7 @@ impl OmpBridge {
         while let Ok(incoming) = self.events.try_recv() {
             match incoming {
                 Incoming::Error(error) => events.push(AgentEvent::Error(error)),
+                Incoming::Delta(event) => events.push(event),
                 Incoming::TitleRead(title) => {
                     self.title_read_in_flight = false;
                     if let Some(title) = title
@@ -474,11 +485,6 @@ impl OmpBridge {
                     .and_then(|id| self.live_workers.get_mut(id))
                 {
                     self.worker_changed |= worker.apply(&payload["event"]);
-                }
-            }
-            "message_update" => {
-                if let Some(event) = event {
-                    events.push(event);
                 }
             }
             "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {

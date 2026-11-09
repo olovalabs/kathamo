@@ -136,15 +136,14 @@ fn write_line(
         }
         open.written = 0;
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     if open.file.is_none() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         open.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
     }
     if let Some(file) = open.file.as_mut() {
         file.write_all(line)?;
-        file.flush()?;
     }
     open.written += line.len() as u64;
     Ok(())
@@ -160,7 +159,7 @@ pub enum Entry {
 
 /// One append-only conversation file.
 ///
-/// Appending only serializes the entry and enqueues it; the writer thread owns
+/// Appending enqueues an owned entry; the writer thread owns serialization,
 /// directory creation, rotation and the file handle. The format and rotation
 /// policy are unchanged, so replay reads exactly what earlier versions wrote.
 pub struct Log {

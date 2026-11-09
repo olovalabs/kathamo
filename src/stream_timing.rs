@@ -17,7 +17,7 @@
 //! - `markdown.*`     initial and update parses (components crate)
 //! - `tool.*`         RPC arrival → UI apply / first card / first output
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -122,16 +122,13 @@ fn report() {
 }
 
 struct ToolTrace {
-    arrivals: Mutex<HashMap<String, Instant>>,
-    cards: Mutex<HashSet<String>>,
-    outputs: Mutex<HashSet<String>>,
+    arrived: Instant,
+    card_painted: bool,
+    output_painted: bool,
 }
 
-static TOOLS: LazyLock<ToolTrace> = LazyLock::new(|| ToolTrace {
-    arrivals: Mutex::new(HashMap::new()),
-    cards: Mutex::new(HashSet::new()),
-    outputs: Mutex::new(HashSet::new()),
-});
+static TOOLS: LazyLock<Mutex<HashMap<String, ToolTrace>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|error| error.into_inner())
@@ -142,13 +139,18 @@ pub fn tool_arrived(id: &str) {
     if !enabled() {
         return;
     }
-    let mut arrivals = lock(&TOOLS.arrivals);
-    if arrivals.len() >= MAX_TRACKED_TOOLS {
-        arrivals.clear();
-        lock(&TOOLS.cards).clear();
-        lock(&TOOLS.outputs).clear();
+    let mut tools = lock(&TOOLS);
+    if tools.len() >= MAX_TRACKED_TOOLS {
+        tools.clear();
     }
-    arrivals.insert(id.to_string(), Instant::now());
+    tools.insert(
+        id.to_owned(),
+        ToolTrace {
+            arrived: Instant::now(),
+            card_painted: false,
+            output_painted: false,
+        },
+    );
 }
 
 /// RPC arrival → the event was applied to the visible transcript.
@@ -156,32 +158,36 @@ pub fn tool_applied(id: &str) {
     if !enabled() {
         return;
     }
-    if let Some(start) = lock(&TOOLS.arrivals).get(id).copied() {
-        record("tool.arrival_to_apply", start.elapsed());
+    let arrived = lock(&TOOLS).get(id).map(|trace| trace.arrived);
+    if let Some(arrived) = arrived {
+        record_since("tool.arrival_to_apply", arrived);
     }
 }
 
 /// RPC arrival → the tool card first entered a frame.
 pub fn tool_card_painted(id: &str) {
-    if !enabled() {
-        return;
-    }
-    let first = lock(&TOOLS.cards).insert(id.to_string());
-    if first && let Some(start) = lock(&TOOLS.arrivals).get(id).copied() {
-        record("tool.arrival_to_card", start.elapsed());
-    }
+    tool_painted(id, "tool.arrival_to_card", |trace| &mut trace.card_painted);
 }
 
 /// RPC arrival → the first non-empty output entered a frame.
 pub fn tool_output_painted(id: &str) {
+    tool_painted(id, "tool.arrival_to_output", |trace| {
+        &mut trace.output_painted
+    });
+}
+
+fn tool_painted(id: &str, label: &'static str, flag: impl FnOnce(&mut ToolTrace) -> &mut bool) {
     if !enabled() {
         return;
     }
-    let first = lock(&TOOLS.outputs).insert(id.to_string());
-    if first && let Some(start) = lock(&TOOLS.arrivals).get(id).copied() {
-        record("tool.arrival_to_output", start.elapsed());
-        lock(&TOOLS.cards).remove(id);
-        lock(&TOOLS.outputs).remove(id);
-        lock(&TOOLS.arrivals).remove(id);
+    let arrived = lock(&TOOLS).get_mut(id).and_then(|trace| {
+        if std::mem::replace(flag(trace), true) {
+            None
+        } else {
+            Some(trace.arrived)
+        }
+    });
+    if let Some(arrived) = arrived {
+        record_since(label, arrived);
     }
 }

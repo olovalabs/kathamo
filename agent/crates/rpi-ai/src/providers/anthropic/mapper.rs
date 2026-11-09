@@ -87,7 +87,7 @@ pub struct MapperState {
     pending_tool: String,
     pending_tool_index: Option<usize>,
     /// When a batched delta was last emitted, for [`DELTA_FLUSH_INTERVAL`].
-    last_flush: std::time::Instant,
+    last_flush: Option<tokio::time::Instant>,
 }
 
 impl MapperState {
@@ -110,14 +110,28 @@ impl MapperState {
             pending_thinking_index: None,
             pending_tool: String::new(),
             pending_tool_index: None,
-            last_flush: std::time::Instant::now(),
+            last_flush: None,
         }
     }
 
     /// Whether a pending batch should be emitted now: past the byte threshold,
     /// or older than the flush interval.
     fn should_flush(&self, pending: &str) -> bool {
-        pending.len() >= DELTA_FLUSH_BYTES || self.last_flush.elapsed() >= DELTA_FLUSH_INTERVAL
+        pending.len() >= DELTA_FLUSH_BYTES
+            || self
+                .last_flush
+                .is_none_or(|last| last.elapsed() >= DELTA_FLUSH_INTERVAL)
+    }
+
+    fn flush_deadline(&self) -> Option<tokio::time::Instant> {
+        if !self.pending_text.is_empty()
+            || !self.pending_thinking.is_empty()
+            || !self.pending_tool.is_empty()
+        {
+            self.last_flush.map(|last| last + DELTA_FLUSH_INTERVAL)
+        } else {
+            None
+        }
     }
 
     /// Emit whatever text/thinking is batched. Called at every block boundary
@@ -138,7 +152,7 @@ impl MapperState {
             return;
         };
         let delta = std::mem::take(&mut self.pending_text);
-        self.last_flush = std::time::Instant::now();
+        self.last_flush = Some(tokio::time::Instant::now());
         prod.push(AssistantMessageEvent::TextDelta {
             content_index,
             delta,
@@ -156,7 +170,7 @@ impl MapperState {
             return;
         };
         let delta = std::mem::take(&mut self.pending_thinking);
-        self.last_flush = std::time::Instant::now();
+        self.last_flush = Some(tokio::time::Instant::now());
         prod.push(AssistantMessageEvent::ThinkingDelta {
             content_index,
             delta,
@@ -187,7 +201,7 @@ impl MapperState {
         if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index) {
             slot.arguments = arguments;
         }
-        self.last_flush = std::time::Instant::now();
+        self.last_flush = Some(tokio::time::Instant::now());
         prod.push(AssistantMessageEvent::ToolCallDelta {
             content_index,
             delta,
@@ -536,9 +550,11 @@ impl MapperState {
                 // A tool-call block is a new channel; flush what is batched so
                 // the consumer never sees tool events before the text that
                 // preceded them.
-                // Flush the previous channel's tail (including any earlier
-                // tool-call checkpoint) before appending this delta.
-                self.flush_pending(prod).await;
+                self.flush_text(prod).await;
+                self.flush_thinking(prod).await;
+                if self.pending_tool_index != Some(content_index) {
+                    self.flush_tool(prod).await;
+                }
                 self.blocks[scratch_index].partial_json.push_str(&partial);
                 self.pending_tool_index = Some(content_index);
                 self.pending_tool.push_str(&partial);
@@ -821,10 +837,14 @@ async fn run_mapper_impl<F>(
 {
     loop {
         let pull_started = diagnostics.is_some().then(Instant::now);
-        let next = stream.next_event().await;
+        let next = stream.next_event_before(state.flush_deadline()).await;
         if let Some(diagnostics) = diagnostics.as_deref_mut() {
             diagnostics.pull_ns += elapsed_ns(pull_started);
         }
+        let Some(next) = next else {
+            state.flush_pending(prod).await;
+            continue;
+        };
         match next {
             Ok(None) => break,
             Ok(Some(sse_frame)) => {

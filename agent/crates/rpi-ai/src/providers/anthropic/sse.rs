@@ -273,6 +273,22 @@ impl SseEventStream {
         event.map(|event| self.record_diagnostic_event(event))
     }
 
+    /// Return `None` when the mapper's pending delta must be flushed. All
+    /// partial input is kept in the stream, so the next read can resume it.
+    pub(crate) async fn next_event_before(
+        &mut self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Option<Result<Option<ServerSentEvent>, AiError>> {
+        match deadline {
+            Some(deadline) => tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => None,
+                next = self.next_event() => Some(next),
+            },
+            None => Some(self.next_event().await),
+        }
+    }
+
     /// Pull the next SSE event, or `Ok(None)` when the body is exhausted (after
     /// the trailing flush). Mirrors one iteration of `iterateSseMessages`.
     pub async fn next_event(&mut self) -> Result<Option<ServerSentEvent>, AiError> {
@@ -650,6 +666,16 @@ mod tests {
             assert!(stream.next_event().await.unwrap().is_none());
             writer.await.unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delta_deadline_preserves_partial_sse_frame() {
+        let (sender, mut stream) = idle_test_stream();
+        sender.send(Bytes::from_static(b"data: par")).await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(8);
+        assert!(stream.next_event_before(Some(deadline)).await.is_none());
+        sender.send(Bytes::from_static(b"tial\n\n")).await.unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "partial");
     }
 
     #[tokio::test(start_paused = true)]

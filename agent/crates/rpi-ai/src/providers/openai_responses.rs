@@ -216,7 +216,7 @@ struct ResponsesStreamState {
     pending_thinking: String,
     pending_thinking_index: Option<usize>,
     /// When a batched delta was last emitted, for [`DELTA_FLUSH_INTERVAL`].
-    last_flush: std::time::Instant,
+    last_flush: Option<tokio::time::Instant>,
 }
 
 impl Default for ResponsesStreamState {
@@ -233,7 +233,7 @@ impl Default for ResponsesStreamState {
             pending_text_index: None,
             pending_thinking: String::new(),
             pending_thinking_index: None,
-            last_flush: std::time::Instant::now(),
+            last_flush: None,
         }
     }
 }
@@ -249,7 +249,18 @@ impl ResponsesStreamState {
     /// Whether a pending batch should be emitted now: past the byte threshold,
     /// or older than the flush interval.
     fn should_flush(&self, pending: &str) -> bool {
-        pending.len() >= DELTA_FLUSH_BYTES || self.last_flush.elapsed() >= DELTA_FLUSH_INTERVAL
+        pending.len() >= DELTA_FLUSH_BYTES
+            || self
+                .last_flush
+                .is_none_or(|last| last.elapsed() >= DELTA_FLUSH_INTERVAL)
+    }
+
+    fn flush_deadline(&self) -> Option<tokio::time::Instant> {
+        if !self.pending_text.is_empty() || !self.pending_thinking.is_empty() {
+            self.last_flush.map(|last| last + DELTA_FLUSH_INTERVAL)
+        } else {
+            None
+        }
     }
 
     /// Emit whatever text/thinking is batched. Called at every item boundary
@@ -278,7 +289,7 @@ impl ResponsesStreamState {
             return;
         };
         let delta = std::mem::take(&mut self.pending_text);
-        self.last_flush = std::time::Instant::now();
+        self.last_flush = Some(tokio::time::Instant::now());
         p.push(AssistantMessageEvent::TextDelta {
             content_index,
             delta,
@@ -300,7 +311,7 @@ impl ResponsesStreamState {
             return;
         };
         let delta = std::mem::take(&mut self.pending_thinking);
-        self.last_flush = std::time::Instant::now();
+        self.last_flush = Some(tokio::time::Instant::now());
         p.push(AssistantMessageEvent::ThinkingDelta {
             content_index,
             delta,
@@ -1280,7 +1291,11 @@ async fn run_stream(
     })
     .await;
     loop {
-        match events.next_event().await {
+        let Some(next) = events.next_event_before(state.flush_deadline()).await else {
+            state.flush_pending(&mut out, p).await;
+            continue;
+        };
+        match next {
             Ok(Some(ev)) => {
                 // A few OpenAI-compatible gateways still terminate with the
                 // Chat Completions-style `[DONE]` sentinel.  Treat it as a

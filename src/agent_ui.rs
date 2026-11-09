@@ -8,8 +8,9 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, Context, Hsla, IntoElement, OperatingSystem, ParentElement, Pixels, Rems,
-    SharedString, Styled, Window, div, prelude::FluentBuilder, px, relative,
+    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, OperatingSystem,
+    ParentElement, Pixels, Rems, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
+    relative,
 };
 use gpui_kit::component::{
     Disableable as _, Icon, IconName, Sizable as _, Size,
@@ -70,6 +71,9 @@ Rules:
 - A node is `{"type": "...", "props": {...}, "children": ["id", ...]}`.
 - Only the component types listed below are allowed. Unknown types render an
   error chip. Prefer 1-3 cards per answer, not the whole conversation.
+- Checkbox, Switch, Toggle, RadioGroup, Rating, Tabs, Stepper, Pagination,
+  Accordion and Collapsible keep their own state when the reader clicks them.
+  Button only acts when `action` is set; that text is sent as the next prompt.
 - Use `children` for nesting. Keep ids short and unique within the block.
 - Do not put HTML, CSS, or scripts in any prop.
 - Text props accept Markdown unless stated otherwise.
@@ -121,6 +125,14 @@ globe, github, user, loader."#;
 pub(crate) enum Segment<'a> {
     Markdown(&'a str),
     Ui { raw: &'a str, closed: bool },
+}
+
+/// Host-owned state for one interactive element in a rendered card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UiStateValue {
+    Bool(bool),
+    Index(usize),
+    Indices(Vec<usize>),
 }
 
 /// Split assistant text into Markdown and `ui` code fences.
@@ -246,30 +258,97 @@ struct UiCtx<'a> {
     id_prefix: &'a str,
     pane_id: usize,
     tokens: ThemeTokens,
+    state: Option<&'a HashMap<String, UiStateValue>>,
+}
+
+fn state_key(ctx: &UiCtx, id: &str) -> String {
+    format!("{}-{id}", ctx.id_prefix)
+}
+
+fn state_bool(ctx: &UiCtx, key: &str, default: bool) -> bool {
+    match ctx.state.and_then(|state| state.get(key)) {
+        Some(UiStateValue::Bool(value)) => *value,
+        _ => default,
+    }
+}
+
+fn state_index(ctx: &UiCtx, key: &str, default: usize) -> usize {
+    match ctx.state.and_then(|state| state.get(key)) {
+        Some(UiStateValue::Index(value)) => *value,
+        _ => default,
+    }
+}
+
+fn state_indices(ctx: &UiCtx, key: &str, default: Vec<usize>) -> Vec<usize> {
+    match ctx.state.and_then(|state| state.get(key)) {
+        Some(UiStateValue::Indices(value)) => value.clone(),
+        _ => default,
+    }
+}
+
+enum PreparedSegment {
+    Markdown(SharedString),
+    PendingUi,
+    Ui(Result<UiSpec, (String, SharedString)>),
+}
+
+#[derive(Default)]
+struct AssistantBody {
+    source: SharedString,
+    segments: std::sync::Arc<Vec<Option<PreparedSegment>>>,
+}
+
+impl AssistantBody {
+    fn prepare(&mut self, text: &str) {
+        self.segments = std::sync::Arc::new(
+            split_ui_segments(text)
+                .into_iter()
+                .map(|segment| match segment {
+                    Segment::Markdown(markdown) if !markdown.trim().is_empty() => {
+                        Some(PreparedSegment::Markdown(SharedString::from(markdown)))
+                    }
+                    Segment::Ui { closed: false, .. } => Some(PreparedSegment::PendingUi),
+                    Segment::Ui { raw, closed: true } => Some(PreparedSegment::Ui(
+                        parse_spec(raw).map_err(|error| (error, SharedString::from(raw))),
+                    )),
+                    _ => None,
+                })
+                .collect(),
+        );
+        self.source = SharedString::from(text);
+    }
 }
 
 /// Render an assistant message body, replacing ` ```ui ` fences with cards.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_assistant_body(
     id: SharedString,
-    text: SharedString,
+    text: &str,
     base: Pixels,
     paragraph_gap: Rems,
     color: Hsla,
     tokens: ThemeTokens,
     pane_id: usize,
+    state: Option<&HashMap<String, UiStateValue>>,
     window: &mut Window,
     cx: &mut Context<AppState>,
 ) -> AnyElement {
+    let body = window.use_keyed_state(
+        SharedString::from(format!("{id}-assistant-body")),
+        cx,
+        |_, _| AssistantBody::default(),
+    );
+    if body.read(cx).source.as_ref() != text {
+        body.update(cx, |body, _| body.prepare(text));
+    }
+    let segments = body.read(cx).segments.clone();
     let mut column = div().w_full().min_w_0().flex().flex_col().gap(px(8.0));
-    let mut any = false;
-    for (ix, segment) in split_ui_segments(text.as_ref()).into_iter().enumerate() {
+    for (ix, segment) in segments.iter().enumerate() {
         match segment {
-            Segment::Markdown(markdown) if !markdown.trim().is_empty() => {
-                any = true;
+            Some(PreparedSegment::Markdown(markdown)) => {
                 column = column.child(crate::chat_markdown(
                     SharedString::from(format!("{id}-md-{ix}")),
-                    SharedString::from(markdown),
+                    markdown.clone(),
                     base,
                     paragraph_gap,
                     color,
@@ -278,36 +357,34 @@ pub(crate) fn render_assistant_body(
                     cx,
                 ));
             }
-            Segment::Ui { raw, closed } => {
-                any = true;
+            Some(segment) => {
                 column = column.child(render_ui_block(
                     SharedString::from(format!("{id}-ui-{ix}")),
-                    raw,
-                    closed,
+                    segment,
                     tokens,
                     pane_id,
+                    state,
                     cx,
                 ));
             }
-            _ => {}
+            None => {}
         }
-    }
-    if !any {
-        return div().into_any_element();
     }
     column.into_any_element()
 }
 
 fn render_ui_block(
     id: SharedString,
-    raw: &str,
-    closed: bool,
+    segment: &PreparedSegment,
     tokens: ThemeTokens,
     pane_id: usize,
+    state: Option<&HashMap<String, UiStateValue>>,
     cx: &mut Context<AppState>,
 ) -> AnyElement {
+    let debug_id = id.clone();
     let chrome = |inner: AnyElement| {
         div()
+            .debug_selector(move || format!("ai-ui-block-{debug_id}"))
             .w_full()
             .min_w_0()
             .rounded(px(10.0))
@@ -319,7 +396,7 @@ fn render_ui_block(
             .into_any_element()
     };
 
-    if !closed {
+    let PreparedSegment::Ui(spec) = segment else {
         return chrome(
             div()
                 .flex()
@@ -331,20 +408,21 @@ fn render_ui_block(
                 .child("Rendering UI…")
                 .into_any_element(),
         );
-    }
+    };
 
-    match parse_spec(raw) {
+    match spec {
         Ok(spec) => {
             let ctx = UiCtx {
-                spec: &spec,
+                spec,
                 id_prefix: id.as_ref(),
                 pane_id,
                 tokens,
+                state,
             };
             let content = render_node(&ctx, &spec.root, 0, cx);
             chrome(content)
         }
-        Err(error) => chrome(
+        Err((error, raw)) => chrome(
             div()
                 .flex()
                 .flex_col()
@@ -361,7 +439,7 @@ fn render_ui_block(
                         .font_family(MONO_FONT)
                         .text_size(px(11.0))
                         .text_color(tokens.text_muted)
-                        .child(raw.to_string()),
+                        .child(raw.clone()),
                 )
                 .into_any_element(),
         ),
@@ -521,6 +599,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
     }
 
     let element_id = SharedString::from(format!("{}-{}", ctx.id_prefix, id));
+    let node_key = state_key(ctx, id);
     let props = &node.props;
     let tokens = ctx.tokens;
 
@@ -849,42 +928,130 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
             }
             button.into_any_element()
         }
-        "checkbox" => Checkbox::new(element_id)
-            .label(prop_str(props, "label").unwrap_or_default())
-            .checked(prop_bool(props, "checked").unwrap_or(false))
-            .with_size(size_from(props))
-            .into_any_element(),
-        "switch" => Switch::new(element_id)
-            .label(prop_str(props, "label").unwrap_or_default())
-            .checked(prop_bool(props, "checked").unwrap_or(false))
-            .with_size(size_from(props))
-            .into_any_element(),
+        "checkbox" => {
+            let checked = state_bool(ctx, &node_key, prop_bool(props, "checked").unwrap_or(false));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            Checkbox::new(element_id)
+                .label(prop_str(props, "label").unwrap_or_default())
+                .checked(checked)
+                .with_size(size_from(props))
+                .on_change(
+                    cx.listener(move |this: &mut AppState, value: &bool, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Bool(*value),
+                            cx,
+                        );
+                    }),
+                )
+                .into_any_element()
+        }
+        "switch" => {
+            let checked = state_bool(ctx, &node_key, prop_bool(props, "checked").unwrap_or(false));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            Switch::new(element_id)
+                .label(prop_str(props, "label").unwrap_or_default())
+                .checked(checked)
+                .with_size(size_from(props))
+                .on_change(
+                    cx.listener(move |this: &mut AppState, value: &bool, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Bool(*value),
+                            cx,
+                        );
+                    }),
+                )
+                .into_any_element()
+        }
         "radiogroup" | "radio-group" => {
+            let selected = state_index(ctx, &node_key, prop_usize(props, "selected").unwrap_or(0));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
             let mut group = RadioGroup::new(element_id)
                 .children(prop_strings(props, "options"))
-                .selected_index(prop_usize(props, "selected"));
+                .selected_index(Some(selected))
+                .on_change(
+                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Index(*value),
+                            cx,
+                        );
+                    }),
+                );
             if prop_bool(props, "horizontal").unwrap_or(false) {
                 group = group.layout(gpui::Axis::Horizontal);
             }
             group.into_any_element()
         }
-        "rating" => Rating::new(element_id)
-            .value(prop_usize(props, "value").unwrap_or(0))
-            .max(prop_usize(props, "max").unwrap_or(5))
-            .into_any_element(),
-        "toggle" => Toggle::new(element_id)
-            .label(prop_str(props, "label").unwrap_or_default())
-            .checked(prop_bool(props, "checked").unwrap_or(false))
-            .with_size(size_from(props))
-            .into_any_element(),
-        "tabs" => TabBar::new(element_id)
-            .children(
-                prop_strings(props, "tabs")
-                    .into_iter()
-                    .map(|label| Tab::new().label(label)),
-            )
-            .selected_index(prop_usize(props, "selected").unwrap_or(0))
-            .into_any_element(),
+        "rating" => {
+            let value = state_index(ctx, &node_key, prop_usize(props, "value").unwrap_or(0));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            Rating::new(element_id)
+                .value(value)
+                .max(prop_usize(props, "max").unwrap_or(5))
+                .on_click(
+                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Index(*value),
+                            cx,
+                        );
+                    }),
+                )
+                .into_any_element()
+        }
+        "toggle" => {
+            let checked = state_bool(ctx, &node_key, prop_bool(props, "checked").unwrap_or(false));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            Toggle::new(element_id)
+                .label(prop_str(props, "label").unwrap_or_default())
+                .checked(checked)
+                .with_size(size_from(props))
+                .on_click(
+                    cx.listener(move |this: &mut AppState, value: &bool, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Bool(*value),
+                            cx,
+                        );
+                    }),
+                )
+                .into_any_element()
+        }
+        "tabs" => {
+            let selected = state_index(ctx, &node_key, prop_usize(props, "selected").unwrap_or(0));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            TabBar::new(element_id)
+                .children(
+                    prop_strings(props, "tabs")
+                        .into_iter()
+                        .map(|label| Tab::new().label(label)),
+                )
+                .selected_index(selected)
+                .on_click(
+                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Index(*value),
+                            cx,
+                        );
+                    }),
+                )
+                .into_any_element()
+        }
         "breadcrumb" => Breadcrumb::new()
             .children(
                 prop_strings(props, "items")
@@ -895,23 +1062,62 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
         "marker" => Marker::new()
             .content(MarkerContent::new().text(prop_str(props, "text").unwrap_or_default()))
             .into_any_element(),
-        "stepper" => Stepper::new(element_id)
-            .items(
-                prop_strings(props, "steps")
-                    .into_iter()
-                    .map(|step| StepperItem::new().child(step)),
-            )
-            .selected_index(prop_usize(props, "selected").unwrap_or(0))
-            .into_any_element(),
+        "stepper" => {
+            let selected = state_index(ctx, &node_key, prop_usize(props, "selected").unwrap_or(0));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            Stepper::new(element_id)
+                .items(
+                    prop_strings(props, "steps")
+                        .into_iter()
+                        .map(|step| StepperItem::new().child(step)),
+                )
+                .selected_index(selected)
+                .on_click(
+                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Index(*value),
+                            cx,
+                        );
+                    }),
+                )
+                .into_any_element()
+        }
         "accordion" => {
             let items = props
                 .get("items")
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            let default_open: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    item.get("open")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .map(|(ix, _)| ix)
+                .collect();
+            let open_indices = state_indices(ctx, &node_key, default_open);
             let multiple = prop_bool(props, "multiple").unwrap_or(false);
-            let mut accordion = Accordion::new(element_id).multiple(multiple);
-            for item in items {
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            let mut accordion = Accordion::new(element_id)
+                .multiple(multiple)
+                .on_toggle_click(cx.listener(
+                    move |this: &mut AppState, indices: &[usize], _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Indices(indices.to_vec()),
+                            cx,
+                        );
+                    },
+                ));
+            for (ix, item) in items.iter().enumerate() {
                 let title = item
                     .get("title")
                     .and_then(serde_json::Value::as_str)
@@ -922,10 +1128,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_owned();
-                let open = item
-                    .get("open")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
+                let open = open_indices.contains(&ix);
                 accordion = accordion.item(|entry| {
                     entry.title(title).open(open).child(
                         div()
@@ -940,8 +1143,24 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
         "collapsible" => {
             let title = prop_str(props, "title").unwrap_or_else(|| "Details".into());
             let content = prop_str(props, "content").unwrap_or_default();
-            let open = prop_bool(props, "open").unwrap_or(false);
+            let default_open = prop_bool(props, "open")
+                .unwrap_or(false)
+                .then_some(vec![0])
+                .unwrap_or_default();
+            let open = state_indices(ctx, &node_key, default_open).contains(&0);
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
             Accordion::new(element_id)
+                .on_toggle_click(cx.listener(
+                    move |this: &mut AppState, indices: &[usize], _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Indices(indices.to_vec()),
+                            cx,
+                        );
+                    },
+                ))
                 .item(|entry| {
                     entry.title(title).open(open).child(
                         div()
@@ -952,10 +1171,25 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 })
                 .into_any_element()
         }
-        "pagination" => gpui_kit::component::pagination::Pagination::new(element_id)
-            .current_page(prop_usize(props, "page").unwrap_or(1))
-            .total_pages(prop_usize(props, "total").unwrap_or(1))
-            .into_any_element(),
+        "pagination" => {
+            let page = state_index(ctx, &node_key, prop_usize(props, "page").unwrap_or(1));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            gpui_kit::component::pagination::Pagination::new(element_id)
+                .current_page(page)
+                .total_pages(prop_usize(props, "total").unwrap_or(1))
+                .on_click(
+                    cx.listener(move |this: &mut AppState, page: &usize, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Index(*page),
+                            cx,
+                        );
+                    }),
+                )
+                .into_any_element()
+        }
         "chart" => render_chart(ctx, props, element_id),
         "list" => {
             let ordered = prop_bool(props, "ordered").unwrap_or(false);

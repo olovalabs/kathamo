@@ -1884,6 +1884,8 @@ struct PaneChat {
     rpi_session_id: Option<String>,
     conversation: Option<conversations::Log>,
     startup_error: Option<String>,
+    /// Values of controls inside AI-rendered cards, keyed by card element id.
+    ui_state: HashMap<String, agent_ui::UiStateValue>,
 }
 
 impl Default for PaneChat {
@@ -1911,6 +1913,7 @@ impl Default for PaneChat {
             rpi_session_id: None,
             conversation: None,
             startup_error: None,
+            ui_state: HashMap::new(),
         }
     }
 }
@@ -6154,9 +6157,6 @@ impl AppState {
                                     }
                                 }
                             }
-                            if pane.chat.selected_model.is_none() && pane.chat.autoscroll {
-                                pane.chat.scroll.scroll_to_bottom();
-                            }
                             match event {
                                 agent_bridge::AgentEvent::Done => {
                                     pane.chat.running = false;
@@ -6225,11 +6225,6 @@ impl AppState {
                                             log.append_event(&event);
                                         }
                                     }
-                                }
-                                if pane.chat.selected_model.as_ref() == Some(model)
-                                    && pane.chat.autoscroll
-                                {
-                                    pane.chat.scroll.scroll_to_bottom();
                                 }
                                 match event {
                                     agent_bridge::AgentEvent::Done => {
@@ -6356,6 +6351,20 @@ impl AppState {
         session.title = SharedString::from(title);
         session.display_title = truncate_title(&session.title);
         self.mark_dirty(cx);
+    }
+
+    /// Store the new value of an interactive control inside an AI card.
+    fn set_ui_state(
+        &mut self,
+        pane_id: usize,
+        key: String,
+        value: agent_ui::UiStateValue,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            pane.chat.ui_state.insert(key, value);
+            cx.notify();
+        }
     }
 
     /// Send a prompt from an AI-rendered UI action button.
@@ -10375,21 +10384,15 @@ impl AppState {
                     .line_height(relative(1.9))
                     .text_color(tokens.text_primary);
 
+                let ui_state = self.pane_ref(pane_id).map(|pane| &pane.chat.ui_state);
                 if message.streaming {
-                    // The split was computed when the delta arrived, so a frame
-                    // only clones the two cached slices. Only the live tail is
-                    // re-parsed per token; settled blocks stay cached.
-                    let settled = message
+                    let (settled, tail) = message
                         .stream
                         .as_ref()
-                        .map(|view| view.settled.clone())
-                        .unwrap_or_else(|| SharedString::from(""));
-                    let tail = message
-                        .stream
-                        .as_ref()
-                        .map(|view| view.tail.clone())
-                        .unwrap_or_else(|| SharedString::from(message.text.as_str()));
-                    if !settled.trim().is_empty() {
+                        .map_or(("", message.text.as_str()), |view| {
+                            (view.settled.as_ref(), view.tail.as_ref())
+                        });
+                    if !settled.is_empty() {
                         body = body.child(agent_ui::render_assistant_body(
                             id.clone(),
                             settled,
@@ -10398,6 +10401,7 @@ impl AppState {
                             tokens.text_primary,
                             tokens,
                             pane_id,
+                            ui_state,
                             window,
                             cx,
                         ));
@@ -10413,6 +10417,7 @@ impl AppState {
                             tokens.text_primary,
                             tokens,
                             pane_id,
+                            ui_state,
                             window,
                             cx,
                         ));
@@ -10420,12 +10425,13 @@ impl AppState {
                 } else {
                     body = body.child(agent_ui::render_assistant_body(
                         id,
-                        message.text.clone().into(),
+                        &message.text,
                         px(13.0),
                         rems(0.6),
                         tokens.text_primary,
                         tokens,
                         pane_id,
+                        ui_state,
                         window,
                         cx,
                     ));
@@ -14294,7 +14300,10 @@ fn main() -> Result<()> {
                                 cx.background_executor()
                                     .timer(std::time::Duration::from_millis(interval))
                                     .await;
-                                if tick_tx.try_send(()).is_err() {
+                                if matches!(
+                                    tick_tx.try_send(()),
+                                    Err(smol::channel::TrySendError::Closed(()))
+                                ) {
                                     break;
                                 }
                             }
@@ -14307,9 +14316,8 @@ fn main() -> Result<()> {
                             if wake_rx.recv().await.is_err() {
                                 break;
                             }
-                            // Coalesce a burst into one drain: every queued event
-                            // is visible to the poll below.
-                            while wake_rx.try_recv().is_ok() {}
+                            // The capacity-one channel coalesces pending wakes.
+                            // Leave any new wake queued while applying this batch.
                             match agent_state_weak
                                 .update(cx, |state, cx| state.poll_agent_events(cx))
                             {
@@ -14845,6 +14853,43 @@ Done."#
             cx.draw_frame()
                 .expect("redraw the card after a theme change");
         }
+    }
+
+    #[test]
+    fn ai_ui_checkbox_toggles_on_click() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            s.pane_mut(pane_id)
+                .unwrap()
+                .chat
+                .messages
+                .push(ChatMessage::new(
+                    ChatRole::Assistant,
+                    "```ui\n{\"root\":\"check\",\"elements\":{\"check\":{\"type\":\"Checkbox\",\"props\":{\"label\":\"Toggle me\",\"checked\":false}}}}\n```".into(),
+                ));
+        });
+        cx.draw_frame().expect("draw checkbox card");
+        let card = format!("agent-markdown-{pane_id}-None-0-ui-0");
+        let selector: &'static str = Box::leak(format!("ai-ui-block-{card}").into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect("card bounds");
+        let click = point(
+            bounds.origin.x + px(20.0),
+            bounds.origin.y + bounds.size.height / 2.0,
+        );
+        cx.simulate_mouse_move(click, None, Modifiers::default());
+        cx.simulate_click(click, Modifiers::default());
+        cx.draw_frame().expect("draw toggled card");
+        state.read_with(&cx, |s, _| {
+            let pane = s.pane_ref(pane_id).unwrap();
+            assert_eq!(
+                pane.chat.ui_state.get(&format!("{card}-check")),
+                Some(&agent_ui::UiStateValue::Bool(true)),
+                "clicking an AI-rendered checkbox must update pane UI state"
+            );
+        });
     }
 
     #[test]
@@ -18320,6 +18365,121 @@ First report
                 .unwrap();
             assert_eq!(input.read(cx).value().as_str(), "git push");
         });
+    }
+
+    #[test]
+    #[ignore = "prints timings for the headless chat view"]
+    fn streaming_chat_frame_benchmark() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        let reply = format!(
+            "{}\n\n```ui\n{{\"root\":\"label\",\"elements\":{{\"label\":{{\"type\":\"Text\",\"props\":{{\"text\":\"Ready\"}}}}}}}}\n```",
+            "A settled paragraph with **formatting** and a code snippet.\n\n".repeat(16)
+        );
+        cx.update_window_entity(&state, |state, window, cx| {
+            state.set_chat_mode(pane_id, true, window, cx);
+            let messages = state.pane_mut(pane_id).unwrap().chat.visible_messages_mut();
+            for _ in 0..24 {
+                messages.push(ChatMessage::new(ChatRole::User, "Prompt".into()));
+                messages.push(ChatMessage::new(ChatRole::Assistant, reply.clone()));
+            }
+            messages.push(ChatMessage::new(ChatRole::User, "Another prompt".into()));
+            push_chat_event(
+                messages,
+                agent_bridge::AgentEvent::Text("Starting. ".into()),
+            );
+        });
+        for _ in 0..8 {
+            cx.draw_frame().unwrap();
+        }
+        let mut samples = Vec::new();
+        for _ in 0..48 {
+            cx.update_window_entity(&state, |state, _, cx| {
+                let messages = state.pane_mut(pane_id).unwrap().chat.visible_messages_mut();
+                push_chat_event(messages, agent_bridge::AgentEvent::Text("x ".into()));
+                cx.notify();
+            });
+            let start = std::time::Instant::now();
+            cx.draw_frame().unwrap();
+            samples.push(start.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        println!("frame_us p50={} p95={}", samples[24], samples[45]);
+    }
+
+    #[test]
+    #[ignore = "requires the local streaming benchmark endpoint"]
+    fn loopback_agent_stream_benchmark() {
+        use agent_bridge::{AgentBridge, AgentEvent};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let cwd = PathBuf::from(std::env::var_os("KATHAMO_BENCH_CWD").unwrap());
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        agent_bridge::set_wake(Arc::new(move || {
+            let _ = wake_tx.try_send(());
+        }));
+        let settle = std::env::var_os("KATHAMO_BENCH_SETTLE").is_some();
+        for sample in 0..12 {
+            let startup = Instant::now();
+            let mut bridge = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+            let spawn = startup.elapsed();
+            let mut messages = Vec::new();
+            for turn in 0..2 {
+                let start = Instant::now();
+                bridge.send_prompt("Say x sixteen times.").unwrap();
+                let mut first = None;
+                let mut last = None;
+                let mut max_gap = Duration::ZERO;
+                let mut count = 0;
+                let mut done = false;
+                let mut completions = 0;
+                while !done {
+                    wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    for event in bridge.poll() {
+                        match &event {
+                            AgentEvent::Error(error) => panic!("{error}"),
+                            AgentEvent::Text(text) => {
+                                count += text.len();
+                                let now = start.elapsed();
+                                first.get_or_insert(now);
+                                if let Some(previous) = last {
+                                    max_gap = max_gap.max(now - previous);
+                                }
+                                last = Some(now);
+                            }
+                            AgentEvent::Done => {
+                                completions += 1;
+                                done = true;
+                                finish_chat_streaming(&mut messages);
+                            }
+                            _ => {}
+                        }
+                        push_chat_event(&mut messages, event);
+                    }
+                }
+                assert_eq!(count, 16);
+                if !settle {
+                    assert_eq!(completions, 1);
+                }
+                println!(
+                    "sample={sample} turn={turn} spawn_us={} ttft_us={} last_us={} total_us={} max_gap_us={} completions={completions}",
+                    spawn.as_micros(),
+                    first.unwrap().as_micros(),
+                    last.unwrap().as_micros(),
+                    start.elapsed().as_micros(),
+                    max_gap.as_micros(),
+                );
+                if settle {
+                    std::thread::sleep(Duration::from_millis(15));
+                    bridge.poll();
+                }
+            }
+            let drop_start = Instant::now();
+            drop(bridge);
+            println!("drop_us={}", drop_start.elapsed().as_micros());
+        }
     }
 
     #[test]

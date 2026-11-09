@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
+#[cfg(test)]
 use std::time::Duration;
 
 use rpi_agent::events::AgentEvent as RpiEvent;
@@ -206,7 +207,6 @@ pub struct EmbeddedSession {
     events: mpsc::Receiver<SessionEvent>,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
     session_id: Arc<Mutex<Option<String>>>,
-    worker: Option<std::thread::JoinHandle<()>>,
     wake: Wake,
     closed: bool,
 }
@@ -222,7 +222,7 @@ impl EmbeddedSession {
         let worker_session_id = Arc::clone(&session_id);
         let wake = Wake::default();
         let worker_wake = wake.clone();
-        let worker = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("rpi-embedded".into())
             .spawn(move || {
                 run_worker(
@@ -238,7 +238,6 @@ impl EmbeddedSession {
             events: event_rx,
             commands: command_tx,
             session_id,
-            worker: Some(worker),
             wake,
             closed: false,
         })
@@ -248,6 +247,7 @@ impl EmbeddedSession {
     /// terminal status) reaches the session's event channel.
     pub fn set_wake(&mut self, callback: Arc<dyn Fn() + Send + Sync>) {
         self.wake.set(callback);
+        self.wake.signal();
     }
 
     /// The durable session id, once the harness has opened or created one.
@@ -291,20 +291,8 @@ impl EmbeddedSession {
 
 impl Drop for EmbeddedSession {
     fn drop(&mut self) {
+        // The worker owns its runtime and handles teardown off the host thread.
         let _ = self.commands.send(Command::Shutdown);
-        if let Some(worker) = self.worker.take() {
-            // Give cancellation a moment, then detach rather than freezing the
-            // host UI if an extension-owned tool ignores the abort.
-            let (done_tx, done_rx) = mpsc::channel();
-            std::thread::Builder::new()
-                .name("rpi-embedded-reap".into())
-                .spawn(move || {
-                    let _ = worker.join();
-                    let _ = done_tx.send(());
-                })
-                .ok();
-            let _ = done_rx.recv_timeout(Duration::from_secs(2));
-        }
     }
 }
 
@@ -316,6 +304,9 @@ fn run_worker(
     wake: Wake,
 ) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        // Each conversation owns a runtime. The provider bridge requires
+        // block_in_place, but an idle pane does not need a pool sized to the host.
+        .worker_threads(2)
         .enable_all()
         .thread_name("rpi-embedded-rt")
         .build()
@@ -424,29 +415,44 @@ async fn run_session(
     // extension/resource leases and routers alive for the session lifetime.
     let forward_tx = events.clone();
     let forward_wake = wake.clone();
+    let running = Arc::new(AtomicBool::new(false));
+    let forward_running = Arc::clone(&running);
+    let (finished, mut completions) = tokio::sync::mpsc::unbounded_channel::<Option<String>>();
     let forwarder = tokio::spawn(async move {
         let _reload = reload;
         let mut event_rx = event_rx;
         loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    forward_event(event, &forward_tx);
-                    // Wake the host as soon as the event is queued rather than
-                    // waiting for its next polling tick.
+            tokio::select! {
+                // Prompt completion is sent after the harness publishes its
+                // last event. Forward queued deltas before exposing Done.
+                biased;
+                event = event_rx.recv() => match event {
+                    Ok(event) => {
+                        if forward_event(event, &forward_tx) {
+                            forward_wake.signal();
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
+                        let _ = forward_tx.send(SessionEvent::Status(format!(
+                            "The agent dropped {dropped} intermediate updates."
+                        )));
+                        forward_wake.signal();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
+                Some(error) = completions.recv() => {
+                    if let Some(error) = error {
+                        let _ = forward_tx.send(SessionEvent::Error(error));
+                    }
+                    forward_running.store(false, Ordering::SeqCst);
+                    let _ = forward_tx.send(SessionEvent::Done);
                     forward_wake.signal();
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
-                    let _ = forward_tx.send(SessionEvent::Status(format!(
-                        "The agent dropped {dropped} intermediate updates."
-                    )));
-                    forward_wake.signal();
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
+    wake.signal(); // The durable session id is now available to the host.
 
-    let running = Arc::new(AtomicBool::new(false));
     while let Some(command) = commands.recv().await {
         match command {
             Command::Prompt(text) => {
@@ -454,28 +460,24 @@ async fn run_session(
                     let _ = events.send(SessionEvent::Error(
                         "The agent is already running a prompt".into(),
                     ));
+                    wake.signal();
                     continue;
                 }
                 let lane: Arc<dyn AgentLane> = harness.clone();
-                let event_sink = events.clone();
-                let run_flag = Arc::clone(&running);
-                let prompt_wake = wake.clone();
+                let finished = finished.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = lane.prompt_text(&text, Vec::new()).await {
-                        let _ = event_sink.send(SessionEvent::Error(error.to_string()));
-                    }
-                    run_flag.store(false, Ordering::SeqCst);
-                    let _ = event_sink.send(SessionEvent::Done);
-                    prompt_wake.signal();
+                    let error = lane.prompt_text(&text, Vec::new()).await.err();
+                    let _ = finished.send(error.map(|error| error.to_string()));
                 });
             }
             Command::Abort => {
-                harness.request_stop_round();
-                if let Err(error) = harness.abort_reclaiming(true).await {
-                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                if running.load(Ordering::SeqCst) {
+                    harness.request_stop_round();
+                    if let Err(error) = harness.abort_reclaiming(true).await {
+                        let _ = events.send(SessionEvent::Error(error.to_string()));
+                        wake.signal();
+                    }
                 }
-                let _ = events.send(SessionEvent::Done);
-                wake.signal();
             }
             Command::Shutdown => {
                 harness.request_stop_round();
@@ -487,6 +489,7 @@ async fn run_session(
 
     forwarder.abort();
     let _ = events.send(SessionEvent::Closed);
+    wake.signal();
 }
 
 fn project_trusted(cwd: &Path) -> bool {
@@ -512,7 +515,7 @@ fn send_fatal(events: &mpsc::Sender<SessionEvent>, wake: &Wake, message: String)
     wake.signal();
 }
 
-fn forward_event(event: RpiEvent, events: &mpsc::Sender<SessionEvent>) {
+fn forward_event(event: RpiEvent, events: &mpsc::Sender<SessionEvent>) -> bool {
     match event {
         RpiEvent::MessageUpdate {
             assistant_message_event,
@@ -524,7 +527,7 @@ fn forward_event(event: RpiEvent, events: &mpsc::Sender<SessionEvent>) {
             AssistantMessageEvent::ThinkingDelta { delta, .. } => {
                 let _ = events.send(SessionEvent::Thinking(delta));
             }
-            _ => {}
+            _ => return false,
         },
         RpiEvent::ToolExecutionStart {
             tool_call_id,
@@ -572,8 +575,10 @@ fn forward_event(event: RpiEvent, events: &mpsc::Sender<SessionEvent>) {
                         .error_message
                         .unwrap_or_else(|| "The agent encountered an error".into());
                     let _ = events.send(SessionEvent::Error(error));
+                    return true;
                 }
             }
+            return false;
         }
         RpiEvent::RetryScheduled {
             attempt,
@@ -585,11 +590,9 @@ fn forward_event(event: RpiEvent, events: &mpsc::Sender<SessionEvent>) {
                 "Retrying model request (attempt {attempt}/{max_retries}; delay {delay_ms} ms): {error}"
             )));
         }
-        RpiEvent::AgentEnd { .. } => {
-            let _ = events.send(SessionEvent::Done);
-        }
-        _ => {}
+        _ => return false,
     }
+    true
 }
 
 fn tool_result_text(result: &rpi_agent::AgentToolResult) -> String {
@@ -947,7 +950,7 @@ mod tests {
             if output == "hi" && !failed)
         );
         assert!(matches!(&events[3], SessionEvent::Status(text) if text.contains("attempt 1/3")));
-        assert_eq!(events[4], SessionEvent::Done);
+        assert_eq!(events.len(), 4);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1037,8 +1040,8 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, SessionEvent::Done)),
-            "expected completion, got {events:?}"
+                .all(|event| !matches!(event, SessionEvent::Done)),
+            "the event projector must leave completion to the prompt task: {events:?}"
         );
     }
 

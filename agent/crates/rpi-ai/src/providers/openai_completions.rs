@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -261,7 +260,11 @@ async fn run_stream(
     let mut events = SseEventStream::new(response, opts.signal.clone())
         .with_idle_timeout(opts.stream_idle_timeout());
     loop {
-        match events.next_event().await {
+        let Some(next) = events.next_event_before(state.flush_deadline()).await else {
+            state.flush_pending(producer).await;
+            continue;
+        };
+        match next {
             Ok(Some(event)) if event.data.trim() == "[DONE]" => {
                 state.finish(producer, model).await;
                 return;
@@ -772,7 +775,7 @@ struct StreamState {
     pending_text: String,
     pending_thinking: String,
     /// When a batched delta was last emitted, for [`DELTA_FLUSH_INTERVAL`].
-    last_flush: Instant,
+    last_flush: Option<tokio::time::Instant>,
 }
 
 impl StreamState {
@@ -792,14 +795,25 @@ impl StreamState {
             started: false,
             pending_text: String::new(),
             pending_thinking: String::new(),
-            last_flush: Instant::now(),
+            last_flush: None,
         }
     }
 
     /// Whether a pending batch should be emitted now: either it has grown past
     /// [`DELTA_FLUSH_BYTES`], or it has been waiting [`DELTA_FLUSH_INTERVAL`].
     fn should_flush(&self, pending: &str) -> bool {
-        pending.len() >= DELTA_FLUSH_BYTES || self.last_flush.elapsed() >= DELTA_FLUSH_INTERVAL
+        pending.len() >= DELTA_FLUSH_BYTES
+            || self
+                .last_flush
+                .is_none_or(|last| last.elapsed() >= DELTA_FLUSH_INTERVAL)
+    }
+
+    fn flush_deadline(&self) -> Option<tokio::time::Instant> {
+        if !self.pending_text.is_empty() || !self.pending_thinking.is_empty() {
+            self.last_flush.map(|last| last + DELTA_FLUSH_INTERVAL)
+        } else {
+            None
+        }
     }
 
     /// Emit whatever text/thinking is batched. Called at every channel boundary
@@ -818,7 +832,7 @@ impl StreamState {
             return;
         };
         let delta = std::mem::take(&mut self.pending_text);
-        self.last_flush = Instant::now();
+        self.last_flush = Some(tokio::time::Instant::now());
         producer
             .push(AssistantMessageEvent::TextDelta {
                 content_index: index,
@@ -837,7 +851,7 @@ impl StreamState {
             return;
         };
         let delta = std::mem::take(&mut self.pending_thinking);
-        self.last_flush = Instant::now();
+        self.last_flush = Some(tokio::time::Instant::now());
         producer
             .push(AssistantMessageEvent::ThinkingDelta {
                 content_index: index,
@@ -1225,7 +1239,6 @@ mod tests {
         AssistantMessage, AssistantMessageEvent, ImageContent, ImageContentType, Message,
         StopReason, Tool, ToolResultMessage, ToolResultRole, UserMessage,
     };
-    use std::time::Duration;
 
     /// Drive `apply_chunk` with a plain content delta, the shape the SSE mapper
     /// produces for a mid-stream text chunk.
@@ -1264,44 +1277,27 @@ mod tests {
             .collect()
     }
 
-    #[tokio::test]
-    async fn a_slow_stream_flushes_on_the_interval_not_the_byte_count() {
-        // A pure byte threshold would hide output for
-        // `DELTA_FLUSH_BYTES / rate`; a model emitting one character per 100ms
-        // would show nothing for six seconds. Ageing `last_flush` by more than
-        // the interval stands in for that elapsed time, so this stays
-        // deterministic instead of sleeping.
-        //
-        // `drain` is not used mid-test on purpose: `next()` only yields `None`
-        // after a terminal event, so draining before `finish` would block.
+    #[tokio::test(start_paused = true)]
+    async fn first_delta_is_immediate_and_the_next_has_a_flush_deadline() {
         let model = model();
         let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
         state.start(&mut producer).await;
 
         state.apply_chunk(&mut producer, &text_chunk("a")).await;
-        assert_eq!(
-            state.pending_text, "a",
-            "a single byte well inside the interval must stay batched (no event)"
-        );
+        assert!(state.pending_text.is_empty());
+        assert!(state.flush_deadline().is_none());
 
-        // Same single byte, but the batch is now older than the interval.
-        state.last_flush = Instant::now()
-            .checked_sub(DELTA_FLUSH_INTERVAL + Duration::from_millis(5))
-            .expect("instant arithmetic");
         state.apply_chunk(&mut producer, &text_chunk("b")).await;
-        assert!(
-            state.pending_text.is_empty(),
-            "an aged batch must be emitted even though it is under the byte threshold"
-        );
+        assert_eq!(state.pending_text, "b");
+        let deadline = state.flush_deadline().unwrap();
+        assert_eq!(deadline - tokio::time::Instant::now(), DELTA_FLUSH_INTERVAL);
+        tokio::time::advance(DELTA_FLUSH_INTERVAL).await;
+        state.flush_pending(&mut producer).await;
 
         state.apply_chunk(&mut producer, &stop_chunk()).await;
         state.finish(&mut producer, &model).await;
-        // Flushing early must not lose or duplicate anything.
-        assert_eq!(
-            text_deltas(&drain(&mut stream).await),
-            vec!["ab".to_string()]
-        );
+        assert_eq!(text_deltas(&drain(&mut stream).await), vec!["a", "b"]);
     }
 
     #[tokio::test]
@@ -2033,11 +2029,13 @@ mod tests {
         let mut state = StreamState::new(&model());
         state.start(&mut producer).await;
         stream.next().await.unwrap();
-        state
-            .apply_chunk(&mut producer, &text_chunk("accepted"))
-            .await;
-        stream.next().await.unwrap(); // TextStart
-        state.flush_pending(&mut producer).await; // fills the queue with accepted content
+        let accepted = text_chunk("accepted");
+        let (_, start) = tokio::join!(state.apply_chunk(&mut producer, &accepted), stream.next(),);
+        assert!(matches!(
+            start,
+            Some(AssistantMessageEvent::TextStart { .. })
+        ));
+        // The immediate first delta has now filled the queue.
         state
             .apply_chunk(
                 &mut producer,

@@ -22,6 +22,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+/// Which part of a streamed answer became visible first. Reasoning and answer
+/// text are tracked separately so a slow first answer is not hidden by a fast
+/// reasoning delta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeltaKind {
+    Reasoning,
+    Answer,
+}
+
 const REPORT_INTERVAL_MS: u64 = 5_000;
 const MAX_SAMPLES: usize = 4_096;
 const MAX_TRACKED_TOOLS: usize = 2_048;
@@ -91,6 +100,14 @@ pub fn maybe_report() {
     }
     NEXT_REPORT_MS.store(elapsed + REPORT_INTERVAL_MS, Ordering::Relaxed);
     report();
+}
+
+/// Print the current window immediately, for benchmark drivers.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn report_now() {
+    if enabled() {
+        report();
+    }
 }
 
 fn report() {
@@ -190,4 +207,251 @@ fn tool_painted(id: &str, label: &'static str, flag: impl FnOnce(&mut ToolTrace)
     if let Some(arrived) = arrived {
         record_since(label, arrived);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-turn lifecycle
+// ---------------------------------------------------------------------------
+
+static NEXT_TRACE: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a metadata-only turn identity for one conversation.
+pub fn new_trace() -> u64 {
+    NEXT_TRACE.fetch_add(1, Ordering::Relaxed)
+}
+
+#[derive(Clone, Copy)]
+struct TurnTrace {
+    sent: Instant,
+    warm: bool,
+    provider_request: Option<Instant>,
+    first: [Option<Instant>; 2],
+    applied: [bool; 2],
+    painted: [bool; 2],
+    cancelled: Option<Instant>,
+}
+
+static TURNS: LazyLock<Mutex<HashMap<u64, TurnTrace>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn phase_label(warm: bool, suffix: &str) -> &'static str {
+    match (warm, suffix) {
+        (true, "send_to_provider") => "turn.warm.send_to_provider",
+        (false, "send_to_provider") => "turn.cold.send_to_provider",
+        (true, "reasoning.send_to_first_delta") => "turn.warm.reasoning.send_to_first_delta",
+        (false, "reasoning.send_to_first_delta") => "turn.cold.reasoning.send_to_first_delta",
+        (true, "answer.send_to_first_delta") => "turn.warm.answer.send_to_first_delta",
+        (false, "answer.send_to_first_delta") => "turn.cold.answer.send_to_first_delta",
+        (true, "reasoning.delta_to_apply") => "turn.warm.reasoning.delta_to_apply",
+        (false, "reasoning.delta_to_apply") => "turn.cold.reasoning.delta_to_apply",
+        (true, "answer.delta_to_apply") => "turn.warm.answer.delta_to_apply",
+        (false, "answer.delta_to_apply") => "turn.cold.answer.delta_to_apply",
+        (true, "reasoning.send_to_paint") => "turn.warm.reasoning.send_to_paint",
+        (false, "reasoning.send_to_paint") => "turn.cold.reasoning.send_to_paint",
+        (true, "answer.send_to_paint") => "turn.warm.answer.send_to_paint",
+        (false, "answer.send_to_paint") => "turn.cold.answer.send_to_paint",
+        (true, "reasoning.delta_to_paint") => "turn.warm.reasoning.delta_to_paint",
+        (false, "reasoning.delta_to_paint") => "turn.cold.reasoning.delta_to_paint",
+        (true, "answer.delta_to_paint") => "turn.warm.answer.delta_to_paint",
+        (false, "answer.delta_to_paint") => "turn.cold.answer.delta_to_paint",
+        _ => "turn.dropped",
+    }
+}
+
+fn kind_index(kind: DeltaKind) -> usize {
+    match kind {
+        DeltaKind::Reasoning => 0,
+        DeltaKind::Answer => 1,
+    }
+}
+
+/// Mark the moment a prompt was submitted for a conversation.
+pub fn turn_sent(trace: u64, warm: bool) {
+    if !enabled() {
+        return;
+    }
+    let mut turns = lock(&TURNS);
+    if turns.len() >= 1_024 {
+        turns.clear();
+    }
+    turns.insert(
+        trace,
+        TurnTrace {
+            sent: Instant::now(),
+            warm,
+            provider_request: None,
+            first: [None; 2],
+            applied: [false; 2],
+            painted: [false; 2],
+            cancelled: None,
+        },
+    );
+}
+
+/// The provider request was handed to the HTTP client. Fired from the
+/// embedded session's provider hook, before the first response byte.
+pub fn turn_provider_request(trace: u64) {
+    if !enabled() {
+        return;
+    }
+    let mut turns = lock(&TURNS);
+    let Some(turn) = turns.get_mut(&trace) else {
+        return;
+    };
+    if turn.provider_request.is_some() {
+        return;
+    }
+    turn.provider_request = Some(Instant::now());
+    let sent = turn.sent;
+    let label = phase_label(turn.warm, "send_to_provider");
+    drop(turns);
+    record_since(label, sent);
+}
+
+/// The first non-empty delta for `kind` reached the bridge.
+pub fn turn_delta_arrived(trace: u64, kind: DeltaKind) {
+    if !enabled() {
+        return;
+    }
+    let index = kind_index(kind);
+    let mut turns = lock(&TURNS);
+    let Some(turn) = turns.get_mut(&trace) else {
+        return;
+    };
+    if turn.first[index].is_some() {
+        return;
+    }
+    let now = Instant::now();
+    turn.first[index] = Some(now);
+    let sent = turn.sent;
+    let label = phase_label(
+        turn.warm,
+        match kind {
+            DeltaKind::Reasoning => "reasoning.send_to_first_delta",
+            DeltaKind::Answer => "answer.send_to_first_delta",
+        },
+    );
+    drop(turns);
+    record(label, now.saturating_duration_since(sent));
+}
+
+/// The first delta for `kind` was applied to the visible transcript.
+pub fn turn_delta_applied(trace: u64, kind: DeltaKind) {
+    if !enabled() {
+        return;
+    }
+    let index = kind_index(kind);
+    let mut turns = lock(&TURNS);
+    let Some(turn) = turns.get_mut(&trace) else {
+        return;
+    };
+    if turn.applied[index] {
+        return;
+    }
+    let Some(arrived) = turn.first[index] else {
+        return;
+    };
+    turn.applied[index] = true;
+    let now = Instant::now();
+    let label = phase_label(
+        turn.warm,
+        match kind {
+            DeltaKind::Reasoning => "reasoning.delta_to_apply",
+            DeltaKind::Answer => "answer.delta_to_apply",
+        },
+    );
+    drop(turns);
+    record(label, now.saturating_duration_since(arrived));
+}
+
+/// Whether the first visible delta of `kind` still needs a paint marker.
+/// The caller attaches a canvas that records the sample when the row paints.
+pub fn turn_paint_due(trace: u64, kind: DeltaKind) -> bool {
+    if !enabled() {
+        return false;
+    }
+    let index = kind_index(kind);
+    let mut turns = lock(&TURNS);
+    let Some(turn) = turns.get_mut(&trace) else {
+        return false;
+    };
+    if turn.painted[index] || turn.first[index].is_none() {
+        return false;
+    }
+    true
+}
+
+/// The assistant/reasoning row that first carried `kind` finished a frame.
+pub fn turn_painted(trace: u64, kind: DeltaKind) {
+    if !enabled() {
+        return;
+    }
+    let index = kind_index(kind);
+    let mut turns = lock(&TURNS);
+    let Some(turn) = turns.get_mut(&trace) else {
+        return;
+    };
+    if turn.painted[index] {
+        return;
+    }
+    let Some(arrived) = turn.first[index] else {
+        return;
+    };
+    if turn.cancelled.is_some() && !turn.applied[index] {
+        // A cancelled turn can settle before the first row is laid out; keep
+        // the turn's cancellation sample and drop the paint sample.
+        return;
+    }
+    turn.painted[index] = true;
+    let now = Instant::now();
+    let sent_label = phase_label(
+        turn.warm,
+        match kind {
+            DeltaKind::Reasoning => "reasoning.send_to_paint",
+            DeltaKind::Answer => "answer.send_to_paint",
+        },
+    );
+    let delta_label = phase_label(
+        turn.warm,
+        match kind {
+            DeltaKind::Reasoning => "reasoning.delta_to_paint",
+            DeltaKind::Answer => "answer.delta_to_paint",
+        },
+    );
+    let sent = turn.sent;
+    drop(turns);
+    record(sent_label, now.saturating_duration_since(sent));
+    record(delta_label, now.saturating_duration_since(arrived));
+}
+
+/// The user asked to stop the turn.
+pub fn turn_cancelled(trace: u64) {
+    if !enabled() {
+        return;
+    }
+    let mut turns = lock(&TURNS);
+    if let Some(turn) = turns.get_mut(&trace)
+        && turn.cancelled.is_none()
+    {
+        turn.cancelled = Some(Instant::now());
+    }
+}
+
+/// The backend reported completion (or closure) for the turn.
+pub fn turn_settled(trace: u64) {
+    if !enabled() {
+        return;
+    }
+    let cancelled = {
+        let mut turns = lock(&TURNS);
+        turns.remove(&trace).and_then(|turn| turn.cancelled)
+    };
+    if let Some(cancelled) = cancelled {
+        record_since("turn.cancel_to_settle", cancelled);
+    }
+}
+
+/// Attach a startup phase to the current report window.
+pub fn record_for_trace(_trace: u64, label: &'static str, elapsed: Duration) {
+    record(label, elapsed);
 }

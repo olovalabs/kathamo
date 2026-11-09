@@ -69,6 +69,7 @@ pub enum AgentEvent {
 /// `KATHAMO_RPI_BACKEND=rpc` to use the old subprocess bridge for a baseline.
 pub struct AgentBridge {
     backend: Backend,
+    trace_id: u64,
 }
 
 enum Backend {
@@ -85,8 +86,7 @@ struct EmbeddedBridge {
     /// a credential refresh can rebuild the same conversation.
     model: Option<String>,
     closed: bool,
-    spawn_start: std::time::Instant,
-    ready_seen: std::cell::Cell<bool>,
+    trace_id: u64,
 }
 
 impl AgentBridge {
@@ -112,17 +112,25 @@ impl AgentBridge {
         session: Option<&str>,
         model: Option<&str>,
     ) -> Result<Self, String> {
+        let trace_id = crate::stream_timing::new_trace();
         if rpc_backend_requested() {
-            agent_bridge_rpc::RpcAgentBridge::spawn_resumed(cwd, session, model).map(|backend| {
-                Self {
+            agent_bridge_rpc::RpcAgentBridge::spawn_resumed(cwd, session, model, trace_id).map(
+                |backend| Self {
                     backend: Backend::Rpc(backend),
-                }
-            })
+                    trace_id,
+                },
+            )
         } else {
-            EmbeddedBridge::spawn_session(cwd, session, model).map(|backend| Self {
+            EmbeddedBridge::spawn_session(cwd, session, model, trace_id).map(|backend| Self {
                 backend: Backend::Embedded(backend),
+                trace_id,
             })
         }
+    }
+
+    /// Identity used by the opt-in turn timings. It is metadata only.
+    pub fn trace_id(&self) -> u64 {
+        self.trace_id
     }
 
     /// The durable conversation id reported by the backend, once it starts.
@@ -185,11 +193,32 @@ impl EmbeddedBridge {
         cwd: &Path,
         session: Option<&str>,
         model: Option<&str>,
+        trace_id: u64,
     ) -> Result<Self, String> {
+        let request_trace = trace_id;
+        let phase_trace = trace_id;
+        let resumed = session.is_some();
         let options = SessionOptions::new(cwd)
             .with_selector(model)
             .with_session(session)
-            .with_append_system_prompt(crate::agent_ui::CATALOG_PROMPT);
+            .with_append_system_prompt(crate::agent_ui::CATALOG_PROMPT)
+            .with_provider_request_hook(Arc::new(move || {
+                crate::stream_timing::turn_provider_request(request_trace);
+            }))
+            .with_phase_hook(Arc::new(
+                move |label: &'static str, elapsed: std::time::Duration| {
+                    let label = match (resumed, label) {
+                        (false, "engine.resolve") => "engine.cold.resolve",
+                        (true, "engine.resolve") => "engine.resume.resolve",
+                        (false, "engine.session_build") => "engine.cold.session_build",
+                        (true, "engine.session_build") => "engine.resume.session_build",
+                        (false, "engine.session_ready") => "engine.cold.session_ready",
+                        (true, "engine.session_ready") => "engine.resume.session_ready",
+                        (_, other) => other,
+                    };
+                    crate::stream_timing::record_for_trace(phase_trace, label, elapsed);
+                },
+            ));
         let spawn_start = std::time::Instant::now();
         let mut session = EmbeddedSession::spawn(options).map_err(|error| {
             format!(
@@ -205,17 +234,12 @@ impl EmbeddedBridge {
             cwd: cwd.to_path_buf(),
             model: model.map(str::to_owned),
             closed: false,
-            spawn_start,
-            ready_seen: std::cell::Cell::new(false),
+            trace_id,
         })
     }
 
     fn session_id(&self) -> Option<String> {
-        let id = self.session.session_id();
-        if id.is_some() && !self.ready_seen.replace(true) {
-            crate::stream_timing::record_since("engine.embedded.ready", self.spawn_start);
-        }
-        id
+        self.session.session_id()
     }
 
     fn restart_after_auth(&mut self) -> Result<(), String> {
@@ -223,7 +247,12 @@ impl EmbeddedBridge {
             .session
             .session_id()
             .ok_or("The agent session is still starting; try again shortly")?;
-        let replacement = Self::spawn_session(&self.cwd, Some(&session), self.model.as_deref())?;
+        let replacement = Self::spawn_session(
+            &self.cwd,
+            Some(&session),
+            self.model.as_deref(),
+            self.trace_id,
+        )?;
         *self = replacement;
         Ok(())
     }
@@ -232,8 +261,24 @@ impl EmbeddedBridge {
         let mut events = Vec::new();
         for event in self.session.poll() {
             match event {
-                SessionEvent::Text(text) => events.push(AgentEvent::Text(text)),
-                SessionEvent::Thinking(text) => events.push(AgentEvent::Thinking(text)),
+                SessionEvent::Text(text) => {
+                    if !text.is_empty() {
+                        crate::stream_timing::turn_delta_arrived(
+                            self.trace_id,
+                            crate::stream_timing::DeltaKind::Answer,
+                        );
+                    }
+                    events.push(AgentEvent::Text(text))
+                }
+                SessionEvent::Thinking(text) => {
+                    if !text.is_empty() {
+                        crate::stream_timing::turn_delta_arrived(
+                            self.trace_id,
+                            crate::stream_timing::DeltaKind::Reasoning,
+                        );
+                    }
+                    events.push(AgentEvent::Thinking(text))
+                }
                 SessionEvent::Status(text) => events.push(AgentEvent::Status(text)),
                 SessionEvent::ToolStart { id, name, input } => {
                     events.push(AgentEvent::ToolStart { id, name, input })

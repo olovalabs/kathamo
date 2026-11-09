@@ -354,7 +354,7 @@ fn sanitize(value: &str) -> String {
 
 /// Read a conversation file and rebuild the visible transcript. Missing files
 /// yield an empty transcript; corrupt lines are skipped.
-pub fn load(path: &Path) -> Vec<ChatMessage> {
+pub fn load(path: &Path) -> Vec<std::sync::Arc<ChatMessage>> {
     let Some(text) = read_bounded(path) else {
         return Vec::new();
     };
@@ -368,8 +368,12 @@ pub fn load(path: &Path) -> Vec<ChatMessage> {
             continue;
         };
         match entry {
-            Entry::User { text } => messages.push(ChatMessage::new(ChatRole::User, text)),
-            Entry::Local { role, text } => messages.push(ChatMessage::new(role, text)),
+            Entry::User { text } => {
+                messages.push(std::sync::Arc::new(ChatMessage::new(ChatRole::User, text)))
+            }
+            Entry::Local { role, text } => {
+                messages.push(std::sync::Arc::new(ChatMessage::new(role, text)))
+            }
             Entry::Event { event } => match event {
                 AgentEvent::Done | AgentEvent::Closed => {}
                 event => push_chat_event(&mut messages, event),
@@ -400,8 +404,9 @@ fn read_bounded(path: &Path) -> Option<String> {
 
 /// State that was mid-flight when the app quit must not look live after a
 /// restart: no streaming message and no spinning tool calls.
-fn normalize_replay(messages: &mut [ChatMessage]) {
+fn normalize_replay(messages: &mut [std::sync::Arc<ChatMessage>]) {
     for message in messages {
+        let message = std::sync::Arc::make_mut(message);
         message.streaming = false;
         if let Some(tool) = message.tool.as_mut()
             && tool.state == ToolState::Running

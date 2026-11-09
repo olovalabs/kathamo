@@ -8,9 +8,8 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, Context, Hsla, InteractiveElement as _, IntoElement, OperatingSystem,
-    ParentElement, Pixels, Rems, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
-    relative,
+    AnyElement, Hsla, InteractiveElement as _, IntoElement, OperatingSystem, ParentElement, Pixels,
+    Rems, SharedString, Styled, Window, div, prelude::FluentBuilder, px, relative,
 };
 use gpui_kit::component::{
     Disableable as _, Icon, IconName, Sizable as _, Size,
@@ -330,8 +329,9 @@ pub(crate) fn render_assistant_body(
     tokens: ThemeTokens,
     pane_id: usize,
     state: Option<&HashMap<String, UiStateValue>>,
+    host: &crate::UiHost,
     window: &mut Window,
-    cx: &mut Context<AppState>,
+    cx: &mut gpui::App,
 ) -> AnyElement {
     let body = window.use_keyed_state(
         SharedString::from(format!("{id}-assistant-body")),
@@ -364,7 +364,7 @@ pub(crate) fn render_assistant_body(
                     tokens,
                     pane_id,
                     state,
-                    cx,
+                    host,
                 ));
             }
             None => {}
@@ -379,7 +379,7 @@ fn render_ui_block(
     tokens: ThemeTokens,
     pane_id: usize,
     state: Option<&HashMap<String, UiStateValue>>,
-    cx: &mut Context<AppState>,
+    host: &crate::UiHost,
 ) -> AnyElement {
     let debug_id = id.clone();
     let chrome = |inner: AnyElement| {
@@ -419,7 +419,7 @@ fn render_ui_block(
                 tokens,
                 state,
             };
-            let content = render_node(&ctx, &spec.root, 0, cx);
+            let content = render_node(&ctx, &spec.root, 0, host);
             chrome(content)
         }
         Err((error, raw)) => chrome(
@@ -582,7 +582,7 @@ fn icon_from(name: &str) -> Icon {
     Icon::new(icon)
 }
 
-fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) -> AnyElement {
+fn render_node(ctx: &UiCtx, id: &str, depth: usize, host: &crate::UiHost) -> AnyElement {
     if depth > MAX_DEPTH {
         return error_chip(ctx.tokens, format!("Nesting deeper than {MAX_DEPTH}"));
     }
@@ -595,7 +595,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
 
     let mut kids: Vec<AnyElement> = Vec::with_capacity(node.children.len());
     for child in &node.children {
-        kids.push(render_node(ctx, child, depth + 1, cx));
+        kids.push(render_node(ctx, child, depth + 1, host));
     }
 
     let element_id = SharedString::from(format!("{}-{}", ctx.id_prefix, id));
@@ -920,7 +920,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
             }
             if let Some(action) = prop_str(props, "action") {
                 let pane_id = ctx.pane_id;
-                button = button.on_click(cx.listener(
+                button = button.on_click(host.listener(
                     move |this: &mut AppState, _: &gpui::ClickEvent, window, cx| {
                         this.submit_ui_action(pane_id, action.clone(), window, cx);
                     },
@@ -937,7 +937,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 .checked(checked)
                 .with_size(size_from(props))
                 .on_change(
-                    cx.listener(move |this: &mut AppState, value: &bool, _window, cx| {
+                    host.listener(move |this: &mut AppState, value: &bool, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),
@@ -957,7 +957,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 .checked(checked)
                 .with_size(size_from(props))
                 .on_change(
-                    cx.listener(move |this: &mut AppState, value: &bool, _window, cx| {
+                    host.listener(move |this: &mut AppState, value: &bool, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),
@@ -975,16 +975,16 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
             let mut group = RadioGroup::new(element_id)
                 .children(prop_strings(props, "options"))
                 .selected_index(Some(selected))
-                .on_change(
-                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                .on_change(host.listener(
+                    move |this: &mut AppState, value: &usize, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),
                             UiStateValue::Index(*value),
                             cx,
                         );
-                    }),
-                );
+                    },
+                ));
             if prop_bool(props, "horizontal").unwrap_or(false) {
                 group = group.layout(gpui::Axis::Horizontal);
             }
@@ -998,7 +998,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 .value(value)
                 .max(prop_usize(props, "max").unwrap_or(5))
                 .on_click(
-                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                    host.listener(move |this: &mut AppState, value: &usize, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),
@@ -1018,7 +1018,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 .checked(checked)
                 .with_size(size_from(props))
                 .on_click(
-                    cx.listener(move |this: &mut AppState, value: &bool, _window, cx| {
+                    host.listener(move |this: &mut AppState, value: &bool, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),
@@ -1041,7 +1041,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 )
                 .selected_index(selected)
                 .on_click(
-                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                    host.listener(move |this: &mut AppState, value: &usize, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),
@@ -1074,7 +1074,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 )
                 .selected_index(selected)
                 .on_click(
-                    cx.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                    host.listener(move |this: &mut AppState, value: &usize, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),
@@ -1107,7 +1107,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
             let handler_key = node_key.clone();
             let mut accordion = Accordion::new(element_id)
                 .multiple(multiple)
-                .on_toggle_click(cx.listener(
+                .on_toggle_click(host.listener(
                     move |this: &mut AppState, indices: &[usize], _window, cx| {
                         this.set_ui_state(
                             pane_id,
@@ -1151,7 +1151,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
             let pane_id = ctx.pane_id;
             let handler_key = node_key.clone();
             Accordion::new(element_id)
-                .on_toggle_click(cx.listener(
+                .on_toggle_click(host.listener(
                     move |this: &mut AppState, indices: &[usize], _window, cx| {
                         this.set_ui_state(
                             pane_id,
@@ -1179,7 +1179,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, cx: &mut Context<AppState>) 
                 .current_page(page)
                 .total_pages(prop_usize(props, "total").unwrap_or(1))
                 .on_click(
-                    cx.listener(move |this: &mut AppState, page: &usize, _window, cx| {
+                    host.listener(move |this: &mut AppState, page: &usize, _window, cx| {
                         this.set_ui_state(
                             pane_id,
                             handler_key.clone(),

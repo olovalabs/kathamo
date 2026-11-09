@@ -20,7 +20,9 @@ import threading
 import time
 
 PROMPT = "Say x sixteen times."
+BURST_PROMPT = "Burst 512 tokens."
 TOKENS = 16
+BURST_TOKENS = 512
 SAMPLES = 12
 
 
@@ -33,16 +35,41 @@ class Fixture(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         request = self.rfile.read(int(self.headers["Content-Length"]))
-        canonical = json.dumps(json.loads(request), sort_keys=True).encode()
+        body = json.loads(request)
+        canonical = json.dumps(body, sort_keys=True).encode()
         self.server.requests.append(hashlib.sha256(canonical).hexdigest())
+        # Only the current (last) user prompt selects the fixture behavior;
+        # history may still contain an earlier prompt with a different role.
+        prompts = [
+            message.get("content")
+            for message in reversed(body.get("messages", []))
+            if message.get("role") == "user"
+            and isinstance(message.get("content"), str)
+        ][:1]
+        burst = any(BURST_PROMPT in prompt for prompt in prompts)
+        slow = any("Slow 200 tokens." in prompt for prompt in prompts)
+        fail = any("Fail request." in prompt for prompt in prompts)
+        if fail:
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "4")
+            self.end_headers()
+            self.wfile.write(b"boom")
+            return
+        tokens = BURST_TOKENS if burst else (200 if slow else TOKENS)
+        delay = 0.0 if burst else (0.01 if slow else 0.003)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
         def send(data):
-            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
-            self.wfile.flush()
+            try:
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                return False
 
         token = {
             "id": "bench",
@@ -52,11 +79,13 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}],
         }
         frame = ("data: " + json.dumps(token) + "\n\n").encode()
-        for _ in range(TOKENS):
-            send(frame)
-            time.sleep(0.003)
-        send(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
-        self.wfile.write(b"0\r\n\r\n")
+        for _ in range(tokens):
+            if not send(frame):
+                return
+            if delay:
+                time.sleep(delay)
+        if send(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'):
+            self.wfile.write(b"0\r\n\r\n")
 
 
 def print_resources(before):
@@ -114,6 +143,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("test_executable", type=lambda value: str(Path(value).resolve()))
     parser.add_argument("--cli", metavar="RPI")
+    parser.add_argument("--rpc", action="store_true", help="use the subprocess rpi RPC bridge")
     parser.add_argument("--settle", action="store_true", help="allow baseline completion to settle between turns")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as tmp, http.server.ThreadingHTTPServer(
@@ -140,19 +170,27 @@ def main():
             env.pop(key, None)
         if args.settle:
             env["KATHAMO_BENCH_SETTLE"] = "1"
+        if args.rpc:
+            env["KATHAMO_RPI_BACKEND"] = "rpc"
         before = resource.getrusage(resource.RUSAGE_CHILDREN)
         subprocess.run([args.test_executable, "loopback_agent_stream_benchmark",
                         "--ignored", "--nocapture"], env=env, check=True, timeout=60)
         print_resources(before)
+        before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        subprocess.run([args.test_executable, "slow_reader_writer_benchmark",
+                        "--ignored", "--nocapture"], env=env, check=True, timeout=60)
+        print_resources(before)
         if args.cli:
-            assert len(server.requests) == SAMPLES * 2
+            expected = SAMPLES * 2 + 8 * 3 + 1 + 2
+            assert len(server.requests) == expected
             before = resource.getrusage(resource.RUSAGE_CHILDREN)
             benchmark_cli(args.cli, env, cwd)
             print_resources(before)
-            direct = server.requests[SAMPLES * 2:]
+            direct = server.requests[expected:]
+            primary = SAMPLES * 2
             print(f"matching JSON requests: "
-                  f"{sum(left == right for left, right in zip(server.requests, direct))}"
-                  f"/{SAMPLES * 2}")
+                  f"{sum(left == right for left, right in zip(server.requests[:primary], direct))}"
+                  f"/{primary}")
 
 
 if __name__ == "__main__":

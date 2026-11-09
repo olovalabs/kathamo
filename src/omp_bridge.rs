@@ -1,13 +1,14 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 
 use serde_json::{Value, json};
 
 use crate::agent_bridge::{AgentEvent, coalesce_events, decode_message_update, decode_tool_event};
+use crate::agent_writer::AgentWriter;
 
 enum Incoming {
     /// Assistant deltas need no other fields from the RPC record.
@@ -29,10 +30,11 @@ enum Incoming {
 /// A separate, persistent OMP conversation for one Google Antigravity model.
 pub struct OmpBridge {
     child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: AgentWriter,
     events: mpsc::Receiver<Incoming>,
     sender: mpsc::Sender<Incoming>,
     next_id: u64,
+    trace_id: u64,
     pending_prompt: Option<String>,
     closed: bool,
     /// Where OMP persists this session, learned from `get_state`. OMP writes its
@@ -84,11 +86,17 @@ impl OmpBridge {
             )
         })?;
         crate::stream_timing::record_since("engine.omp.spawn", spawn_start);
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
+        let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let (sender, events) = mpsc::channel();
+        let error_sender = sender.clone();
+        let writer = AgentWriter::spawn(stdin, move |error| {
+            let _ = error_sender.send(Incoming::Error(error));
+            crate::agent_bridge::signal_wake();
+        });
         let bridge_sender = sender.clone();
-        let reply_stdin = Arc::clone(&stdin);
+        let reply_writer = writer.clone();
+        let trace_id = crate::stream_timing::new_trace();
         let reader_start = std::time::Instant::now();
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -122,6 +130,21 @@ impl OmpBridge {
                 }
                 if record["type"] == "message_update" {
                     if let Some(event) = decode_message_update(&record) {
+                        match &event {
+                            AgentEvent::Text(text) if !text.is_empty() => {
+                                crate::stream_timing::turn_delta_arrived(
+                                    trace_id,
+                                    crate::stream_timing::DeltaKind::Answer,
+                                );
+                            }
+                            AgentEvent::Thinking(text) if !text.is_empty() => {
+                                crate::stream_timing::turn_delta_arrived(
+                                    trace_id,
+                                    crate::stream_timing::DeltaKind::Reasoning,
+                                );
+                            }
+                            _ => {}
+                        }
                         if sender.send(Incoming::Delta(event)).is_err() {
                             return;
                         }
@@ -137,12 +160,9 @@ impl OmpBridge {
                                 "OMP requested an interactive dialog or tool approval, which is not supported in this view; the request was cancelled.".into(),
                             ));
                             crate::agent_bridge::signal_wake();
-                            if let Err(error) = write_command(
-                                &reply_stdin,
-                                &json!({
-                                    "type": "extension_ui_response", "id": record["id"], "cancelled": true
-                                }),
-                            ) {
+                            if let Err(error) = reply_writer.send_json(json!({
+                                "type": "extension_ui_response", "id": record["id"], "cancelled": true
+                            })) {
                                 let _ = sender.send(Incoming::Error(error));
                                 crate::agent_bridge::signal_wake();
                             }
@@ -208,38 +228,27 @@ impl OmpBridge {
         // Request incremental updates rather than repeatedly transmitting the
         // entire growing message. Older OMP versions may reject this optional
         // projection; their ordinary full updates contain the same deltas.
-        write_command(
-            &stdin,
-            &json!({
-                "type": "set_event_filter", "id": "kathamo-event-filter",
-                "events": null, "messageUpdates": "delta"
-            }),
-        )?;
-        let _ = write_command(
-            &stdin,
-            &json!({
-                "type": "set_cache_warming", "id": "kathamo-cache-warming", "mode": "idle"
-            }),
-        );
-        let _ = write_command(
-            &stdin,
-            &json!({
-                "type": "set_thinking_level", "id": "kathamo-thinking-level", "level": "low"
-            }),
-        );
+        writer.send_json(json!({
+            "type": "set_event_filter", "id": "kathamo-event-filter",
+            "events": null, "messageUpdates": "delta"
+        }))?;
+        let _ = writer.send_json(json!({
+            "type": "set_cache_warming", "id": "kathamo-cache-warming", "mode": "idle"
+        }));
+        let _ = writer.send_json(json!({
+            "type": "set_thinking_level", "id": "kathamo-thinking-level", "level": "low"
+        }));
         // Worker messages are emitted separately from the parent transcript.
-        let _ = write_command(
-            &stdin,
-            &json!({"type": "set_subagent_subscription", "id": "kathamo-subagents", "level": "events"}),
-        );
+        let _ = writer.send_json(json!({"type": "set_subagent_subscription", "id": "kathamo-subagents", "level": "events"}));
         // Learn where this session is stored so its generated title can be read.
-        let _ = write_command(&stdin, &json!({"type": "get_state", "id": "kathamo-state"}));
+        let _ = writer.send_json(json!({"type": "get_state", "id": "kathamo-state"}));
         Ok(Self {
             child,
-            stdin,
+            writer,
             events,
             sender: bridge_sender,
             next_id: 0,
+            trace_id,
             pending_prompt: None,
             closed: false,
             session_file: None,
@@ -263,13 +272,22 @@ impl OmpBridge {
             self.title_requested = false;
             let _ = self.send(json!({"type": "abort"}));
         }
-        let id = self.send(json!({"type": "prompt", "message": prompt}))?;
+        if self.closed {
+            return Err("The omp process has exited".into());
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = format!("kathamo-{}", self.next_id);
+        self.writer.send_prompt(id.clone(), prompt.to_owned())?;
         self.pending_prompt = Some(id);
         Ok(())
     }
 
     pub fn cancel(&mut self) -> Result<(), String> {
         self.send(json!({"type": "abort"})).map(|_| ())
+    }
+
+    pub fn trace_id(&self) -> u64 {
+        self.trace_id
     }
     pub fn set_thinking_level(&mut self, level: &str) -> Result<(), String> {
         self.send(json!({"type": "set_thinking_level", "level": level}))
@@ -283,7 +301,7 @@ impl OmpBridge {
         self.next_id = self.next_id.wrapping_add(1);
         let id = format!("kathamo-{}", self.next_id);
         command["id"] = json!(id);
-        write_command(&self.stdin, &command)?;
+        self.writer.send_json(command)?;
         Ok(id)
     }
 
@@ -326,6 +344,7 @@ impl OmpBridge {
                 Incoming::Closed => {
                     if !self.closed {
                         self.closed = true;
+                        self.writer.close();
                         let status = self
                             .child
                             .try_wait()
@@ -584,6 +603,8 @@ impl Drop for OmpBridge {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // The child is gone, so a writer blocked on a full pipe has unwound.
+        self.writer.shutdown();
     }
 }
 
@@ -613,18 +634,6 @@ fn parse_title_line(line: &str) -> Option<String> {
 /// an agent error.
 fn is_busy_rejection(detail: &str) -> bool {
     detail.contains("already processing")
-}
-
-fn write_command(stdin: &Mutex<ChildStdin>, command: &Value) -> Result<(), String> {
-    let mut input = stdin
-        .lock()
-        .map_err(|_| "OMP input lock was poisoned".to_string())?;
-    serde_json::to_writer(&mut *input, command)
-        .map_err(|error| format!("Failed to encode OMP command: {error}"))?;
-    input
-        .write_all(b"\n")
-        .and_then(|_| input.flush())
-        .map_err(|error| format!("Failed to send OMP command: {error}"))
 }
 
 #[cfg(test)]

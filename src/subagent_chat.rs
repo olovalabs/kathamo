@@ -406,7 +406,7 @@ pub struct Row<'a> {
     pub result: Option<&'a str>,
 }
 
-pub fn rows(messages: &[ChatMessage]) -> Vec<Row<'_>> {
+pub fn rows<M: std::ops::Deref<Target = ChatMessage>>(messages: &[M]) -> Vec<Row<'_>> {
     let mut rows: Vec<Row<'_>> = Vec::new();
     let mut indices = std::collections::HashMap::new();
     let mut turn = 0;

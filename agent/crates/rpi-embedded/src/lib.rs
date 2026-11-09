@@ -122,7 +122,7 @@ pub enum SessionEvent {
 }
 
 /// Inputs for one embedded conversation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SessionOptions {
     pub cwd: PathBuf,
     /// Provider id from the host's model picker.
@@ -135,6 +135,11 @@ pub struct SessionOptions {
     /// Extra system-prompt text appended after the base prompt. The host uses
     /// this to describe capabilities it renders itself, such as UI cards.
     pub append_system_prompt: Option<String>,
+    /// Host metadata hook fired immediately before the first provider request
+    /// of a turn. It never observes prompts, credentials or tool payloads.
+    pub provider_request_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Host metadata hook for startup phases (resolve, session build, ready).
+    pub phase_hook: Option<Arc<dyn Fn(&'static str, std::time::Duration) + Send + Sync>>,
 }
 
 impl SessionOptions {
@@ -145,6 +150,8 @@ impl SessionOptions {
             model: None,
             session_id: None,
             append_system_prompt: None,
+            provider_request_hook: None,
+            phase_hook: None,
         }
     }
 
@@ -169,6 +176,19 @@ impl SessionOptions {
 
     pub fn with_append_system_prompt(mut self, prompt: &str) -> Self {
         self.append_system_prompt = Some(prompt.to_owned());
+        self
+    }
+
+    pub fn with_provider_request_hook(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.provider_request_hook = Some(hook);
+        self
+    }
+
+    pub fn with_phase_hook(
+        mut self,
+        hook: Arc<dyn Fn(&'static str, std::time::Duration) + Send + Sync>,
+    ) -> Self {
+        self.phase_hook = Some(hook);
         self
     }
 }
@@ -337,11 +357,15 @@ async fn run_session(
         model,
         session_id: resume,
         append_system_prompt,
+        provider_request_hook,
+        phase_hook,
     } = options;
     let trusted = project_trusted(&cwd);
+    let started = std::time::Instant::now();
 
     // Resolution reads host-owned files and environment; keep it off the async
     // workers that also serve tool I/O.
+    let resolved_started = std::time::Instant::now();
     let resolve_cwd = cwd.clone();
     let resolve_provider = provider.clone();
     let resolve_model = model.clone();
@@ -373,6 +397,10 @@ async fn run_session(
         }
     };
 
+    if let Some(hook) = &phase_hook {
+        hook("engine.resolve", resolved_started.elapsed());
+    }
+
     let mut args = Args::default();
     args.mode = Mode::Rpc;
     // Several embedded conversations share one process. rpi's extension layer
@@ -388,6 +416,7 @@ async fn run_session(
         args.append_system_prompt.push(prompt);
     }
 
+    let build_started = std::time::Instant::now();
     let mut built = rpi_cli::session::build(&resolved, &args, &cwd, trusted).await;
     if built.is_err() && resume.is_some() {
         // A stale id must not brick the pane; the host transcript is still on
@@ -407,8 +436,34 @@ async fn run_session(
         }
     };
     let harness = Arc::new(harness);
+    if let Some(hook) = &phase_hook {
+        hook("engine.session_build", build_started.elapsed());
+        hook("engine.session_ready", started.elapsed());
+    }
     if let Ok(mut slot) = session_id.lock() {
         *slot = Some(harness.session_id());
+    }
+    // The host uses this only for metadata timing. Embedded sessions run without
+    // extensions, so no extension provider hooks are displaced.
+    if let Some(hook) = provider_request_hook {
+        struct HostTimingHooks(Arc<dyn Fn() + Send + Sync>);
+        impl rpi_ai::ProviderHooks for HostTimingHooks {
+            fn before_request(
+                &self,
+                _model: &rpi_ai::Model,
+                _ctx: &rpi_ai::types::Context,
+                _opts: &rpi_ai::SimpleStreamOptions,
+            ) -> Option<rpi_ai::SimpleStreamOptionsPatch> {
+                (self.0)();
+                None
+            }
+        }
+        let hooks: Arc<dyn rpi_ai::ProviderHooks> = Arc::new(HostTimingHooks(hook));
+        if let Err(error) = harness.set_provider_hooks(Some(hooks)).await {
+            let _ = events.send(SessionEvent::Status(format!(
+                "Could not install timing hooks: {error}"
+            )));
+        }
     }
 
     // Forward the harness event bus into the host's polling loop. `reload` keeps
@@ -1053,6 +1108,8 @@ mod tests {
             model: Some("missing-model".into()),
             session_id: None,
             append_system_prompt: None,
+            provider_request_hook: None,
+            phase_hook: None,
         })
         .expect("worker starts");
 

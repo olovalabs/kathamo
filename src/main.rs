@@ -2,12 +2,12 @@ use anyhow::Result;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClipboardEntry, Context,
-    CursorStyle, Div, Edges, Entity, ExternalPaths, Hsla, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
-    Point, Rems, Render, ScrollEvent, SharedString, StatefulInteractiveElement as _,
-    StyleRefinement, Styled, StyledImage as _, Transformation, Window, WindowControlArea,
-    WindowDecorations, WindowOptions, actions, deferred, div, img, percentage, px, relative, rems,
-    rgba, size, svg,
+    CursorStyle, Div, Edges, Entity, ExternalPaths, FollowMode, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Rems, Render, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, StyledImage as _, Transformation,
+    Window, WindowControlArea, WindowDecorations, WindowOptions, actions, canvas, deferred, div,
+    img, list, percentage, px, relative, rems, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::highlighter::HighlightTheme;
@@ -30,6 +30,7 @@ mod agent_auth;
 mod agent_bridge;
 mod agent_rules;
 mod agent_ui;
+mod agent_writer;
 mod assets;
 mod attachments;
 mod attention;
@@ -129,6 +130,29 @@ impl std::io::Write for SharedWriter {
         self.writer.lock().flush()
     }
 }
+/// Access to the owning app entity from a render closure that only receives a
+/// plain `&mut App` (for example a virtualized list item).
+#[derive(Clone)]
+pub(crate) struct UiHost {
+    app: gpui::WeakEntity<AppState>,
+}
+
+impl UiHost {
+    pub(crate) fn new(app: gpui::WeakEntity<AppState>) -> Self {
+        Self { app }
+    }
+
+    pub(crate) fn listener<E: ?Sized + 'static>(
+        &self,
+        handler: impl Fn(&mut AppState, &E, &mut Window, &mut gpui::Context<AppState>) + 'static,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        let app = self.app.clone();
+        move |event, window, cx| {
+            let _ = app.update(cx, |this, cx| handler(this, event, window, cx));
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ChatRole {
     User,
@@ -153,6 +177,8 @@ struct ChatMessage {
     /// delta arrives, never while rendering, so a frame walks only the short
     /// live tail instead of rescanning the whole message.
     stream: Option<StreamView>,
+    /// Metadata-only turn identity for opt-in paint timings.
+    turn: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -199,6 +225,7 @@ impl ChatMessage {
             expanded: true,
             streaming: false,
             stream: None,
+            turn: None,
         }
     }
 }
@@ -651,7 +678,9 @@ fn tool_view(name: &str, input: &str) -> ToolView {
 
 /// Header text for a run of tool calls, mirroring opencode's collapsed
 /// "Used N Read, Grep" row. Returns `(prefix, title)`.
-fn tool_group_label(parts: &[(usize, &ChatMessage)]) -> (String, String) {
+fn tool_group_label<M: std::ops::Deref<Target = ChatMessage>>(
+    parts: &[(usize, M)],
+) -> (String, String) {
     let mut titles: Vec<String> = Vec::new();
     let mut tool_count = 0usize;
     for (_, message) in parts {
@@ -1437,7 +1466,7 @@ fn chat_thinking_row(
 }
 
 fn update_chat_tool(
-    messages: &mut Vec<ChatMessage>,
+    messages: &mut Vec<Arc<ChatMessage>>,
     id: Option<String>,
     name: String,
     output: String,
@@ -1446,22 +1475,31 @@ fn update_chat_tool(
     // An absent ID cannot distinguish concurrent calls with the same name.
     // Associate those events with the oldest matching running call.
     let existing = messages
-        .iter_mut()
+        .iter()
         .rev()
         .take_while(|message| message.role != ChatRole::User)
-        .filter_map(|message| message.tool.as_mut())
-        .filter(|tool| tool.state == ToolState::Running)
-        .filter(|tool| match id.as_ref() {
-            Some(id) => tool.id.as_ref() == Some(id),
-            None => tool.id.is_none() && tool.name == name,
+        .enumerate()
+        .filter_map(|(offset, message)| {
+            message
+                .tool
+                .as_ref()
+                .filter(|tool| tool.state == ToolState::Running)
+                .filter(|tool| match id.as_ref() {
+                    Some(id) => tool.id.as_ref() == Some(id),
+                    None => tool.id.is_none() && tool.name == name,
+                })
+                .map(|_| offset)
         })
-        .last();
+        .last()
+        .map(|offset| messages.len() - 1 - offset);
     let workers = if state == ToolState::Completed {
         subagent_chat::legacy(&name, &output)
     } else {
         Vec::new()
     };
-    if let Some(tool) = existing {
+    if let Some(index) = existing {
+        let message = Arc::make_mut(&mut messages[index]);
+        let tool = message.tool.as_mut().expect("matched a tool message");
         subagent_chat::update_workers(&mut tool.workers, workers);
         let (full, preview, truncated) = tool_output_fields(output);
         tool.output = full;
@@ -1471,7 +1509,7 @@ fn update_chat_tool(
     } else {
         let (full, preview, truncated) = tool_output_fields(output);
         let display = ToolDisplay::new(&name, "");
-        messages.push(ChatMessage {
+        messages.push(Arc::new(ChatMessage {
             role: ChatRole::Tool,
             text: String::new(),
             tool: Some(ChatTool {
@@ -1489,7 +1527,8 @@ fn update_chat_tool(
             expanded: false,
             streaming: false,
             stream: None,
-        });
+            turn: None,
+        }));
     }
 }
 
@@ -1579,12 +1618,13 @@ fn agent_startup_notice(error: &str) -> (String, String) {
 /// activity, a tool call, an error, or the end of the turn. The next text
 /// event starts a fresh streaming message, so completed text gets the full
 /// markdown render again.
-fn finish_chat_streaming(messages: &mut [ChatMessage]) {
+fn finish_chat_streaming(messages: &mut [Arc<ChatMessage>]) {
     // Only the newest message can be streaming: every other role calls this
     // before pushing, so scanning the whole transcript here is wasted work.
     if let Some(message) = messages.last_mut()
         && message.streaming
     {
+        let message = Arc::make_mut(message);
         message.streaming = false;
         message.stream = None;
     }
@@ -1624,19 +1664,25 @@ fn refresh_stream_view(message: &mut ChatMessage, scan: bool) {
     }
 }
 
-fn finish_chat_tools(messages: &mut [ChatMessage]) {
-    for tool in messages
+fn finish_chat_tools(messages: &mut [Arc<ChatMessage>]) {
+    for message in messages
         .iter_mut()
         .rev()
         .take_while(|message| message.role != ChatRole::User)
-        .filter_map(|message| message.tool.as_mut())
-        .filter(|tool| tool.state == ToolState::Running)
     {
-        tool.state = ToolState::Unknown;
+        if message
+            .tool
+            .as_ref()
+            .is_some_and(|tool| tool.state == ToolState::Running)
+        {
+            if let Some(tool) = Arc::make_mut(message).tool.as_mut() {
+                tool.state = ToolState::Unknown;
+            }
+        }
     }
 }
 
-fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEvent) {
+fn push_chat_event(messages: &mut Vec<Arc<ChatMessage>>, event: agent_bridge::AgentEvent) {
     let (role, text) = match event {
         agent_bridge::AgentEvent::ToolStart { id, name, input } => {
             if let Some(id) = id.as_deref() {
@@ -1646,7 +1692,7 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
             // newest message; finalization only looks at the tail.
             finish_chat_streaming(messages);
             let display = ToolDisplay::new(&name, &input);
-            messages.push(ChatMessage {
+            messages.push(Arc::new(ChatMessage {
                 role: ChatRole::Tool,
                 text: String::new(),
                 tool: Some(ChatTool {
@@ -1664,7 +1710,8 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                 expanded: false,
                 streaming: false,
                 stream: None,
-            });
+                turn: None,
+            }));
             return;
         }
         agent_bridge::AgentEvent::ToolUpdate { id, name, output } => {
@@ -1693,14 +1740,23 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
             return;
         }
         agent_bridge::AgentEvent::Subagents { tool_id, workers } => {
-            if let Some(tool) = messages
-                .iter_mut()
+            let index = messages
+                .iter()
                 .rev()
                 .take_while(|message| message.role != ChatRole::User)
-                .filter_map(|message| message.tool.as_mut())
-                .find(|tool| tool.id.as_deref() == Some(tool_id.as_str()))
-            {
-                subagent_chat::update_workers(&mut tool.workers, workers);
+                .enumerate()
+                .find(|(_, message)| {
+                    message
+                        .tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.id.as_deref() == Some(tool_id.as_str()))
+                })
+                .map(|(offset, _)| messages.len() - 1 - offset);
+            if let Some(index) = index {
+                let message = Arc::make_mut(&mut messages[index]);
+                if let Some(tool) = message.tool.as_mut() {
+                    subagent_chat::update_workers(&mut tool.workers, workers);
+                }
             }
             return;
         }
@@ -1725,6 +1781,7 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
             .take_while(|message| message.role != ChatRole::User)
         {
             if message.role == ChatRole::Thinking {
+                let message = Arc::make_mut(message);
                 message.expanded = false;
                 // The block is complete: fold the live tail back into the full
                 // text and drop the streaming split.
@@ -1738,6 +1795,7 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
     if matches!(role, ChatRole::Assistant | ChatRole::Thinking)
         && let Some(last) = messages.last_mut().filter(|message| message.role == role)
     {
+        let last = Arc::make_mut(last);
         last.text.push_str(&text);
         // Reasoning streams like assistant text: settled blocks stay cached and
         // only the live tail is re-parsed, instead of reparsing the whole block
@@ -1751,7 +1809,7 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
         message.streaming = true;
         refresh_stream_view(&mut message, true);
     }
-    messages.push(message);
+    messages.push(Arc::new(message));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1821,6 +1879,12 @@ impl ModelBridge {
             Self::Omp(bridge) => bridge.poll(),
         }
     }
+    fn trace_id(&self) -> u64 {
+        match self {
+            Self::Rpi(bridge) => bridge.trace_id(),
+            Self::Omp(bridge) => bridge.trace_id(),
+        }
+    }
     fn set_thinking_level(&mut self, level: &str) -> Result<(), String> {
         match self {
             Self::Omp(bridge) => bridge.set_thinking_level(level),
@@ -1832,8 +1896,11 @@ impl ModelBridge {
 #[derive(Default)]
 struct ModelChat {
     bridge: Option<ModelBridge>,
-    messages: Vec<ChatMessage>,
+    messages: Vec<Arc<ChatMessage>>,
     running: bool,
+    /// Completed turns in this conversation, used only to label cold/warm
+    /// timing samples.
+    completed_turns: u64,
     auth_refresh_pending: bool,
     rpi_session_id: Option<String>,
     conversation: Option<conversations::Log>,
@@ -1854,16 +1921,88 @@ struct WorkerView {
     _load: Option<gpui::Task<()>>,
 }
 
+/// An owned subagent row for the virtualized transcript. Worker rows are cloned
+/// only when a frame builds the visible subagent block.
+#[derive(Clone)]
+struct WorkerRowSnapshot {
+    index: usize,
+    id: String,
+    avatar: usize,
+    title: String,
+    status: &'static str,
+}
+
+/// One virtualized transcript unit. Settled history stays measured and is not
+/// rebuilt when the active reply grows.
+enum ChatRow {
+    Subagents {
+        start: usize,
+        rows: Vec<WorkerRowSnapshot>,
+    },
+    ToolGroup {
+        start: usize,
+        parts: Vec<(usize, Arc<ChatMessage>)>,
+        open: bool,
+        running: bool,
+    },
+    Message {
+        index: usize,
+        message: Arc<ChatMessage>,
+        live: bool,
+    },
+    Running,
+}
+
+/// Owned render data for one frame of the transcript list. It clones message
+/// handles, never message text.
+struct ChatSnapshot {
+    pane_id: usize,
+    conversation: SharedString,
+    tokens: ThemeTokens,
+    rows: Vec<ChatRow>,
+    ui_state: HashMap<String, agent_ui::UiStateValue>,
+    host: UiHost,
+}
+
+fn worker_status_label(label: &str) -> &'static str {
+    match label {
+        "Starting" => "is starting",
+        "Running" => "is working",
+        "Completed" => "finished",
+        "Failed" => "failed",
+        "Cancelled" => "was cancelled",
+        "Idle" => "is idle",
+        _ => "reported",
+    }
+}
+
+fn chat_row_contains(row: &ChatRow, message_index: usize) -> bool {
+    match row {
+        ChatRow::Subagents { start, .. } => *start == message_index,
+        ChatRow::ToolGroup { parts, .. } => parts.iter().any(|(index, _)| *index == message_index),
+        ChatRow::Message { index, .. } => *index == message_index,
+        ChatRow::Running => false,
+    }
+}
+
 struct PaneChat {
     worker_view: Option<WorkerView>,
     active: bool,
     bridge: Option<agent_bridge::AgentBridge>,
     cwd: Option<PathBuf>,
-    messages: Vec<ChatMessage>,
+    messages: Vec<Arc<ChatMessage>>,
     running: bool,
+    /// Completed turns in the automatic (unpinned) conversation.
+    completed_turns: u64,
     terminal_draft: String,
-    scroll: gpui::ScrollHandle,
     agent_draft: String,
+    /// Virtualized transcript state. Only rows near the viewport are built.
+    list_state: ListState,
+    list_rows: std::cell::Cell<usize>,
+    list_key: std::cell::Cell<u64>,
+    active_dirty: std::cell::Cell<bool>,
+    dirty_message: std::cell::Cell<Option<usize>>,
+    scroll_handler_installed: std::cell::Cell<bool>,
     auth_refresh_pending: bool,
     auth: Option<AuthModal>,
     selected_model: Option<agent_auth::AgentModel>,
@@ -1897,9 +2036,19 @@ impl Default for PaneChat {
             cwd: None,
             messages: Vec::new(),
             running: false,
+            completed_turns: 0,
             terminal_draft: String::new(),
-            scroll: gpui::ScrollHandle::new(),
             agent_draft: String::new(),
+            list_state: {
+                let state = ListState::new(0, ListAlignment::Bottom, px(600.0));
+                state.set_follow_mode(FollowMode::Tail);
+                state
+            },
+            list_rows: std::cell::Cell::new(0),
+            list_key: std::cell::Cell::new(0),
+            active_dirty: std::cell::Cell::new(false),
+            dirty_message: std::cell::Cell::new(None),
+            scroll_handler_installed: std::cell::Cell::new(false),
             auth_refresh_pending: false,
             auth: None,
             selected_model: None,
@@ -1955,7 +2104,7 @@ impl PaneChat {
         }
     }
 
-    fn visible_messages(&self) -> &[ChatMessage] {
+    fn visible_messages(&self) -> &[Arc<ChatMessage>] {
         match self.selected_model.as_ref() {
             Some(model) => self
                 .models
@@ -1965,7 +2114,7 @@ impl PaneChat {
             None => &self.messages,
         }
     }
-    fn visible_messages_mut(&mut self) -> &mut Vec<ChatMessage> {
+    fn visible_messages_mut(&mut self) -> &mut Vec<Arc<ChatMessage>> {
         match self.selected_model.as_ref() {
             Some(model) => &mut self.models.entry(model.clone()).or_default().messages,
             None => &mut self.messages,
@@ -1977,6 +2126,48 @@ impl PaneChat {
             Some(model) => self.models.get(model).is_some_and(|chat| chat.running),
             None => self.running,
         }
+    }
+
+    /// The active reply grew. Its row must be re-measured on the next frame,
+    /// while every settled row keeps its cached height.
+    fn mark_active_dirty(&self) {
+        self.active_dirty.set(true);
+    }
+
+    /// A row's height changed because the reader toggled a message.
+    fn invalidate_message_row(&self, index: usize) {
+        self.dirty_message.set(Some(index));
+    }
+
+    fn scroll_to_end(&self) {
+        self.list_state.scroll_to_end();
+        self.list_state.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// Keep the list's item count in step with the transcript. Appending and
+    /// truncating preserve the reader's scroll anchor; a conversation switch
+    /// resets measurements.
+    fn sync_rows(&self, count: usize, key: u64) {
+        if key != self.list_key.get() {
+            self.list_state.reset(count);
+            self.list_state.set_follow_mode(FollowMode::Tail);
+            self.list_key.set(key);
+            self.list_rows.set(count);
+            return;
+        }
+        let old = self.list_rows.get();
+        if count > old {
+            self.list_state.splice(old..old, count - old);
+            // Appending a boundary finalizes the previous tail row (for
+            // example a streaming answer becomes settled Markdown), so its
+            // cached height must be remeasured too.
+            if old > 0 {
+                self.list_state.splice(old - 1..old, 1);
+            }
+        } else if count < old {
+            self.list_state.splice(count..old, 0);
+        }
+        self.list_rows.set(count);
     }
 
     fn visible_startup_error(&self) -> Option<&str> {
@@ -2440,7 +2631,7 @@ struct RenamingProject {
 struct RestoreData {
     workspace: workspace_state::SavedWorkspace,
     scrollbacks: HashMap<String, String>,
-    transcripts: HashMap<String, Vec<ChatMessage>>,
+    transcripts: HashMap<String, Vec<Arc<ChatMessage>>>,
 }
 
 fn transcript_key(uid: &str, key: &str) -> String {
@@ -5518,11 +5709,14 @@ impl AppState {
         if let Some(pane) = self.pane_mut(pane_id) {
             let messages = pane.chat.visible_messages_mut();
             if let Some(msg) = messages.get_mut(index) {
-                if let Some(tool) = &mut msg.tool {
-                    tool.expanded = !tool.expanded;
-                    cx.notify();
-                } else if msg.role == ChatRole::Thinking {
-                    msg.expanded = !msg.expanded;
+                if msg.tool.is_some() || msg.role == ChatRole::Thinking {
+                    let msg = Arc::make_mut(msg);
+                    if let Some(tool) = &mut msg.tool {
+                        tool.expanded = !tool.expanded;
+                    } else {
+                        msg.expanded = !msg.expanded;
+                    }
+                    pane.chat.invalidate_message_row(index);
                     cx.notify();
                 }
             }
@@ -5532,12 +5726,15 @@ impl AppState {
     fn toggle_chat_tool_show_full(&mut self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
         if let Some(pane) = self.pane_mut(pane_id) {
             let messages = pane.chat.visible_messages_mut();
-            if let Some(tool) = messages
-                .get_mut(index)
-                .and_then(|message| message.tool.as_mut())
+            if let Some(message) = messages.get_mut(index)
+                && message.tool.is_some()
             {
-                tool.show_full = !tool.show_full;
-                cx.notify();
+                let message = Arc::make_mut(message);
+                if let Some(tool) = message.tool.as_mut() {
+                    tool.show_full = !tool.show_full;
+                    pane.chat.invalidate_message_row(index);
+                    cx.notify();
+                }
             }
         }
     }
@@ -5552,6 +5749,7 @@ impl AppState {
             if !pane.chat.expanded_tool_groups.remove(&start) {
                 pane.chat.expanded_tool_groups.insert(start);
             }
+            pane.chat.invalidate_message_row(start);
             cx.notify();
         }
     }
@@ -6136,12 +6334,25 @@ impl AppState {
                     }
                     if let Some(mut bridge) = pane.chat.bridge.take() {
                         let mut closed = false;
+                        let trace = bridge.trace_id();
                         let drain_start = std::time::Instant::now();
                         let drained = bridge.poll();
                         crate::stream_timing::record_since("ui.drain", drain_start);
+                        if !drained.is_empty() {
+                            pane.chat.mark_active_dirty();
+                        }
                         for event in drained {
                             let apply_start = std::time::Instant::now();
                             changed = true;
+                            let delta_kind = match &event {
+                                agent_bridge::AgentEvent::Thinking(text) if !text.is_empty() => {
+                                    Some(crate::stream_timing::DeltaKind::Reasoning)
+                                }
+                                agent_bridge::AgentEvent::Text(text) if !text.is_empty() => {
+                                    Some(crate::stream_timing::DeltaKind::Answer)
+                                }
+                                _ => None,
+                            };
                             let startup_error = pane.chat.messages.is_empty()
                                 && !pane.chat.running
                                 && matches!(event, agent_bridge::AgentEvent::Error(_));
@@ -6160,11 +6371,15 @@ impl AppState {
                             match event {
                                 agent_bridge::AgentEvent::Done => {
                                     pane.chat.running = false;
+                                    pane.chat.completed_turns =
+                                        pane.chat.completed_turns.saturating_add(1);
+                                    crate::stream_timing::turn_settled(trace);
                                     finish_chat_tools(&mut pane.chat.messages);
                                     finish_chat_streaming(&mut pane.chat.messages);
                                 }
                                 agent_bridge::AgentEvent::Closed => {
                                     pane.chat.running = false;
+                                    crate::stream_timing::turn_settled(trace);
                                     finish_chat_tools(&mut pane.chat.messages);
                                     finish_chat_streaming(&mut pane.chat.messages);
                                     closed = true;
@@ -6177,6 +6392,12 @@ impl AppState {
                                     titled_panes.push(pane.id);
                                 }
                                 other => push_chat_event(&mut pane.chat.messages, other),
+                            }
+                            if let Some(kind) = delta_kind {
+                                crate::stream_timing::turn_delta_applied(trace, kind);
+                                if let Some(last) = pane.chat.messages.last_mut() {
+                                    Arc::make_mut(last).turn = Some(trace);
+                                }
                             }
                             crate::stream_timing::record_since("ui.apply", apply_start);
                         }
@@ -6191,6 +6412,7 @@ impl AppState {
                     }
                     streaming |= pane.chat.running;
                     let pane_uid = pane.uid.clone();
+                    let mut models_dirty = false;
                     for (model, chat) in &mut pane.chat.models {
                         if save_history && chat.conversation.is_none() {
                             chat.conversation = Some(conversations::Log::open(
@@ -6200,6 +6422,7 @@ impl AppState {
                         }
                         if let Some(mut bridge) = chat.bridge.take() {
                             let mut closed = false;
+                            let trace = bridge.trace_id();
                             let drain_start = std::time::Instant::now();
                             let drained = bridge.poll();
                             if let ModelBridge::Omp(omp) = &mut bridge {
@@ -6208,9 +6431,23 @@ impl AppState {
                                     && pane.chat.worker_view.is_some();
                             }
                             crate::stream_timing::record_since("ui.drain", drain_start);
+                            if !drained.is_empty() {
+                                models_dirty = true;
+                            }
                             for event in drained {
                                 let apply_start = std::time::Instant::now();
                                 changed = true;
+                                let delta_kind = match &event {
+                                    agent_bridge::AgentEvent::Thinking(text)
+                                        if !text.is_empty() =>
+                                    {
+                                        Some(crate::stream_timing::DeltaKind::Reasoning)
+                                    }
+                                    agent_bridge::AgentEvent::Text(text) if !text.is_empty() => {
+                                        Some(crate::stream_timing::DeltaKind::Answer)
+                                    }
+                                    _ => None,
+                                };
                                 let startup_error = chat.messages.is_empty()
                                     && !chat.running
                                     && matches!(event, agent_bridge::AgentEvent::Error(_));
@@ -6229,11 +6466,15 @@ impl AppState {
                                 match event {
                                     agent_bridge::AgentEvent::Done => {
                                         chat.running = false;
+                                        chat.completed_turns =
+                                            chat.completed_turns.saturating_add(1);
+                                        crate::stream_timing::turn_settled(trace);
                                         finish_chat_tools(&mut chat.messages);
                                         finish_chat_streaming(&mut chat.messages);
                                     }
                                     agent_bridge::AgentEvent::Closed => {
                                         chat.running = false;
+                                        crate::stream_timing::turn_settled(trace);
                                         finish_chat_tools(&mut chat.messages);
                                         finish_chat_streaming(&mut chat.messages);
                                         closed = true;
@@ -6247,6 +6488,12 @@ impl AppState {
                                     }
                                     other => push_chat_event(&mut chat.messages, other),
                                 }
+                                if let Some(kind) = delta_kind {
+                                    crate::stream_timing::turn_delta_applied(trace, kind);
+                                    if let Some(last) = chat.messages.last_mut() {
+                                        Arc::make_mut(last).turn = Some(trace);
+                                    }
+                                }
                                 crate::stream_timing::record_since("ui.apply", apply_start);
                             }
                             if let ModelBridge::Rpi(bridge) = &bridge {
@@ -6259,6 +6506,9 @@ impl AppState {
                             }
                         }
                         streaming |= chat.running;
+                    }
+                    if models_dirty {
+                        pane.chat.mark_active_dirty();
                     }
                 }
             }
@@ -6281,7 +6531,7 @@ impl AppState {
                                 Err(error) => pane
                                     .chat
                                     .messages
-                                    .push(ChatMessage::new(ChatRole::Error, error)),
+                                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error))),
                             }
                         }
                         if !retry {
@@ -6299,9 +6549,9 @@ impl AppState {
                                 match bridge.restart_after_auth() {
                                     Ok(()) => {}
                                     Err(error) if error.contains("still starting") => retry = true,
-                                    Err(error) => {
-                                        chat.messages.push(ChatMessage::new(ChatRole::Error, error))
-                                    }
+                                    Err(error) => chat
+                                        .messages
+                                        .push(Arc::new(ChatMessage::new(ChatRole::Error, error))),
                                 }
                             }
                             if !retry {
@@ -6363,6 +6613,18 @@ impl AppState {
     ) {
         if let Some(pane) = self.pane_mut(pane_id) {
             pane.chat.ui_state.insert(key, value);
+            // Card controls can change a row's height. Reset measurements but
+            // restore the reader's anchor (or tail-follow) afterwards; this is
+            // a click-rate path.
+            let rows = pane.chat.list_rows.get();
+            let following = pane.chat.list_state.is_following_tail();
+            let anchor = pane.chat.list_state.logical_scroll_top();
+            pane.chat.list_state.reset(rows);
+            if following {
+                pane.chat.list_state.set_follow_mode(FollowMode::Tail);
+            } else {
+                pane.chat.list_state.scroll_to(anchor);
+            }
             cx.notify();
         }
     }
@@ -6446,7 +6708,7 @@ impl AppState {
             if let Some(pane) = self.pane_mut(pane_id) {
                 pane.chat
                     .visible_messages_mut()
-                    .push(ChatMessage::new(ChatRole::Status, msg.into()));
+                    .push(Arc::new(ChatMessage::new(ChatRole::Status, msg.into())));
                 if let Some(log) = pane.chat.visible_conversation() {
                     log.append_local(ChatRole::Status, msg);
                 }
@@ -6474,13 +6736,15 @@ impl AppState {
                         }
                     }
                 }
-                pane.chat.visible_messages_mut().push(ChatMessage::new(
-                    ChatRole::Status,
-                    format!(
-                        "Thinking level set to '{level}' ({} mode).",
-                        if fast { "Fast" } else { "Deep" }
-                    ),
-                ));
+                pane.chat
+                    .visible_messages_mut()
+                    .push(Arc::new(ChatMessage::new(
+                        ChatRole::Status,
+                        format!(
+                            "Thinking level set to '{level}' ({} mode).",
+                            if fast { "Fast" } else { "Deep" }
+                        ),
+                    )));
                 let status = format!(
                     "Thinking level set to '{level}' ({} mode).",
                     if fast { "Fast" } else { "Deep" }
@@ -6510,27 +6774,36 @@ impl AppState {
                         chat.bridge = Some(bridge);
                     }
                     Err(error) => {
-                        chat.messages.push(ChatMessage::new(ChatRole::Error, error));
+                        chat.messages
+                            .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
                         cx.notify();
                         return;
                     }
                 }
             }
             chat.startup_error = None;
+            let trace = chat.bridge.as_ref().map(|bridge| bridge.trace_id());
+            let warm = chat.completed_turns > 0;
+            if let Some(trace) = trace {
+                crate::stream_timing::turn_sent(trace, warm);
+            }
             match chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
                 Ok(()) => {
                     if let Some(log) = chat.conversation.as_mut() {
                         log.append_user(&prompt);
                     }
-                    chat.messages.push(ChatMessage::new(ChatRole::User, prompt));
+                    chat.messages
+                        .push(Arc::new(ChatMessage::new(ChatRole::User, prompt)));
                     chat.running = true;
                     pane.attachments.clear();
                     input.update(cx, |state, cx| state.set_value("", window, cx));
                 }
-                Err(error) => chat.messages.push(ChatMessage::new(ChatRole::Error, error)),
+                Err(error) => chat
+                    .messages
+                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error))),
             }
             pane.chat.autoscroll = true;
-            pane.chat.scroll.scroll_to_bottom();
+            pane.chat.scroll_to_end();
             cx.notify();
             return;
         }
@@ -6553,11 +6826,16 @@ impl AppState {
                 Err(error) => {
                     pane.chat
                         .messages
-                        .push(ChatMessage::new(ChatRole::Error, error));
+                        .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
                     cx.notify();
                     return;
                 }
             }
+        }
+        let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
+        let warm = pane.chat.completed_turns > 0;
+        if let Some(trace) = trace {
+            crate::stream_timing::turn_sent(trace, warm);
         }
         match pane.chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
             Ok(()) => {
@@ -6566,7 +6844,7 @@ impl AppState {
                 }
                 pane.chat
                     .messages
-                    .push(ChatMessage::new(ChatRole::User, prompt));
+                    .push(Arc::new(ChatMessage::new(ChatRole::User, prompt)));
                 pane.chat.running = true;
                 pane.attachments.clear();
                 input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -6574,10 +6852,10 @@ impl AppState {
             Err(error) => pane
                 .chat
                 .messages
-                .push(ChatMessage::new(ChatRole::Error, error)),
+                .push(Arc::new(ChatMessage::new(ChatRole::Error, error))),
         }
         pane.chat.autoscroll = true;
-        pane.chat.scroll.scroll_to_bottom();
+        pane.chat.scroll_to_end();
         cx.notify();
     }
 
@@ -6736,10 +7014,15 @@ impl AppState {
             if let Some(model) = pane.chat.selected_model.as_ref() {
                 if let Some(chat) = pane.chat.models.get_mut(model) {
                     if chat.running {
+                        let trace = chat.bridge.as_ref().map(|bridge| bridge.trace_id());
                         if let Some(bridge) = chat.bridge.as_mut() {
                             if let Err(error) = bridge.cancel() {
-                                chat.messages.push(ChatMessage::new(ChatRole::Error, error));
+                                chat.messages
+                                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
                             }
+                        }
+                        if let Some(trace) = trace {
+                            crate::stream_timing::turn_cancelled(trace);
                         }
                     } else if let Some(input) = &pane.input_state {
                         input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -6751,12 +7034,16 @@ impl AppState {
                 return;
             }
             if pane.chat.running {
+                let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
                 if let Some(bridge) = pane.chat.bridge.as_mut() {
                     if let Err(error) = bridge.cancel() {
                         pane.chat
                             .messages
-                            .push(ChatMessage::new(ChatRole::Error, error));
+                            .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
                     }
+                }
+                if let Some(trace) = trace {
+                    crate::stream_timing::turn_cancelled(trace);
                 }
             } else if let Some(input) = &pane.input_state {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -10332,16 +10619,48 @@ impl AppState {
     }
 
     fn render_chat_message(
-        &self,
         pane_id: usize,
         conversation: &str,
         index: usize,
         message: &ChatMessage,
         running: bool,
         tokens: ThemeTokens,
+        ui_state: Option<&HashMap<String, agent_ui::UiStateValue>>,
+        host: &UiHost,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
+        let mut paint_marker = None;
+        if message.streaming
+            && !message.text.is_empty()
+            && let Some(turn) = message.turn
+        {
+            let kind = match message.role {
+                ChatRole::Assistant => Some(crate::stream_timing::DeltaKind::Answer),
+                ChatRole::Thinking => Some(crate::stream_timing::DeltaKind::Reasoning),
+                _ => None,
+            };
+            if let Some(kind) = kind
+                && crate::stream_timing::turn_paint_due(turn, kind)
+            {
+                // The canvas paints with this row, so the sample is the frame
+                // that actually made the text visible rather than the next
+                // scheduled frame.
+                paint_marker = Some(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, _, _, _| {
+                            crate::stream_timing::turn_painted(turn, kind);
+                        },
+                    )
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size(px(1.0))
+                    .into_any_element(),
+                );
+            }
+        }
         let inner: AnyElement = match message.role {
             ChatRole::User => div()
                 .w_full()
@@ -10384,7 +10703,6 @@ impl AppState {
                     .line_height(relative(1.9))
                     .text_color(tokens.text_primary);
 
-                let ui_state = self.pane_ref(pane_id).map(|pane| &pane.chat.ui_state);
                 if message.streaming {
                     let (settled, tail) = message
                         .stream
@@ -10402,6 +10720,7 @@ impl AppState {
                             tokens,
                             pane_id,
                             ui_state,
+                            host,
                             window,
                             cx,
                         ));
@@ -10418,6 +10737,7 @@ impl AppState {
                             tokens,
                             pane_id,
                             ui_state,
+                            host,
                             window,
                             cx,
                         ));
@@ -10432,6 +10752,7 @@ impl AppState {
                         tokens,
                         pane_id,
                         ui_state,
+                        host,
                         window,
                         cx,
                     ));
@@ -10440,7 +10761,7 @@ impl AppState {
                 body.into_any_element()
             }
             ChatRole::Thinking => {
-                let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                let on_toggle = host.listener(move |this, _: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
                     this.toggle_chat_tool_expanded(pane_id, index, cx);
                 });
@@ -10468,11 +10789,11 @@ impl AppState {
                 .into_any_element(),
             ChatRole::Tool => {
                 if let Some(tool) = &message.tool {
-                    let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    let on_toggle = host.listener(move |this, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.toggle_chat_tool_expanded(pane_id, index, cx);
                     });
-                    let on_show_more = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    let on_show_more = host.listener(move |this, _: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
                         this.toggle_chat_tool_show_full(pane_id, index, cx);
                     });
@@ -10525,20 +10846,32 @@ impl AppState {
                 .into_any_element(),
         };
 
-        div().w_full().min_w_0().child(inner).into_any_element()
+        if let Some(marker) = paint_marker {
+            div()
+                .w_full()
+                .min_w_0()
+                .relative()
+                .child(marker)
+                .child(inner)
+                .into_any_element()
+        } else {
+            div().w_full().min_w_0().child(inner).into_any_element()
+        }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_chat_tool_group(
-        &self,
         pane_id: usize,
         conversation: &str,
         start: usize,
-        parts: &[(usize, &ChatMessage)],
+        parts: &[(usize, Arc<ChatMessage>)],
         open: bool,
         running: bool,
         tokens: ThemeTokens,
+        ui_state: Option<&HashMap<String, agent_ui::UiStateValue>>,
+        host: &UiHost,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> AnyElement {
         // A collapsed group is the first visible representation of its tools,
         // so record that paint even though the individual cards stay hidden.
@@ -10548,7 +10881,7 @@ impl AppState {
             }
         }
         let (prefix, label) = tool_group_label(parts);
-        let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+        let on_toggle = host.listener(move |this, _: &MouseDownEvent, _, cx| {
             cx.stop_propagation();
             this.toggle_chat_tool_group_expanded(pane_id, start, cx);
         });
@@ -10627,13 +10960,15 @@ impl AppState {
                 .flex_col()
                 .gap(px(2.0));
             for (index, part) in parts {
-                children = children.child(self.render_chat_message(
+                children = children.child(Self::render_chat_message(
                     pane_id,
                     conversation,
                     *index,
                     part,
                     running,
                     tokens,
+                    ui_state,
+                    host,
                     window,
                     cx,
                 ));
@@ -10643,7 +10978,7 @@ impl AppState {
         group.into_any_element()
     }
 
-    fn worker_avatar(&self, avatar: usize, pixel: f32) -> gpui::Div {
+    fn worker_avatar(avatar: usize, pixel: f32) -> gpui::Div {
         let (pattern, color) = subagent_chat::AVATARS[avatar];
         div()
             .relative()
@@ -10664,24 +10999,13 @@ impl AppState {
     }
 
     fn render_worker_row(
-        &self,
         pane_id: usize,
-        row: &subagent_chat::Row<'_>,
+        row: &WorkerRowSnapshot,
         tokens: ThemeTokens,
-        cx: &mut Context<Self>,
+        host: &UiHost,
     ) -> AnyElement {
-        let worker = row.worker;
         let index = row.index;
-        let id = worker.id.clone();
-        let status = match worker.status_label() {
-            "Starting" => "is starting",
-            "Running" => "is working",
-            "Completed" => "finished",
-            "Failed" => "failed",
-            "Cancelled" => "was cancelled",
-            "Idle" => "is idle",
-            _ => "reported",
-        };
+        let id = row.id.clone();
         div()
             .id(SharedString::from(format!(
                 "subagent-{pane_id}-{index}-{id}"
@@ -10700,21 +11024,21 @@ impl AppState {
             .text_size(px(14.0))
             .cursor(CursorStyle::PointingHand)
             .hover(move |style| style.bg(tokens.sidebar_item_hover))
-            .child(self.worker_avatar(row.avatar, 3.0))
+            .child(Self::worker_avatar(row.avatar, 3.0))
             .child(
                 div()
                     .min_w_0()
                     .truncate()
                     .text_color(tokens.text_primary)
-                    .child(worker.display_title()),
+                    .child(row.title.clone()),
             )
             .child(
                 div()
                     .flex_shrink_0()
                     .text_color(tokens.text_muted)
-                    .child(status),
+                    .child(row.status),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(host.listener(move |this, _, _, cx| {
                 this.open_worker_view(pane_id, index, &id, cx);
             }))
             .into_any_element()
@@ -10870,16 +11194,20 @@ impl AppState {
             live.into_iter()
                 .flat_map(|worker| worker.unsaved_replies(&view.messages)),
         );
+        let host = UiHost::new(cx.weak_entity());
+        let ui_state = Some(&pane.chat.ui_state);
         let mut has_reply = false;
         for (index, message) in messages.enumerate() {
             has_reply |= message.role == ChatRole::Assistant;
-            body = body.child(self.render_chat_message(
+            body = body.child(Self::render_chat_message(
                 pane_id,
                 &conversation,
                 index,
                 message,
                 message.streaming,
                 tokens,
+                ui_state,
+                &host,
                 window,
                 cx,
             ));
@@ -10929,7 +11257,7 @@ impl AppState {
                             .flex()
                             .items_center()
                             .gap(px(10.0))
-                            .child(self.worker_avatar(row.avatar, 4.0))
+                            .child(Self::worker_avatar(row.avatar, 4.0))
                             .child(
                                 div()
                                     .min_w_0()
@@ -10974,108 +11302,55 @@ impl AppState {
         let conversation = format!("{:?}", pane.chat.selected_model);
         let pane_id = pane.id;
         let is_autoscroll = pane.chat.autoscroll;
-        let offset_y = pane.chat.scroll.offset().y;
-        let max_height = pane.chat.scroll.max_offset().y;
-        let dist_from_bottom = max_height + offset_y;
-
-        if is_autoscroll {
-            pane.chat.scroll.scroll_to_bottom();
+        if is_autoscroll && !pane.chat.list_state.is_following_tail() {
+            pane.chat.list_state.set_follow_mode(FollowMode::Tail);
         }
 
         let running = pane.chat.visible_running();
-        let mut messages: Vec<AnyElement> = Vec::new();
         let row_start = std::time::Instant::now();
-        let mut cursor = 0usize;
-        let mut worker_rows = workers.iter().peekable();
-        while cursor < visible.len() {
-            let message = &visible[cursor];
-            if message
-                .tool
-                .as_ref()
-                .is_some_and(|tool| !tool.workers.is_empty())
-            {
-                let start = cursor;
-                while cursor < visible.len()
-                    && visible[cursor]
-                        .tool
-                        .as_ref()
-                        .is_some_and(|tool| !tool.workers.is_empty())
-                {
-                    cursor += 1;
-                }
-                if worker_rows.peek().is_some_and(|row| row.index < cursor) {
-                    let mut rows = Vec::new();
-                    while let Some(row) = worker_rows.next_if(|row| row.index < cursor) {
-                        rows.push(self.render_worker_row(pane_id, row, tokens, cx));
-                    }
-                    messages.push(
-                        div()
-                            .debug_selector(move || format!("subagent-list-{start}"))
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .pb(px(10.0))
-                            .border_b_1()
-                            .border_color(tokens.border_subtle)
-                            .child(
-                                div()
-                                    .pb(px(7.0))
-                                    .text_size(px(14.0))
-                                    .text_color(tokens.text_muted)
-                                    .child("Subagents"),
-                            )
-                            .children(rows)
-                            .into_any_element(),
-                    );
-                }
-                continue;
-            }
-            // Reasoning stays outside the tool group so live thoughts are always
-            // visible instead of hiding behind a collapsed "Used N tools" row.
-            if message.role == ChatRole::Tool && message.tool.is_some() {
-                let start = cursor;
-                let mut parts: Vec<(usize, &ChatMessage)> = Vec::new();
-                while cursor < visible.len()
-                    && visible[cursor].role == ChatRole::Tool
-                    && visible[cursor]
-                        .tool
-                        .as_ref()
-                        .is_some_and(|tool| tool.workers.is_empty())
-                {
-                    parts.push((cursor, &visible[cursor]));
-                    cursor += 1;
-                }
-                let open = pane.chat.expanded_tool_groups.contains(&start);
-                let live = running && cursor == visible.len();
-                messages.push(self.render_chat_tool_group(
-                    pane_id,
-                    &conversation,
-                    start,
-                    &parts,
-                    open,
-                    live,
-                    tokens,
-                    window,
-                    cx,
-                ));
-                continue;
-            }
-            // Only the newest thinking block is live; older blocks read as thoughts.
-            let live = running && cursor + 1 == visible.len();
-            messages.push(self.render_chat_message(
-                pane_id,
-                &conversation,
-                cursor,
-                message,
-                live,
-                tokens,
-                window,
-                cx,
-            ));
-            cursor += 1;
-        }
+        let (rows, active_row) = Self::build_chat_rows(pane, running);
         crate::stream_timing::record_since("ui.render_rows", row_start);
+
+        let row_count = rows.len();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(conversation.as_str(), &mut hasher);
+        pane.chat
+            .sync_rows(row_count, std::hash::Hasher::finish(&hasher));
+        if let Some(index) = pane.chat.dirty_message.take() {
+            if let Some(row) = rows.iter().position(|row| chat_row_contains(row, index)) {
+                pane.chat.list_state.splice(row..row + 1, 1);
+            }
+        } else if pane.chat.active_dirty.replace(false) {
+            // Only the row that grew is re-measured. Settled history keeps its
+            // cached height and is not rebuilt. When a turn settles the active
+            // row is no longer streaming, so fall back to the last content row.
+            let row = active_row.or_else(|| {
+                rows.iter().rposition(|row| {
+                    matches!(row, ChatRow::Message { .. } | ChatRow::ToolGroup { .. })
+                })
+            });
+            if let Some(row) = row {
+                pane.chat.list_state.splice(row..row + 1, 1);
+            }
+        }
+        if !pane.chat.scroll_handler_installed.get() {
+            let weak = cx.weak_entity();
+            let id = pane_id;
+            pane.chat
+                .list_state
+                .set_scroll_handler(move |event, _, cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if let Some(pane) = this.pane_mut(id) {
+                            let following = event.is_following_tail;
+                            if pane.chat.autoscroll != following {
+                                pane.chat.autoscroll = following;
+                                cx.notify();
+                            }
+                        }
+                    });
+                });
+            pane.chat.scroll_handler_installed.set(true);
+        }
         let default_screen: Option<AnyElement> = if pane.chat.visible_messages().is_empty() {
             let effective = pane.chat.selected_model.as_ref();
             let inherited =
@@ -11232,60 +11507,44 @@ impl AppState {
             None
         };
 
-        let chat_view = div()
-            .id(("agent-chat", pane_id))
-            .size_full()
-            .track_scroll(&pane.chat.scroll)
-            .overflow_y_scroll()
-            .on_scroll(cx.listener(move |this, event: &ScrollEvent, window, cx| {
-                if let Some(pane) = this.pane_mut(pane_id) {
-                    let line_height = window.line_height();
-                    let delta = event.delta.pixel_delta(line_height);
-                    let offset_y = pane.chat.scroll.offset().y;
-                    let max_height = pane.chat.scroll.max_offset().y;
-                    let dist = max_height + offset_y;
-                    if delta.y > px(0.0) {
-                        if pane.chat.autoscroll {
-                            pane.chat.autoscroll = false;
-                            cx.notify();
-                        }
-                    } else if delta.y < px(0.0) {
-                        if dist <= px(40.0) {
-                            if !pane.chat.autoscroll {
-                                pane.chat.autoscroll = true;
-                                pane.chat.scroll.scroll_to_bottom();
-                                cx.notify();
-                            }
-                        }
-                    }
-                }
-            }))
-            .px(px(24.0))
-            .py(px(8.0))
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .when_some(default_screen, |view, screen| view.child(screen))
-            .children(messages)
-            .when(pane.chat.visible_running(), |view| {
-                view.child(
+        if let Some(screen) = default_screen {
+            // An empty transcript does not need a virtualized list.
+            return div()
+                .relative()
+                .size_full()
+                .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .px(px(4.0))
-                        .py(px(2.0))
-                        .child(div().size(px(6.0)).rounded_full().bg(tokens.block_warning))
-                        .child(
-                            div()
-                                .text_color(tokens.text_muted)
-                                .text_size(px(12.0))
-                                .child("Waiting for agent updates…"),
-                        ),
+                        .id(("agent-chat", pane_id))
+                        .size_full()
+                        .overflow_y_scroll()
+                        .px(px(24.0))
+                        .py(px(8.0))
+                        .child(screen),
                 )
-            });
+                .into_any_element();
+        }
 
-        let scroll_to_bottom_btn = if !is_autoscroll && dist_from_bottom > px(32.0) {
+        let host = UiHost::new(cx.weak_entity());
+        let snapshot = Arc::new(ChatSnapshot {
+            pane_id,
+            conversation: conversation.clone().into(),
+            tokens,
+            rows,
+            ui_state: pane.chat.ui_state.clone(),
+            host: host.clone(),
+        });
+        let row_snapshot = Arc::clone(&snapshot);
+        let list_state = pane.chat.list_state.clone();
+        let chat_view = div().id(("agent-chat", pane_id)).size_full().child(
+            list(list_state.clone(), move |index, window, cx| {
+                Self::render_chat_row(&row_snapshot, index, window, cx)
+            })
+            .size_full()
+            .px(px(24.0))
+            .py(px(8.0)),
+        );
+
+        let scroll_to_bottom_btn = if !is_autoscroll {
             Some(
                 div()
                     .id(("scroll-to-bottom-btn", pane_id))
@@ -11316,11 +11575,11 @@ impl AppState {
                     .child("Scroll to bottom")
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        host.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             if let Some(pane) = this.pane_mut(pane_id) {
                                 pane.chat.autoscroll = true;
-                                pane.chat.scroll.scroll_to_bottom();
+                                pane.chat.scroll_to_end();
                                 cx.notify();
                             }
                         }),
@@ -11337,7 +11596,7 @@ impl AppState {
             .right_0()
             .bottom_0()
             .child(
-                gpui_component::scroll::Scrollbar::vertical(&pane.chat.scroll)
+                gpui_component::scroll::Scrollbar::vertical(&list_state)
                     .id(("agent-chat-scrollbar", pane_id)),
             );
 
@@ -11348,6 +11607,198 @@ impl AppState {
             .child(chat_view)
             .child(scrollbar)
             .children(scroll_to_bottom_btn)
+            .into_any_element()
+    }
+
+    fn build_chat_rows(pane: &TerminalPane, running: bool) -> (Vec<ChatRow>, Option<usize>) {
+        let visible = pane.chat.visible_messages();
+        let worker_rows: Vec<WorkerRowSnapshot> = subagent_chat::rows(visible)
+            .into_iter()
+            .map(|row| WorkerRowSnapshot {
+                index: row.index,
+                id: row.worker.id.clone(),
+                avatar: row.avatar,
+                title: row.worker.display_title(),
+                status: worker_status_label(row.worker.status_label()),
+            })
+            .collect();
+        let mut rows = Vec::new();
+        let mut active_row = None;
+        let mut cursor = 0usize;
+        let mut worker_index = 0usize;
+        while cursor < visible.len() {
+            let message = &visible[cursor];
+            if message
+                .tool
+                .as_ref()
+                .is_some_and(|tool| !tool.workers.is_empty())
+            {
+                let start = cursor;
+                while cursor < visible.len()
+                    && visible[cursor]
+                        .tool
+                        .as_ref()
+                        .is_some_and(|tool| !tool.workers.is_empty())
+                {
+                    cursor += 1;
+                }
+                if worker_index < worker_rows.len() && worker_rows[worker_index].index < cursor {
+                    let mut block = Vec::new();
+                    while worker_index < worker_rows.len()
+                        && worker_rows[worker_index].index < cursor
+                    {
+                        block.push(worker_rows[worker_index].clone());
+                        worker_index += 1;
+                    }
+                    if block
+                        .iter()
+                        .any(|row| matches!(row.status, "is starting" | "is working"))
+                    {
+                        active_row = Some(rows.len());
+                    }
+                    rows.push(ChatRow::Subagents { start, rows: block });
+                }
+                continue;
+            }
+            // Reasoning stays outside the tool group so live thoughts are always
+            // visible instead of hiding behind a collapsed "Used N tools" row.
+            if message.role == ChatRole::Tool && message.tool.is_some() {
+                let start = cursor;
+                let mut parts: Vec<(usize, Arc<ChatMessage>)> = Vec::new();
+                while cursor < visible.len()
+                    && visible[cursor].role == ChatRole::Tool
+                    && visible[cursor]
+                        .tool
+                        .as_ref()
+                        .is_some_and(|tool| tool.workers.is_empty())
+                {
+                    parts.push((cursor, Arc::clone(&visible[cursor])));
+                    cursor += 1;
+                }
+                let open = pane.chat.expanded_tool_groups.contains(&start);
+                let live = running && cursor == visible.len();
+                if live {
+                    active_row = Some(rows.len());
+                }
+                rows.push(ChatRow::ToolGroup {
+                    start,
+                    parts,
+                    open,
+                    running: live,
+                });
+                continue;
+            }
+            let live = running && cursor + 1 == visible.len();
+            if message.streaming {
+                active_row = Some(rows.len());
+            }
+            rows.push(ChatRow::Message {
+                index: cursor,
+                message: Arc::clone(message),
+                live,
+            });
+            cursor += 1;
+        }
+        if running {
+            rows.push(ChatRow::Running);
+        }
+        (rows, active_row)
+    }
+
+    fn render_chat_row(
+        snapshot: &ChatSnapshot,
+        index: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let Some(row) = snapshot.rows.get(index) else {
+            return div().into_any_element();
+        };
+        let tokens = snapshot.tokens;
+        let inner: AnyElement = match row {
+            ChatRow::Subagents { start, rows } => {
+                let rendered = rows
+                    .iter()
+                    .map(|row| {
+                        Self::render_worker_row(snapshot.pane_id, row, tokens, &snapshot.host)
+                    })
+                    .collect::<Vec<_>>();
+                div()
+                    .debug_selector({
+                        let start = *start;
+                        move || format!("subagent-list-{start}")
+                    })
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .pb(px(10.0))
+                    .border_b_1()
+                    .border_color(tokens.border_subtle)
+                    .child(
+                        div()
+                            .pb(px(7.0))
+                            .text_size(px(14.0))
+                            .text_color(tokens.text_muted)
+                            .child("Subagents"),
+                    )
+                    .children(rendered)
+                    .into_any_element()
+            }
+            ChatRow::ToolGroup {
+                start,
+                parts,
+                open,
+                running,
+            } => Self::render_chat_tool_group(
+                snapshot.pane_id,
+                snapshot.conversation.as_ref(),
+                *start,
+                parts,
+                *open,
+                *running,
+                tokens,
+                Some(&snapshot.ui_state),
+                &snapshot.host,
+                window,
+                cx,
+            ),
+            ChatRow::Message {
+                index,
+                message,
+                live,
+            } => Self::render_chat_message(
+                snapshot.pane_id,
+                snapshot.conversation.as_ref(),
+                *index,
+                message,
+                *live,
+                tokens,
+                Some(&snapshot.ui_state),
+                &snapshot.host,
+                window,
+                cx,
+            ),
+            ChatRow::Running => div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(4.0))
+                .py(px(2.0))
+                .child(div().size(px(6.0)).rounded_full().bg(tokens.block_warning))
+                .child(
+                    div()
+                        .text_color(tokens.text_muted)
+                        .text_size(px(12.0))
+                        .child("Waiting for agent updates…"),
+                )
+                .into_any_element(),
+        };
+        div()
+            .w_full()
+            .min_w_0()
+            .pb(px(8.0))
+            .child(inner)
             .into_any_element()
     }
     fn render_terminal_pane(
@@ -14510,7 +14961,12 @@ mod resize_tests {
         fn draw_frame(&mut self) -> anyhow::Result<()> {
             self.update(|window, cx| {
                 window.draw(cx).clear(cx);
-                window.render_to_image().map(drop)
+                let rendered = window.render_to_image().map(drop);
+                // Production runs next-frame callbacks as soon as the frame is
+                // presented; make headless frames do the same so paint-timing
+                // assertions observe the real ordering.
+                window.simulate_next_frame(cx);
+                rendered
             })
         }
     }
@@ -14791,7 +15247,7 @@ mod resize_tests {
         let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
         cx.update_window_entity(&state, |s, window, cx| {
             s.set_chat_mode(pane_id, true, window, cx);
-            s.pane_mut(pane_id).unwrap().chat.messages.push(ChatMessage::new(
+            s.pane_mut(pane_id).unwrap().chat.messages.push(Arc::new(ChatMessage::new(
                 ChatRole::Assistant,
                 r#"Here is the generated card:
 
@@ -14838,7 +15294,7 @@ mod resize_tests {
 
 Done."#
                     .into(),
-            ));
+            )));
         });
         cx.draw_frame().expect("draw an AI-generated UI card");
         for (preference, is_dark) in [
@@ -14866,10 +15322,10 @@ Done."#
                 .unwrap()
                 .chat
                 .messages
-                .push(ChatMessage::new(
+                .push(Arc::new(ChatMessage::new(
                     ChatRole::Assistant,
                     "```ui\n{\"root\":\"check\",\"elements\":{\"check\":{\"type\":\"Checkbox\",\"props\":{\"label\":\"Toggle me\",\"checked\":false}}}}\n```".into(),
-                ));
+                )));
         });
         cx.draw_frame().expect("draw checkbox card");
         let card = format!("agent-markdown-{pane_id}-None-0-ui-0");
@@ -16426,7 +16882,7 @@ mod kathamo_bottom_input_tests {
                 },
             );
         }
-        let parts: Vec<(usize, &ChatMessage)> = messages.iter().enumerate().collect();
+        let parts: Vec<(usize, Arc<ChatMessage>)> = messages.iter().cloned().enumerate().collect();
         let (prefix, title) = tool_group_label(&parts);
         assert_eq!(format!("{prefix}{title}"), "Used 2 Read, Grep");
     }
@@ -16661,7 +17117,7 @@ First report
             assert!(pane.chat.autoscroll, "autoscroll must be true by default");
             // Add several messages so the container has scrollable content
             for i in 0..15 {
-                pane.chat.messages.push(ChatMessage::new(
+                pane.chat.messages.push(Arc::new(ChatMessage::new(
                     if i % 2 == 0 {
                         ChatRole::User
                     } else {
@@ -16670,19 +17126,17 @@ First report
                     format!(
                         "Message {i} with several lines of text to ensure vertical scrollability."
                     ),
-                ));
+                )));
             }
         });
         cx.draw_frame()
             .expect("draw chat frame with autoscroll pinned");
         state.read_with(&cx, |s, _| {
             let pane = s.pane_ref(id).unwrap();
-            let offset_y = pane.chat.scroll.offset().y;
-            let max_y = pane.chat.scroll.max_offset().y;
-            assert!(max_y > px(0.0), "content should be scrollable");
             assert_eq!(
-                offset_y, -max_y,
-                "autoscroll must be clamped to the bottom offset"
+                pane.chat.list_state.is_scrolled_to_end(),
+                Some(true),
+                "autoscroll must follow the end of the transcript"
             );
         });
 
@@ -16690,10 +17144,10 @@ First report
         cx.update_window_entity(&state, |s, _, cx| {
             let pane = s.pane_mut(id).unwrap();
             for i in 15..25 {
-                pane.chat.messages.push(ChatMessage::new(
+                pane.chat.messages.push(Arc::new(ChatMessage::new(
                     ChatRole::Assistant,
                     format!("New streamed chunk {i} making the conversation much taller!"),
-                ));
+                )));
             }
             cx.notify();
         });
@@ -16701,10 +17155,9 @@ First report
             .expect("draw frame after new streamed chunks");
         state.read_with(&cx, |s, _| {
             let pane = s.pane_ref(id).unwrap();
-            let offset_y = pane.chat.scroll.offset().y;
-            let max_y = pane.chat.scroll.max_offset().y;
             assert_eq!(
-                offset_y, -max_y,
+                pane.chat.list_state.is_scrolled_to_end(),
+                Some(true),
                 "autoscroll must follow growing content to the new bottom"
             );
         });
@@ -16712,10 +17165,10 @@ First report
         cx.update_window_entity(&state, |s, _, cx| {
             let pane = s.pane_mut(id).unwrap();
             pane.chat.autoscroll = false;
-            let max_y = pane.chat.scroll.max_offset().y;
-            pane.chat
-                .scroll
-                .set_offset(point(px(0.), -max_y + px(400.0)));
+            pane.chat.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.0),
+            });
             cx.notify();
         });
         cx.draw_frame()
@@ -16736,6 +17189,10 @@ First report
             assert!(
                 pane.chat.autoscroll,
                 "sending a new prompt must re-pin autoscroll to the bottom"
+            );
+            assert!(
+                pane.chat.list_state.is_following_tail(),
+                "the list must resume following the tail"
             );
         });
         cx.draw_frame().unwrap();
@@ -18367,37 +18824,73 @@ First report
         });
     }
 
-    #[test]
-    #[ignore = "prints timings for the headless chat view"]
-    fn streaming_chat_frame_benchmark() {
+    fn process_rss_kib() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        status
+            .lines()
+            .find(|line| line.starts_with("VmRSS:"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn measure_chat_frames(name: &str, pairs: usize, paragraphs: usize, deltas_per_frame: usize) {
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         let pane_id = state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
-        let reply = format!(
-            "{}\n\n```ui\n{{\"root\":\"label\",\"elements\":{{\"label\":{{\"type\":\"Text\",\"props\":{{\"text\":\"Ready\"}}}}}}}}\n```",
-            "A settled paragraph with **formatting** and a code snippet.\n\n".repeat(16)
+        let mut reply =
+            "A settled paragraph with **formatting** and a code snippet.\n\n".repeat(paragraphs);
+        reply.push_str(
+            "```ui\n{\"root\":\"label\",\"elements\":{\"label\":{\"type\":\"Text\",\"props\":{\"text\":\"Ready\"}}}}\n```",
         );
+        let mut turn_trace = None;
         cx.update_window_entity(&state, |state, window, cx| {
             state.set_chat_mode(pane_id, true, window, cx);
             let messages = state.pane_mut(pane_id).unwrap().chat.visible_messages_mut();
-            for _ in 0..24 {
-                messages.push(ChatMessage::new(ChatRole::User, "Prompt".into()));
-                messages.push(ChatMessage::new(ChatRole::Assistant, reply.clone()));
+            for _ in 0..pairs {
+                messages.push(Arc::new(ChatMessage::new(ChatRole::User, "Prompt".into())));
+                messages.push(Arc::new(ChatMessage::new(
+                    ChatRole::Assistant,
+                    reply.clone(),
+                )));
+                // Exercise the grouped-tool path in the visible window too.
+                push_chat_event(
+                    messages,
+                    agent_bridge::AgentEvent::ToolEnd {
+                        id: Some(format!("tool-{pairs}")),
+                        name: "read".into(),
+                        output: "ok".into(),
+                        failed: false,
+                    },
+                );
             }
-            messages.push(ChatMessage::new(ChatRole::User, "Another prompt".into()));
+            messages.push(Arc::new(ChatMessage::new(
+                ChatRole::User,
+                "Another prompt".into(),
+            )));
+            let turn = crate::stream_timing::new_trace();
+            turn_trace = Some(turn);
+            crate::stream_timing::turn_sent(turn, false);
             push_chat_event(
                 messages,
                 agent_bridge::AgentEvent::Text("Starting. ".into()),
             );
+            if let Some(last) = messages.last_mut() {
+                Arc::make_mut(last).turn = Some(turn);
+            }
+            crate::stream_timing::turn_delta_arrived(turn, crate::stream_timing::DeltaKind::Answer);
         });
         for _ in 0..8 {
             cx.draw_frame().unwrap();
         }
+        let rss_before = process_rss_kib();
         let mut samples = Vec::new();
         for _ in 0..48 {
             cx.update_window_entity(&state, |state, _, cx| {
                 let messages = state.pane_mut(pane_id).unwrap().chat.visible_messages_mut();
-                push_chat_event(messages, agent_bridge::AgentEvent::Text("x ".into()));
+                for _ in 0..deltas_per_frame {
+                    push_chat_event(messages, agent_bridge::AgentEvent::Text("x ".into()));
+                }
                 cx.notify();
             });
             let start = std::time::Instant::now();
@@ -18405,7 +18898,31 @@ First report
             samples.push(start.elapsed().as_micros());
         }
         samples.sort_unstable();
-        println!("frame_us p50={} p95={}", samples[24], samples[45]);
+        if let Some(turn) = turn_trace {
+            crate::stream_timing::turn_settled(turn);
+        }
+        println!(
+            "{name}: messages={} frame_us p50={} p95={} max={} rss_delta_kib={}",
+            pairs * 3 + 2,
+            samples[24],
+            samples[45],
+            samples.last().copied().unwrap_or_default(),
+            process_rss_kib().saturating_sub(rss_before)
+        );
+        crate::stream_timing::report_now();
+    }
+
+    #[test]
+    #[ignore = "prints timings for the headless chat view"]
+    fn streaming_chat_frame_benchmark() {
+        // Force the metadata timings this test prints. Safe here: the ignored
+        // benchmark runs alone and this happens before the first frame.
+        unsafe {
+            std::env::set_var("KATHAMO_STREAM_TIMINGS", "1");
+        }
+        measure_chat_frames("short", 24, 16, 1);
+        measure_chat_frames("long", 240, 3, 1);
+        measure_chat_frames("long-bursty", 240, 3, 8);
     }
 
     #[test]
@@ -18420,19 +18937,31 @@ First report
         agent_bridge::set_wake(Arc::new(move || {
             let _ = wake_tx.try_send(());
         }));
+        unsafe {
+            std::env::set_var("KATHAMO_STREAM_TIMINGS", "1");
+        }
         let settle = std::env::var_os("KATHAMO_BENCH_SETTLE").is_some();
+        let mut resumed_session: Option<String> = None;
         for sample in 0..12 {
             let startup = Instant::now();
-            let mut bridge = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+            let mut bridge = match resumed_session.as_deref() {
+                Some(session) => {
+                    AgentBridge::spawn_resumed(&cwd, Some(session), Some("bench/fixture")).unwrap()
+                }
+                None => AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap(),
+            };
             let spawn = startup.elapsed();
             let mut messages = Vec::new();
             for turn in 0..2 {
                 let start = Instant::now();
+                let trace = bridge.trace_id();
+                crate::stream_timing::turn_sent(trace, turn > 0);
                 bridge.send_prompt("Say x sixteen times.").unwrap();
                 let mut first = None;
                 let mut last = None;
                 let mut max_gap = Duration::ZERO;
                 let mut count = 0;
+                let mut seen = String::new();
                 let mut done = false;
                 let mut completions = 0;
                 while !done {
@@ -18442,16 +18971,22 @@ First report
                             AgentEvent::Error(error) => panic!("{error}"),
                             AgentEvent::Text(text) => {
                                 count += text.len();
+                                seen.push_str(text);
                                 let now = start.elapsed();
                                 first.get_or_insert(now);
                                 if let Some(previous) = last {
                                     max_gap = max_gap.max(now - previous);
                                 }
                                 last = Some(now);
+                                crate::stream_timing::turn_delta_applied(
+                                    trace,
+                                    crate::stream_timing::DeltaKind::Answer,
+                                );
                             }
                             AgentEvent::Done => {
                                 completions += 1;
                                 done = true;
+                                crate::stream_timing::turn_settled(trace);
                                 finish_chat_streaming(&mut messages);
                             }
                             _ => {}
@@ -18460,6 +18995,7 @@ First report
                     }
                 }
                 assert_eq!(count, 16);
+                assert_eq!(seen, "x".repeat(16), "exact transcript text and order");
                 if !settle {
                     assert_eq!(completions, 1);
                 }
@@ -18476,10 +19012,299 @@ First report
                     bridge.poll();
                 }
             }
+            if let Some(id) = bridge.session_id() {
+                resumed_session = Some(id);
+            }
             let drop_start = Instant::now();
             drop(bridge);
             println!("drop_us={}", drop_start.elapsed().as_micros());
         }
+        crate::stream_timing::report_now();
+
+        // Bursty stream: the fixture writes 512 tokens without pacing. Warm
+        // turns must deliver the first delta within a frame of the request.
+        const BURST_TOKENS: usize = 512;
+        for sample in 0..8 {
+            let startup = Instant::now();
+            let mut bridge = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+            let spawn = startup.elapsed();
+            let mut messages = Vec::new();
+            for turn in 0..3 {
+                let start = Instant::now();
+                let trace = bridge.trace_id();
+                crate::stream_timing::turn_sent(trace, turn > 0);
+                bridge.send_prompt("Burst 512 tokens.").unwrap();
+                let mut first = None;
+                let mut last = None;
+                let mut max_gap = Duration::ZERO;
+                let mut count = 0;
+                let mut seen = String::new();
+                let mut done = false;
+                let mut completions = 0;
+                while !done {
+                    wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    for event in bridge.poll() {
+                        match &event {
+                            AgentEvent::Error(error) => panic!("{error}"),
+                            AgentEvent::Text(text) => {
+                                count += text.len();
+                                seen.push_str(text);
+                                let now = start.elapsed();
+                                first.get_or_insert(now);
+                                if let Some(previous) = last {
+                                    max_gap = max_gap.max(now - previous);
+                                }
+                                last = Some(now);
+                                crate::stream_timing::turn_delta_applied(
+                                    trace,
+                                    crate::stream_timing::DeltaKind::Answer,
+                                );
+                            }
+                            AgentEvent::Done => {
+                                completions += 1;
+                                done = true;
+                                crate::stream_timing::turn_settled(trace);
+                                finish_chat_streaming(&mut messages);
+                            }
+                            _ => {}
+                        }
+                        push_chat_event(&mut messages, event);
+                    }
+                }
+                assert_eq!(count, BURST_TOKENS);
+                assert_eq!(seen, "x".repeat(BURST_TOKENS));
+                assert_eq!(completions, 1, "one completion per turn");
+                println!(
+                    "burst sample={sample} turn={turn} spawn_us={} ttft_us={} last_us={} total_us={} max_gap_us={}",
+                    spawn.as_micros(),
+                    first.unwrap().as_micros(),
+                    last.unwrap().as_micros(),
+                    start.elapsed().as_micros(),
+                    max_gap.as_micros(),
+                );
+            }
+            drop(bridge);
+        }
+        crate::stream_timing::report_now();
+
+        // Cancellation: stream a paced answer, stop after the first delta, and
+        // verify one completion plus a settled turn.
+        let mut bridge = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+        let mut messages = Vec::new();
+        let trace = bridge.trace_id();
+        crate::stream_timing::turn_sent(trace, true);
+        bridge.send_prompt("Slow 200 tokens.").unwrap();
+        let mut first_delta = None;
+        let mut cancel_at = None;
+        let mut done = false;
+        let mut completions = 0;
+        while !done {
+            wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            for event in bridge.poll() {
+                match &event {
+                    AgentEvent::Text(_) => {
+                        first_delta.get_or_insert_with(Instant::now);
+                        if cancel_at.is_none() {
+                            crate::stream_timing::turn_cancelled(trace);
+                            cancel_at = Some(Instant::now());
+                            bridge.cancel().unwrap();
+                        }
+                    }
+                    AgentEvent::Done => {
+                        completions += 1;
+                        done = true;
+                        crate::stream_timing::turn_settled(trace);
+                        finish_chat_streaming(&mut messages);
+                    }
+                    AgentEvent::Error(error) => {
+                        // An aborted provider request may surface as an error.
+                        let lower = error.to_ascii_lowercase();
+                        assert!(
+                            lower.contains("abort") || lower.contains("cancel"),
+                            "unexpected error during cancel: {error}"
+                        );
+                    }
+                    _ => {}
+                }
+                push_chat_event(&mut messages, event);
+            }
+        }
+        assert_eq!(completions, 1, "cancellation must settle exactly once");
+        let cancel_at = cancel_at.expect("a delta arrived before cancel");
+        println!(
+            "cancel first_delta_to_cancel_us={} settle_us={}",
+            first_delta
+                .expect("first delta")
+                .duration_since(cancel_at)
+                .as_micros(),
+            cancel_at.elapsed().as_micros()
+        );
+        drop(bridge);
+        crate::stream_timing::report_now();
+
+        // Two panes streaming at once must both complete exactly once without
+        // blocking the shared pump thread.
+        fn process_stats() -> (u64, u64) {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let read = |key: &str| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with(key))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            (read("Threads:"), read("VmRSS:"))
+        }
+        let (threads_before, _) = process_stats();
+        let mut first = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+        let mut second = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+        let traces = [first.trace_id(), second.trace_id()];
+        for trace in traces {
+            crate::stream_timing::turn_sent(trace, false);
+        }
+        first.send_prompt("Say x sixteen times.").unwrap();
+        second.send_prompt("Say x sixteen times.").unwrap();
+        let mut counts = [0usize; 2];
+        let mut completions = [0usize; 2];
+        let mut done = [false; 2];
+        while !done.iter().all(|done| *done) {
+            wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            for (index, bridge) in [&mut first, &mut second].into_iter().enumerate() {
+                for event in bridge.poll() {
+                    match &event {
+                        AgentEvent::Text(text) => counts[index] += text.len(),
+                        AgentEvent::Done => {
+                            completions[index] += 1;
+                            done[index] = true;
+                            crate::stream_timing::turn_settled(traces[index]);
+                        }
+                        AgentEvent::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        assert_eq!(counts, [16, 16]);
+        assert_eq!(completions, [1, 1], "one completion per concurrent pane");
+        let (threads_after, rss_kib) = process_stats();
+        println!(
+            "concurrent threads before={threads_before} after={threads_after} rss_kib={rss_kib} counts={counts:?} completions={completions:?}"
+        );
+        drop(first);
+        drop(second);
+
+        // Backend failure: one Error and one Done, then the same bridge must
+        // accept an immediate follow-up successfully.
+        let mut bridge = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+        let mut messages = Vec::new();
+        let trace = bridge.trace_id();
+        crate::stream_timing::turn_sent(trace, false);
+        bridge.send_prompt("Fail request.").unwrap();
+        let mut errors = 0;
+        let mut completions = 0;
+        let mut done = false;
+        while !done {
+            wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            for event in bridge.poll() {
+                match &event {
+                    AgentEvent::Error(error) => {
+                        let lower = error.to_ascii_lowercase();
+                        assert!(lower.contains("400") || lower.contains("boom"), "{error}");
+                        errors += 1;
+                    }
+                    AgentEvent::Done => {
+                        completions += 1;
+                        done = true;
+                        crate::stream_timing::turn_settled(trace);
+                    }
+                    _ => {}
+                }
+                push_chat_event(&mut messages, event);
+            }
+        }
+        assert_eq!(errors, 1);
+        assert_eq!(completions, 1);
+        crate::stream_timing::turn_sent(trace, true);
+        bridge.send_prompt("Say x sixteen times.").unwrap();
+        let mut follow_count = 0;
+        let mut follow_done = false;
+        let mut follow_completions = 0;
+        while !follow_done {
+            wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            for event in bridge.poll() {
+                match &event {
+                    AgentEvent::Text(text) => follow_count += text.len(),
+                    AgentEvent::Done => {
+                        follow_completions += 1;
+                        follow_done = true;
+                        crate::stream_timing::turn_settled(trace);
+                    }
+                    AgentEvent::Error(error) => panic!("follow-up failed: {error}"),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(follow_count, 16);
+        assert_eq!(follow_completions, 1);
+        println!("backend_failure errors={errors} completions={completions} follow_up=ok");
+        drop(bridge);
+    }
+
+    #[test]
+    #[ignore = "prints slow-reader enqueue timings; run with --ignored --nocapture"]
+    fn slow_reader_writer_benchmark() {
+        use crate::agent_writer::AgentWriter;
+        use std::io::Write;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+
+        struct SlowReader {
+            release: Arc<AtomicBool>,
+        }
+
+        impl Write for SlowReader {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                while !self.release.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let release = Arc::new(AtomicBool::new(false));
+        let sink_release = Arc::clone(&release);
+        let writer = AgentWriter::spawn(
+            SlowReader {
+                release: sink_release,
+            },
+            |error| {
+                eprintln!("slow-reader write error: {error}");
+            },
+        );
+        let prompt = "x".repeat(4 * 1024 * 1024);
+        let start = Instant::now();
+        writer.send_prompt("slow".into(), prompt).unwrap();
+        let prompt_us = start.elapsed().as_micros();
+        let mut worst = Duration::ZERO;
+        for index in 0..2_000 {
+            let start = Instant::now();
+            writer
+                .send_json(serde_json::json!({"type":"abort","id":index}))
+                .unwrap();
+            worst = worst.max(start.elapsed());
+        }
+        let queue_us = start.elapsed().as_micros();
+        println!(
+            "slow_reader prompt_enqueue_us={prompt_us} 2000_abort_enqueue_us={queue_us} worst_us={}",
+            worst.as_micros()
+        );
+        release.store(true, Ordering::Release);
+        writer.shutdown();
     }
 
     #[test]

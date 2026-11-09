@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="rpi 博客：版本发布说明、性能实测与技术实现细节。" />
+
+    <link rel="canonical" href="https://rpi.laofu.online/blog.html" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="theme-color" content="#101113" />
+    <meta name="robots" content="index, follow" />
+
+    <meta property="og:type" content="Blog" />
+    <meta property="og:site_name" content="rpi" />
+    <meta property="og:url" content="https://rpi.laofu.online/blog.html" />
+    <meta property="og:title" content="Blog · rpi" />
+    <meta property="og:description" content="rpi 博客：版本发布说明、性能实测与技术实现细节。" />
+    <meta property="og:image" content="https://rpi.laofu.online/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="rpi interactive terminal session" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:locale:alternate" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Blog · rpi" />
+    <meta name="twitter:description" content="rpi 博客：版本发布说明、性能实测与技术实现细节。" />
+    <meta name="twitter:image" content="https://rpi.laofu.online/og-image.png" />
+    <title>Blog · rpi</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css?v=20261014-qr-crop" />
+    <script defer src="https://stat.laofu.online/script.js" data-website-id="ed386bec-9be6-486a-b184-d72a437dd346" data-performance="true"></script>
+    <script defer src="https://stat.laofu.online/recorder.js" data-website-id="ed386bec-9be6-486a-b184-d72a437dd346"></script>
+  </head>
+  <body class="blog-page">
+    <div class="site-shell">
+      <header class="topbar" data-sticky-header>
+        <a class="brand" href="./index.html#top" aria-label="rpi home"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span></a>
+        <nav class="desktop-nav" aria-label="主导航"><a href="./index.html#top" data-i18n="nav.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">扩展</a><a href="./compare.html" data-i18n="nav.compare">对比</a><a class="is-current" href="https://blog.laofu.online/" target="_blank" rel="noreferrer" data-i18n="nav.blog">博客</a></nav>
+        <div class="topbar-actions"><button class="language-switcher" type="button" data-language-toggle>EN</button><a class="button button-small button-star" aria-label="Star 支持" data-i18n-attr="aria-label|action.star" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer"><svg class="star-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 2.8 5.7 6.3.9-4.6 4.5 1.1 6.3-5.6-3-5.6 3 1.1-6.3L3 9.6l6.2-.9Z"/></svg><span data-i18n="action.star">Star 支持</span></a><a class="button button-small desktop-only" href="./index.html#get-started" data-i18n="nav.start">开始使用 <span aria-hidden="true">→</span></a><a class="button button-small button-sponsor" href="./support.html" target="_blank" rel="noopener noreferrer" data-i18n="support.author">赞助作者</a><button class="menu-toggle" type="button" aria-label="打开导航" data-i18n-attr="aria-label|nav.open" aria-expanded="false" data-menu-toggle><span></span><span></span></button></div>
+      </header>
+      <div class="mobile-menu" data-mobile-menu><a href="./index.html#top" data-i18n="nav.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">扩展</a><a href="./compare.html" data-i18n="nav.compare">对比</a><a class="is-current" href="https://blog.laofu.online/" target="_blank" rel="noreferrer" data-i18n="nav.blog">博客</a></div>
+
+      <main>
+        <section class="blog-hero page-section">
+          <div class="eyebrow eyebrow-dark">RPI / UPDATES</div>
+          <h1 data-i18n="blog.title">博客</h1>
+          <p data-i18n="blog.intro">版本更新、技术分享与项目动态。追踪 rpi 的每一步演进。</p>
+          <p class="blog-external-link"><a class="button button-small" href="https://blog.laofu.online/" target="_blank" rel="noreferrer" data-i18n="blog.external">前往 bigfish 网络博客 ↗</a></p>
+        </section>
+        <section class="blog-workspace page-section">
+          <div class="blog-list" data-blog-list></div>
+          <div class="blog-empty" data-blog-empty hidden data-i18n="blog.empty">暂无文章，敬请期待。</div>
+          <div class="blog-detail" data-blog-detail hidden></div>
+        </section>
+      </main>
+      <footer class="footer"><div class="footer-brand"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span><span class="footer-tagline">Rust Agent Toolkit</span></div><div class="footer-links"><a href="./index.html" data-i18n="footer.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">软件包</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a><a href="./support.html" target="_blank" rel="noopener noreferrer" data-i18n="support.author">赞助作者</a><span>MIT License</span></div></footer>
+      <div class="toast" role="status" aria-live="polite" data-toast></div>
+    </div>
+    <script src="./blog.js?v=20261014-language-fix" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,376 @@
+# Taskfile for the rpi-* crate family release.
+#
+# `task publish` is the one-command release: it computes the next version
+# automatically (scripts/next-version.sh), then hands the whole bump -> tag ->
+# push -> binaries -> channels -> crates.io -> site pipeline to
+# scripts/release.sh. `task release` is the same pipeline for an explicit
+# version; `task publish:crates` is the crates.io-only half.
+#
+# The dep-ordered publish itself is driven by release-helper.rs via plain
+# `cargo publish`. Keep this file as the ergonomic entry point so the
+# dependency order is encoded once and `cargo test` stays the pre-flight.
+#
+# Dependency order (v0.1.4+): telemetry → ai → runtime → agent →
+# plugin-sdk → extensions → tools → harness → tui → cli. plugin-sdk is a
+# zero-dep leaf and extensions depends on plugin-sdk + ai + agent, so both land
+# before tools/harness (which are independent of them but published in family
+# order).
+#
+# Usage:
+#   task              # list targets
+#   task publish      # 发布下一个版本：自动递增 + 跑完整流水线
+#   task publish RELEASE_VERSION=0.4.0
+#                     # 指定版本发布
+#   task publish RELEASE_BUMP=minor
+#                     # 递增 minor（默认 patch；也可 major / none）
+#   task publish -- --from push --yes
+#                     # 续跑中断的发布，额外参数原样传给 scripts/release.sh
+#   task publish:crates
+#                     # 只发 crates.io，用 Cargo.toml 里已准备好的版本
+#   task publish:fast RELEASE_VERSION=0.1.12
+#                     # 只发 crates.io，跳过 test/check（仍校验发布状态）
+#   task dry-run RELEASE_VERSION=0.1.12
+#                     # package all crates without uploading
+#   task test         # cargo test --workspace --locked
+#
+# 版本自动递增以最高的 `vX.Y.Z` 标签为基准，但 Cargo.toml 里的 workspace 版本
+# 一旦已经领先于所有标签就原样沿用 —— 说明这一版已经 bump 过、只是还没发出去。
+# 所以续跑中断的发布用 `RELEASE_BUMP=none`（或直接给 RELEASE_VERSION）。
+#
+# Prerequisites for `task publish*`: `rustc` and `curl` on PATH, plus a one-time
+# `cargo login` so ~/.cargo/credentials.toml has a publish-scoped token.
+# crates.io records are permanent.
+
+version: '3'
+
+vars:
+  RPI_SERVICE_NAME: rpi
+  RPI_DOMAIN: rpi.laofu.online
+  RPI_DOMAINS: '{{.RPI_DOMAIN}} rpi.bigfisharc.cn'
+  RPI_DEPLOY_DIR: .deploy/rpi
+  RPI_RELEASE_HELPER:
+    sh: git rev-parse --git-path rpi-release-helper.exe
+
+  # 自动版本递增的默认部分（patch|minor|major|none）。CLI 传 RELEASE_BUMP 覆盖。
+  RELEASE_BUMP: patch
+
+tasks:
+  default:
+    desc: List available release targets
+    cmds:
+      - task --list
+
+  dry-run:
+    desc: Package all rpi-* crates in release order without uploading
+    vars:
+      PREPARED_VERSION:
+        sh: bash scripts/next-version.sh none
+      VERSION: '{{.RELEASE_VERSION | default .PREPARED_VERSION}}'
+    cmds:
+      - task: release:validate
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
+      - task: release:dry-run-crates
+
+  publish:
+    desc: 发布下一个版本 —— 自动递增版本号，然后跑完整发布流水线
+    vars:
+      AUTO_VERSION:
+        sh: bash scripts/next-version.sh {{.RELEASE_BUMP}}
+      VERSION: '{{.RELEASE_VERSION | default .AUTO_VERSION}}'
+    cmds:
+      - bash scripts/release.sh "{{.VERSION}}" {{.CLI_ARGS}}
+
+  publish:crates:
+    desc: 只发布 crates.io（默认用 Cargo.toml 里已准备好的版本）
+    vars:
+      PREPARED_VERSION:
+        sh: bash scripts/next-version.sh none
+      VERSION: '{{.RELEASE_VERSION | default .PREPARED_VERSION}}'
+    cmds:
+      - task: release:validate
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
+      - task: test
+      - task: check
+      - task: release:publish-crates
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
+
+  publish:fast:
+    desc: 只发 crates.io，跳过 test/check（仍校验发布状态）
+    vars:
+      PREPARED_VERSION:
+        sh: bash scripts/next-version.sh none
+      VERSION: '{{.RELEASE_VERSION | default .PREPARED_VERSION}}'
+    cmds:
+      - task: release:validate
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
+      - task: release:publish-crates
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
+
+  release:
+    desc: One-command release for an explicit version — bump, tag, wait for binaries, refresh every channel
+    requires:
+      vars: [RELEASE_VERSION]
+    cmds:
+      - bash scripts/release.sh "{{.RELEASE_VERSION}}" {{.CLI_ARGS}}
+
+  release:channels:
+    desc: Refresh the install-channel manifests + site data for a released version
+    requires:
+      vars: [RELEASE_VERSION]
+    cmds:
+      - bash scripts/refresh-channels.sh "{{.RELEASE_VERSION}}"
+
+  release:validate:
+    desc: Require a clean tree and one consistent version across the workspace release crates
+    requires:
+      vars: [RELEASE_VERSION]
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" validate "{{.RELEASE_VERSION}}"'
+
+  release:validate-dirty:
+    desc: Validate the release state while the version bump is still uncommitted (pre-commit)
+    requires:
+      vars: [RELEASE_VERSION]
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" validate "{{.RELEASE_VERSION}}" --allow-dirty'
+
+  release:build-helper:
+    internal: true
+    cmds:
+      - rustc --edition=2021 release-helper.rs -o "{{.RPI_RELEASE_HELPER}}"
+
+  release:dry-run-crates:
+    internal: true
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" dry-run'
+
+  release:publish-crates:
+    internal: true
+    requires:
+      vars: [RELEASE_VERSION]
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" publish "{{.RELEASE_VERSION}}"'
+
+  docs:sync:
+    desc: 同步仓库文档到 pi-cli 的 embedded-docs（include_str! 快照，CI 会校验）
+    cmds:
+      - sh scripts/sync-embedded-docs.sh
+
+  test:
+    desc: Run the locked workspace test suite
+    cmds:
+      - cargo test --workspace --locked
+
+  test:session:
+    desc: 离线测试真实 CLI 的消息、重启恢复与会话隔离（诊断目录必须不存在）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.SESSION_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.SESSION_CARGO_TARGET_DIR | default "target/session-smoke-cargo"}}'
+      DEFAULT_BINARY: '{{.BUILD_TARGET}}/debug/rpi{{if eq OS "windows"}}.exe{{end}}'
+      BINARY: '{{.SESSION_BINARY | default .DEFAULT_BINARY}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/session-smoke-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.SESSION_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_session_smoke.py'
+      - '{{.PYTHON}} -B scripts/session-smoke.py --rpi "{{.BINARY}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" {{.CLI_ARGS}}'
+
+  test:recovery:
+    desc: 测试 harness 崩溃恢复、消息顺序与 CLI 会话 cwd 恢复
+    vars:
+      BUILD_TARGET: '{{.SESSION_CARGO_TARGET_DIR | default "target/session-smoke-cargo"}}'
+    cmds:
+      - cargo test -p rpi-harness --test harness_run_e2e --test context_message_order --test frame_progress_recovery --test m5c_jsonl_torn_tail --test jsonl_failure_regressions --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo test -p rpi-cli --test session_cwd_restore --locked --target-dir "{{.BUILD_TARGET}}"
+
+  test:resources:
+    desc: 离线测试 release 编辑器与多轮 RPC 的内存、CPU 和最终结论（不使用真实模型）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.RESOURCE_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      PROBE: '{{.RESOURCE_EDITOR_PROBE | default (printf "%s/release/examples/editor_resource_probe%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/resource-smoke-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.RESOURCE_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    env:
+      RPI_RESOURCE_SMOKE_BINARY: '{{.BINARY}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_resource_smoke.py'
+      - '{{.PYTHON}} -B scripts/test_compare_resources.py'
+      - '{{.PYTHON}} -B scripts/test_resource_tui.py'
+      - cargo test -p rpi-tui --lib --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/resource-smoke.py --rpi "{{.BINARY}}" --editor-probe "{{.PROBE}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" --profile release {{.CLI_ARGS}}'
+
+  test:cold-start:
+    desc: 回归 701000 append frames + 21733 entries 的历史冷启动、消息查询与旧格式升级（合成数据，无模型调用）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.COLD_START_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -B -c "import pathlib, tempfile, uuid; print(pathlib.Path(tempfile.gettempdir()) / (''rpi-cold-start-'' + uuid.uuid4().hex))"'
+      DIAGNOSTICS_DIR: '{{.COLD_START_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    env:
+      RPI_COLD_START_BINARY: '{{.BINARY}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release -j 1 --locked --offline --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_resource_cold_start.py'
+      - '{{.PYTHON}} -B scripts/resource-cold-start.py --candidate "{{.BINARY}}" --output "{{.DIAGNOSTICS_DIR}}-modern" --shapes modern --frames 701000 --entries 21733 --repeats 5 --max-ready-ms 2000 --max-single-ready-ms 3000 {{.CLI_ARGS}}'
+      # Legacy first-open also pays for the checked progress-format upgrade.
+      # Keep its explicit budget separate; do not silently relax the modern SLA.
+      - '{{.PYTHON}} -B scripts/resource-cold-start.py --candidate "{{.BINARY}}" --output "{{.DIAGNOSTICS_DIR}}-legacy" --shapes legacy --frames 701000 --entries 21733 --repeats 5 --max-ready-ms 3500 --max-single-ready-ms 5000 {{.CLI_ARGS}}'
+
+  test:resources:live:
+    desc: 显式启用真实模型的有界多轮资源回归（需 endpoint/model/凭据环境变量，可能收费）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.RESOURCE_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      PROBE: '{{.RESOURCE_EDITOR_PROBE | default (printf "%s/release/examples/editor_resource_probe%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/resource-smoke-live-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.RESOURCE_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/resource-smoke.py --live --rpi "{{.BINARY}}" --editor-probe "{{.PROBE}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" --profile release {{.CLI_ARGS}}'
+
+  check:
+    desc: Check all locked workspace targets
+    cmds:
+      - cargo check --workspace --all-targets --locked
+
+  metrics:
+    desc: 打印曝光指标基线（stars / crates.io 下载 / release 下载 / 仓库流量）
+    cmds:
+      - bash scripts/metrics.sh
+
+  demo-transcript:
+    desc: 重新生成 README 用的离线示例输出（demo/transcript.txt）
+    cmds:
+      - bash scripts/demo-transcript.sh
+
+  demo:
+    desc: 重新录制 README 用的离线确定性 GIF（需要 vhs + ttyd + ffmpeg）
+    cmds:
+      - cargo build -p minimal -p tools-example
+      - vhs demo/sdk.tape
+
+  rpi-pack-frontend:
+    desc: 打包 rpi 静态官网（tar.gz；zip 在 Linux 侧解压会因反斜杠分隔符报错）
+    cmds:
+      - >-
+        powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '{{.RPI_DEPLOY_DIR}}' | Out-Null; tar -czf '{{.RPI_DEPLOY_DIR}}\frontend.tar.gz' -C website --exclude=./.rpi --exclude=./.deploy ."
+      - >-
+        echo "前端包已生成: {{.RPI_DEPLOY_DIR}}/frontend.tar.gz"
+
+  rpi-upload-frontend:
+    desc: 上传 rpi 静态官网到公网服务器
+    deps:
+      - rpi-pack-frontend
+    cmds:
+      - ssh root@139.196.85.175 "mkdir -p /var/www/{{.RPI_SERVICE_NAME}} /tmp/deploy"
+      - scp "{{.RPI_DEPLOY_DIR}}/frontend.tar.gz" root@139.196.85.175:/tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.tar.gz
+      - ssh root@139.196.85.175 "tar -xzf /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.tar.gz -C /var/www/{{.RPI_SERVICE_NAME}} && rm /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.tar.gz"
+      # The web root is public and Caddy does not hide dotfiles, so local state
+      # that ever gets packaged (.rpi holds session transcripts, .deploy holds
+      # build tarballs) would be served over HTTP. Remove it on every deploy
+      # instead of relying on the packer's excludes alone.
+      - ssh root@139.196.85.175 "rm -rf /var/www/{{.RPI_SERVICE_NAME}}/.rpi /var/www/{{.RPI_SERVICE_NAME}}/.deploy"
+      - >-
+        echo "前端文件已上传到 /var/www/{{.RPI_SERVICE_NAME}}/"
+
+  rpi-upload-guide:
+    desc: 上传 rpi 完整使用手册、扩展作者指南和调试指引
+    cmds:
+      - ssh root@139.196.85.175 "mkdir -p /var/www/{{.RPI_SERVICE_NAME}}"
+      - scp docs/guides/user-guide.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/user-guide.md
+      - scp docs/extensions/authoring.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/extension-authoring.md
+      - scp docs/debugging/rust-debugging.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/rust-debugging.md
+      - >-
+        echo "使用手册、扩展作者指南和调试指引已上传"
+
+  rpi-caddy-upload:
+    desc: 上传 rpi Caddy 配置、同步新域名镜像并校验重载
+    cmds:
+      - scp deploy/rpi.caddy root@139.196.85.175:/root/work/ai-infr/config/caddy/sites/{{.RPI_SERVICE_NAME}}.caddy
+      - ssh root@139.196.85.175 "docker exec app-caddy sh -c 'mkdir -p /data/caddy && chmod 755 /data/caddy'"
+      # Do not use sync-bigfisharc.sh: it currently masks validation/reload failures.
+      # The mirror is generated, never edited or independently declared here.
+      - ssh root@139.196.85.175 "cd /root/work/ai-infr/config/caddy && python3 gen_bigfisharc.py sites sites-bigfisharc/mirror.caddy && docker exec app-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && docker exec app-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
+      - >-
+        echo "Caddy 配置已生效: {{.RPI_DOMAINS}}"
+
+  rpi-caddy-mount:
+    desc: 将 rpi 静态目录挂载到现有 Caddy 容器
+    cmds:
+      - scp deploy/caddy-rpi.override.yml root@139.196.85.175:/root/work/ai-infr/docker-compose.rpi.override.yml
+      - ssh root@139.196.85.175 "cd /root/work/ai-infr && docker compose -f docker-compose.yml -f docker-compose.rpi.override.yml config >/dev/null"
+      - ssh root@139.196.85.175 "docker rm -f app-caddy 2>/dev/null || true"
+      - ssh root@139.196.85.175 "cd /root/work/ai-infr && docker compose -f docker-compose.yml -f docker-compose.rpi.override.yml up -d caddy"
+      - powershell -NoProfile -Command "Start-Sleep -Seconds 5"
+
+  rpi-caddy-storage-repair:
+    desc: 恢复 Caddy 缺失的绑定存储目录并重启容器
+    cmds:
+      - ssh root@139.196.85.175 "mkdir -p /var/lib/docker/volumes/app-caddy-data/_data /var/lib/docker/volumes/app-caddy-config/_data"
+      - ssh root@139.196.85.175 "docker restart app-caddy"
+      - powershell -NoProfile -Command "Start-Sleep -Seconds 5"
+
+  rpi-deploy:
+    desc: 打包、上传并发布 rpi 静态官网
+    cmds:
+      - task: rpi-upload-frontend
+      - task: rpi-upload-guide
+      - task: rpi-caddy-mount
+      - task: rpi-caddy-upload
+      - task: rpi-cdn-purge
+      - task: rpi-verify
+
+  rpi-cdn-purge:
+    desc: 可选的双域名 CDN 刷新（RPI_CDN_PURGE_SCRIPT 指向供应商脚本）
+    cmds:
+      - bash scripts/website-cdn-purge.sh {{.RPI_DOMAINS}}
+
+  rpi-verify:
+    desc: 验证两个域名的官网内容、缓存策略与内部路径保护
+    cmds:
+      - python scripts/verify-website.py {{range splitList " " .RPI_DOMAINS}}https://{{.}} {{end}}
+
+  rpi-diagnose:
+    desc: 诊断 rpi 公网 HTTP 与 Caddy 状态
+    cmds:
+      - ssh root@139.196.85.175 "curl --max-time 15 --silent --show-error --head http://{{.RPI_DOMAIN}}/"
+      - ssh root@139.196.85.175 "docker logs app-caddy --tail 80 2>&1 | grep -i '{{.RPI_DOMAIN}}' || true"
+      - ssh root@139.196.85.175 "docker inspect app-caddy | head -c 5000"
+      - ssh root@139.196.85.175 "docker exec app-caddy sh -c 'ls -ld /data /config /etc/caddy 2>&1 || true'"
+      - ssh root@139.196.85.175 "docker exec app-caddy sh -c 'id; stat /data /config; test -w /config && echo config-writable || echo config-not-writable'"
+      - ssh root@139.196.85.175 "docker volume inspect app-caddy-data app-caddy-config || true"
+      - ssh root@139.196.85.175 "ls -ld /var/lib/docker/volumes/app-caddy-data/_data /var/lib/docker/volumes/app-caddy-config/_data 2>&1 || true; ls -la /var/lib/docker/volumes/app-caddy-data/_data /var/lib/docker/volumes/app-caddy-config/_data 2>&1 || true"
+      - ssh root@139.196.85.175 "docker info | grep -E 'Docker Root Dir|Storage Driver'; ls -ld /var/lib/docker /var/lib/docker/volumes"
+      - ssh root@139.196.85.175 "find /var/www/rpi -maxdepth 2 -type f -printf '%P\\n' | sort | head -80"
+      - ssh root@139.196.85.175 "curl --insecure --silent --show-error --head https://{{.RPI_DOMAIN}}/index.html; curl --insecure --silent --show-error https://{{.RPI_DOMAIN}}/data/packages.json"
+      - ssh root@139.196.85.175 "find /root/work/ai-infr -maxdepth 4 -type f \( -name 'docker-compose*.yml' -o -name 'compose*.yml' \) -print"
+      - ssh root@139.196.85.175 "grep -R -n 'app-caddy' /root/work/ai-infr --include='*.yml' --include='*.yaml' 2>/dev/null | head -40"
+      - ssh root@139.196.85.175 "sed -n '170,230p' /root/work/ai-infr/docker-compose.yml"

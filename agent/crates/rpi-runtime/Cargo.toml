@@ -1,0 +1,24 @@
+[package]
+name = "rpi-runtime"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Embeddable model catalog, credential resolution and provider execution bindings"
+readme = "README.md"
+
+[dependencies]
+rpi-ai = { workspace = true, features = ["providers"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,102 @@
+name: Release install channels
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to retry (for example v0.3.25)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  manifests:
+    if: github.repository == 'bigfish1913/pi-rust'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Run the reviewed scripts, even when retrying an older release.
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify the complete release and generate channel manifests
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          gh release download "$TAG" --repo bigfish1913/pi-rust --pattern rpi-release.json --dir "$RUNNER_TEMP"
+          python3 scripts/verify-channel-release.py "$TAG" "$RUNNER_TEMP/rpi-release.json"
+          bash scripts/refresh-channels.sh "${TAG#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: channel-manifests-${{ inputs.tag }}
+          path: packaging/
+          if-no-files-found: error
+          overwrite: true
+
+  taps:
+    needs: manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [homebrew, scoop]
+    concurrency:
+      group: release-channel-${{ matrix.channel }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: channel-manifests-${{ inputs.tag }}
+          path: packaging/
+      - name: Publish the channel
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          test -n "$GH_TOKEN" || { echo '::error::Missing RELEASE_AUTOMATION_TOKEN'; exit 1; }
+          bash scripts/push-taps.sh "${TAG#v}" "$CHANNEL"
+          echo "Published $CHANNEL for $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  winget:
+    needs: manifests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: release-channel-winget
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: channel-manifests-${{ inputs.tag }}
+          path: packaging/
+      - name: Submit or update the Microsoft winget PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          test -n "$GH_TOKEN" || { echo '::error::Missing RELEASE_AUTOMATION_TOKEN'; exit 1; }
+          bash scripts/winget-submit.sh "${TAG#v}" | tee "$RUNNER_TEMP/winget-result.txt"
+          cat "$RUNNER_TEMP/winget-result.txt" >> "$GITHUB_STEP_SUMMARY"

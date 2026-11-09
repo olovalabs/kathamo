@@ -1,0 +1,119 @@
+{
+  "hero": {
+    "eyebrow": "RUST NATIVE CODING AGENT",
+    "title": "更小，更快，<br /><em>更方便的 Agent。</em>",
+    "description": "一个 Rust 原生编程 Agent，把读写代码、执行命令和会话管理带进你的终端。下载独立二进制，配置模型就能开始；也支持插件扩展与 Rust SDK 嵌入。"
+  },
+  "stats": [
+    {
+      "value": "21.8 MiB",
+      "label": "单文件安装体积 · 基准版本"
+    },
+    {
+      "value": "10.7×",
+      "label": "冷启动更快 · 离线基准 / vs pi"
+    },
+    {
+      "value": "1/7.6",
+      "label": "启动后内存 · 离线基准 / vs pi"
+    },
+    {
+      "value": "1",
+      "label": "独立二进制 · 无需 Node.js 运行时"
+    }
+  ],
+  "features": [
+    {
+      "number": "01",
+      "title": "更小，一个二进制就够",
+      "description": "原生二进制，无需额外的 Node.js 运行时。把终端编程工具装进一个文件，减少安装体积和环境依赖。",
+      "tag": "轻量安装"
+    },
+    {
+      "number": "02",
+      "title": "更快，少一点启动等待",
+      "description": "Rust 原生启动，降低进程启动与内存开销。冷启动和就绪时内存都有可复现的离线基准，让性能优势有据可查。",
+      "tag": "原生速度"
+    },
+    {
+      "number": "03",
+      "title": "更方便，打开终端就能做",
+      "description": "预编译版本无需 Rust 工具链。配置模型后即可读写文件、执行命令；会话保存在本地，中断后还能继续。",
+      "tag": "上手省心"
+    },
+    {
+      "number": "04",
+      "title": "需要更多？自由扩展",
+      "description": "替换模型 Provider、安装 Rust 插件，或把核心 crate 嵌入你的应用。同一个 Agent，也能成为你的开发基础。",
+      "tag": "SDK 与插件"
+    }
+  ],
+  "architecture": [
+    {
+      "name": "rpi-ai",
+      "label": "Models + streaming",
+      "description": "统一消息类型、Provider 和流式事件",
+      "tone": "orange"
+    },
+    {
+      "name": "rpi-agent",
+      "label": "Agent loop",
+      "description": "工具调用、事件、Hook、steering",
+      "tone": "mint"
+    },
+    {
+      "name": "rpi-tools",
+      "label": "Built-in tools",
+      "description": "read / write / edit / bash",
+      "tone": "blue"
+    },
+    {
+      "name": "rpi-harness",
+      "label": "Sessions",
+      "description": "会话树、JSONL、compaction",
+      "tone": "violet"
+    },
+    {
+      "name": "rpi-cli",
+      "label": "Your interface",
+      "description": "CLI、TUI、配置和插件",
+      "tone": "cream"
+    }
+  ],
+  "examples": [
+    {
+      "id": "minimal",
+      "label": "Minimal agent",
+      "file": "examples/minimal/src/main.rs",
+      "note": "确定性的本地 provider，不需要 API key。",
+      "code": "use rpi_agent::AgentBuilder;\nuse rpi_ai::providers::faux::{FauxProvider, FauxScript};\n\n#[tokio::main]\nasync fn main() {\n    let script = FauxScript::new()\n        .with_text(\"Hello from rpi!\");\n    let provider = FauxProvider::new(script);\n    let model = provider.default_model().clone();\n\n    let agent = AgentBuilder::new()\n        .model(model)\n        .stream_fn(make_stream_fn(provider))\n        .build()\n        .expect(\"agent builds\");\n\n    agent.prompt(\"hi\").await.expect(\"prompt completes\");\n}\n"
+    },
+    {
+      "id": "tools",
+      "label": "Tool loop",
+      "file": "examples/tools/src/main.rs",
+      "note": "把内置 write 和 bash 工具接进真实文件系统。",
+      "code": "let env = Arc::new(OsExecutionEnv::with_cwd(tmp));\nlet ctx = ExecutionToolContext::new(\n    env.clone() as Arc<dyn ExecutionEnv>,\n    Some(env as Arc<dyn MutatingEnv>),\n);\n\nlet write = create_write_tool(&ctx);\nlet bash = create_bash_tool(&ctx, None);\n\nlet agent = AgentBuilder::new()\n    .model(model)\n    .stream_fn(make_stream_fn(provider))\n    .tools(vec![write, bash])\n    .build()?;\n\nagent.prompt(\"Write hello to out.txt\").await?;\n"
+    }
+  ],
+  "releases": [
+    {
+      "version": "0.9.0",
+      "status": "current",
+      "title": "Runtime 与性能优化",
+      "description": "抽取可复用 rpi-runtime，减少重复上下文与消息拷贝，并加入零拷贝归档 payload 与性能基准。"
+    },
+    {
+      "version": "next",
+      "status": "building",
+      "title": "更多 Provider 与扩展能力",
+      "description": "继续完善 Provider 适配、扩展资源协议与终端使用体验。"
+    },
+    {
+      "version": "future",
+      "status": "exploring",
+      "title": "你的想法",
+      "description": "把 rpi 接进你的产品、工作流和自己的运行环境。"
+    }
+  ]
+}

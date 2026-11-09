@@ -1,0 +1,256 @@
+<h1 id="rpi-user-guide">rpi User Guide</h1>
+<p>This guide describes the behavior implemented by the current <code>pi-rust</code> workspace. rpi is a native Rust coding-agent toolkit: the reusable runtime is published as crates, while <code>rpi-cli</code> provides a ready-to-run terminal application. The examples below use the current command names, configuration paths, and extension model; they are not a generic guide for the upstream Pi project.</p>
+<h2 id="1-install-and-run">1. Install and run</h2>
+<h3 id="install-the-cli">Install the CLI</h3>
+<p>Install the published binary with Rust and Cargo:</p>
+<pre><code class="language-bash">cargo install rpi-cli
+rpi --version
+rpi --help
+</code></pre>
+<p>To build the development version from source:</p>
+<pre><code class="language-bash">git clone https://github.com/bigfish1913/pi-rust.git
+cd pi-rust
+cargo install --path crates/rpi-cli --force
+</code></pre>
+<p><code>cargo install</code> installs the <code>rpi</code> executable. It is different from <code>rpi install</code>, which installs Rust dynamic-library extensions built against <code>rpi-plugin-sdk</code>.</p>
+<h3 id="build-from-the-workspace">Build from the workspace</h3>
+<p>rpi is a Cargo workspace, not a Node/npm application:</p>
+<pre><code class="language-bash">cargo run -p rpi-cli
+cargo run -p rpi-cli -- -p &quot;Summarize README.md&quot;
+cargo run -p rpi-cli -- --mode json -p &quot;List the crates in this project&quot;
+cargo build -p rpi-cli --release
+</code></pre>
+<p>The release binary is <code>target/release/rpi.exe</code> on Windows and normally <code>target/release/rpi</code> on Linux/macOS. The offline minimal example uses the deterministic faux provider and needs neither an API key nor network access:</p>
+<pre><code class="language-bash">cargo run -p minimal
+</code></pre>
+<h3 id="first-prompt">First prompt</h3>
+<p>Interactive mode:</p>
+<pre><code class="language-bash">rpi
+rpi &quot;Explain the structure of this project&quot;
+</code></pre>
+<p>One-shot mode:</p>
+<pre><code class="language-bash">rpi -p &quot;Summarize README.md&quot;
+rpi --mode json -p &quot;List the risks in this project&quot;
+</code></pre>
+<p>Prefix a file with <code>@</code> to include it in the first user message:</p>
+<pre><code class="language-bash">rpi @README.md &quot;Suggest improvements for this project&quot;
+</code></pre>
+<h2 id="2-models-and-credentials">2. Models and credentials</h2>
+<h3 id="credential-precedence">Credential precedence</h3>
+<p>When several sources are present, rpi checks them in this order:</p>
+<ol>
+<li><code>--api-key</code></li>
+<li><code>~/.rpi/auth.json</code>, written by <code>rpi auth login</code></li>
+<li>The provider's <code>apiKey</code> in <code>~/.rpi/agent/models.json</code></li>
+<li>Environment variables</li>
+</ol>
+<p>Anthropic providers accept <code>ANTHROPIC_API_KEY</code> or <code>ANTHROPIC_AUTH_TOKEN</code>. OpenAI-compatible providers use <code>OPENAI_API_KEY</code> unless a custom provider configuration supplies another value. Credential checks do not make a network request:</p>
+<pre><code class="language-bash">rpi auth check
+rpi auth check --provider gateway --json
+rpi auth login
+rpi auth logout
+</code></pre>
+<p>Never commit API keys to the repository, <code>.rpi</code> resources, or documentation.</p>
+<h3 id="configure-a-custom-provider">Configure a custom provider</h3>
+<p>The default model catalog is <code>~/.rpi/agent/models.json</code>. Set <code>RPI_CODING_AGENT_DIR</code> to relocate the whole agent configuration directory:</p>
+<pre><code class="language-jsonc">{
+  &quot;providers&quot;: {
+    &quot;gateway&quot;: {
+      &quot;api&quot;: &quot;anthropic-messages&quot;,
+      &quot;baseUrl&quot;: &quot;https://gateway.example.com&quot;,
+      &quot;apiKey&quot;: &quot;sk-gateway-secret&quot;,
+      &quot;models&quot;: [{ &quot;id&quot;: &quot;custom-claude&quot;, &quot;name&quot;: &quot;Custom Claude&quot; }]
+    },
+    &quot;openai-gateway&quot;: {
+      &quot;api&quot;: &quot;openai-completions&quot;,
+      &quot;baseUrl&quot;: &quot;https://api.example.com/v1&quot;,
+      &quot;apiKey&quot;: &quot;sk-openai-secret&quot;,
+      &quot;models&quot;: [{ &quot;id&quot;: &quot;custom-model&quot;, &quot;name&quot;: &quot;Custom Model&quot; }]
+    }
+  }
+}
+</code></pre>
+<p>Select a model with either a provider/model pattern or separate flags:</p>
+<pre><code class="language-bash">rpi --model gateway/custom-claude -p &quot;hello&quot;
+rpi --model openai-gateway/custom-model -p &quot;hello&quot;
+rpi --provider gateway --model custom-claude -p &quot;hello&quot;
+</code></pre>
+<p>Without <code>--model</code>, rpi chooses an authenticated model according to its provider catalog. A compatible Anthropic gateway can also be selected with <code>ANTHROPIC_BASE_URL</code> and <code>ANTHROPIC_AUTH_TOKEN</code>.</p>
+<h2 id="3-cli-modes-and-commands">3. CLI modes and commands</h2>
+<p>Frequently used global options:</p>
+<pre><code class="language-text">--provider &lt;name&gt;       provider name
+--model &lt;pattern&gt;       model id; supports provider/model and thinking suffixes
+--api-key &lt;key&gt;         per-run credential override
+--base-url &lt;url&gt;        endpoint override
+--timeout &lt;seconds&gt;     LLM request timeout, default 600
+--thinking &lt;level&gt;      off/minimal/low/medium/high/xhigh/max
+--print, -p             run once and exit
+--mode text|json|rpc    output mode
+--continue, -c         continue the most recent session
+--resume, -r           choose a saved session
+--session &lt;id|path&gt;    select a session
+--session-dir &lt;dir&gt;    session directory
+--tools &lt;list&gt;         allow only these tools
+--exclude-tools &lt;list&gt; disable selected tools
+--no-tools             disable every tool
+--no-builtin-tools     disable read/bash/edit/write/docs
+--no-skills            skip skill discovery
+--no-prompt-templates  skip prompt-template discovery
+--no-context-files     skip AGENTS.md/CLAUDE.md discovery
+--no-extensions        disable extension loading
+--extensions-dir &lt;dir&gt; scan an extra extension directory
+--package-only         load only project package/resources
+--offline              disable startup network checks
+--export &lt;file&gt;        export a JSONL session as HTML
+--server               start the headless JSONL server
+--connect &lt;host:port&gt;  connect a remote TUI client
+</code></pre>
+<p>Subcommands include:</p>
+<pre><code class="language-text">rpi auth login|check|logout
+rpi events path|tail
+rpi install &lt;crate&gt;
+rpi uninstall &lt;crate&gt;
+rpi extension update [name] # update all eligible extensions, or select one by name
+rpi update
+rpi dev [options]
+rpi dev-local [options]
+rpi package link|list|unlink
+</code></pre>
+<p>The startup <code>Context</code> summary lists the effective <code>SYSTEM.md</code>, <code>APPEND_SYSTEM.md</code>, <code>AGENTS.md</code>, and <code>CLAUDE.md</code> resources. <code>/context</code> shows the full list and <code>/reload</code> refreshes it. <code>/changelog</code> displays the release notes embedded in the current binary; <code>/changelog all</code> displays the complete history.</p>
+<h3 id="headless-server-and-remote-client">Headless server and remote client</h3>
+<p>Run the agent without a local TUI and connect from another process:</p>
+<pre><code class="language-bash">rpi --server --port 9899
+rpi --connect 127.0.0.1:9899 --token &lt;token&gt;
+
+# Alternatively provide the token through the environment
+export RPI_SERVER_TOKEN=&lt;token&gt;
+rpi --connect 127.0.0.1:9899
+</code></pre>
+<p>The server prints a token at startup and enables token authentication by default. The remote client is a display and input client: it does not load local providers, tools, sessions, or extensions. Session files and execution remain on the server. Remote mode supports runtime operations such as <code>/state</code>, <code>/model</code>, <code>/thinking</code>, <code>/tools</code>, and <code>/abort</code>; operations that require local harness state are intentionally limited. See <code>docs/remote/user-guide.md</code> for the protocol and constraints.</p>
+<h2 id="4-built-in-tools-and-safety-boundaries">4. Built-in tools and safety boundaries</h2>
+<p>The default tool set contains Pi-compatible <code>read</code>, <code>bash</code>, <code>edit</code>, and <code>write</code>, plus rpi's read-only <code>docs</code> lookup tool. Windows also registers <code>powershell</code> by default. The library includes <code>grep</code>, <code>find</code>, and <code>ls</code> implementations, but the CLI does not register them by default.</p>
+<p>Restrict the default tool set in <code>.rpi/settings.json</code>:</p>
+<pre><code class="language-json">{
+  &quot;defaultTools&quot;: [&quot;read&quot;, &quot;bash&quot;, &quot;edit&quot;, &quot;write&quot;, &quot;docs&quot;]
+}
+</code></pre>
+<p>You can also choose tools per run:</p>
+<pre><code class="language-bash">rpi --tools read,bash,edit,write,docs -p &quot;Inspect and update the project&quot;
+rpi --no-tools -p &quot;Explain this error without touching files&quot;
+</code></pre>
+<p>The CLI's tool selection is not a complete operating-system sandbox. Treat <code>bash</code>, <code>powershell</code>, file writes, and native extensions as trusted capabilities. Add confirmation and filesystem isolation at the product boundary when untrusted users or repositories are involved.</p>
+<h2 id="5-project-resources-and-precedence">5. Project resources and precedence</h2>
+<p>Project resources live under <code>.rpi</code>:</p>
+<pre><code class="language-text">project/
+└── .rpi/
+    ├── settings.json
+    ├── SYSTEM.md
+    ├── APPEND_SYSTEM.md
+    ├── skills/
+    ├── prompts/
+    ├── themes/
+    └── extensions/
+</code></pre>
+<p>Global resources normally live under <code>~/.rpi/agent/</code>. Project resources take precedence over global resources with the same name. Additional directories can be declared in <code>.rpi/settings.json</code>:</p>
+<pre><code class="language-json">{
+  &quot;skillDirs&quot;: [&quot;./team-skills&quot;],
+  &quot;promptDirs&quot;: [&quot;./prompts/shared&quot;],
+  &quot;extensionDirs&quot;: [&quot;./target/debug&quot;]
+}
+</code></pre>
+<p>The shorthand keys <code>skills</code>, <code>prompts</code>, and <code>extensions</code> are also supported. Paths are relative to the project root; global settings resolve relative paths against the agent directory. Use <code>--package-only</code> or <code>--project-only</code> to load only the current project's package and resources. This is different from <code>--local-only</code>, which limits extensions to explicitly supplied local paths.</p>
+<p>Set <code>RPI_CODING_AGENT_DIR=/work/rpi-agent</code> to relocate configuration and default sessions. Use <code>--no-session</code> when a temporary, non-persistent run is required.</p>
+<h2 id="6-rust-extensions">6. Rust extensions</h2>
+<p>Native extensions are Rust <code>cdylib</code> libraries loaded by <code>rpi-extensions</code> and linked to the stable <code>rpi-plugin-sdk</code> ABI:</p>
+<pre><code class="language-bash">cargo build -p plugin-stub
+rpi --extensions-dir target/debug -p 'echo &quot;hi&quot;'
+</code></pre>
+<p>Install a published extension or a local development package:</p>
+<pre><code class="language-bash">rpi install rpi-extension-example
+rpi install rpi-extension-example --version 0.1.0
+rpi install my-extension --path ../my-rpi-extension --force
+</code></pre>
+<p>Use <code>rpi extension update</code> to update all project-linked extensions and globally
+installed registry/prebuilt extensions, or <code>rpi extension update &lt;name&gt;</code> to select
+one by name. Updates preserve the original Cargo build backend or explicit GitHub
+source. Global development installs made with <code>--path</code> are excluded. The old
+<code>rpi package update [name]</code> remains compatible; prefer <code>extension update</code> for
+extension updates. Project linking commands remain <code>rpi package link</code>,
+<code>rpi package list</code>, and <code>rpi package unlink</code>.</p>
+<p>For iterative development:</p>
+<pre><code class="language-bash">cd ../my-rpi-extension
+rpi dev
+rpi dev --package my-extension
+rpi dev-local
+</code></pre>
+<p><code>rpi dev</code> detects Cargo <code>cdylib</code> targets, builds the extension, loads versioned artifacts from <code>.rpi/extensions/.dev</code>, and hot-reloads after source changes. If a rebuild fails, the last successfully loaded version remains active. <code>rpi dev-local</code> isolates the current extension from global extensions.</p>
+<p>Link a development package to one project:</p>
+<pre><code class="language-bash">rpi package link --path ../my-extension --package my-extension
+rpi package list
+rpi package unlink my-extension
+</code></pre>
+<p>Project packages are stored in <code>.rpi/packages/&lt;name&gt;/</code>. They are trusted local Rust libraries, not npm packages. Installed libraries normally live under <code>~/.rpi/agent/extensions</code> or the directory selected by <code>RPI_CODING_AGENT_DIR</code>.</p>
+<p>An extension may register tools, providers, event handlers, and resource handlers through the SDK. Keep data crossing the ABI inside SDK-defined serializable types and do not depend on private <code>rpi-cli</code> modules.</p>
+<h2 id="7-sdk-integration">7. SDK integration</h2>
+<p>Compose only the layers an embedded application needs:</p>
+<ul>
+<li><code>rpi-ai</code>: model types, providers, messages, and streaming events.</li>
+<li><code>rpi-agent</code>: the Agent loop, tools, hooks, cancellation, and events.</li>
+<li><code>rpi-tools</code>: built-in tools and the replaceable <code>ExecutionEnv</code> boundary.</li>
+<li><code>rpi-harness</code>: sessions, JSONL persistence, compaction, skills, and context files.</li>
+<li><code>rpi-cli</code>: the terminal application and configuration surface.</li>
+</ul>
+<p>A minimal offline Agent looks like this:</p>
+<pre><code class="language-rust">use rpi_agent::{Agent, AgentEvent};
+use rpi_ai::providers::faux::faux_provider;
+
+let model = faux_provider().model(&quot;echo&quot;);
+let mut agent = Agent::builder(model)
+    .system_prompt(&quot;You are a helpful assistant.&quot;)
+    .build();
+
+let mut events = agent.subscribe();
+agent.prompt(&quot;Hello from rpi&quot;).await?;
+while let Some(event) = events.recv().await {
+    if matches!(event, AgentEvent::AgentEnd { .. }) {
+        break;
+    }
+}
+</code></pre>
+<p>Implement <code>rpi-agent::AgentTool</code> for a custom tool and <code>rpi-ai::Provider</code> for a model adapter. Combine the faux provider with <code>InMemoryExecutionEnv</code> to test message ordering, tool calls, failures, and completion without an API key, network, or real filesystem.</p>
+<h2 id="8-troubleshooting">8. Troubleshooting</h2>
+<h3 id="model-or-endpoint-errors">Model or endpoint errors</h3>
+<p>Run <code>rpi auth check</code>, verify the provider name, model id, <code>models.json</code>, environment variables, and <code>baseUrl</code>. Use an explicit <code>provider/model</code> pattern to avoid ambiguity. Check authentication headers and endpoint compatibility before changing Agent code.</p>
+<h3 id="extension-load-failures">Extension load failures</h3>
+<p>Confirm that the library is a platform-compatible <code>cdylib</code>, that its ABI version matches the host, and that <code>--extensions-dir</code> points to the directory containing the built artifact. Keep the complete host error output; it usually distinguishes discovery, loading, ABI, and registration failures.</p>
+<h3 id="event-handler-diagnostics">Event handler diagnostics</h3>
+<pre><code class="language-bash">export RPI_EVENT_LOG=1
+rpi
+rpi events tail
+</code></pre>
+<p>The default log is <code>~/.rpi/logs/events.jsonl</code>; <code>RPI_EVENT_LOG_PATH</code> overrides it. A <code>BeforeTuiStart</code> veto returns exit code <code>3</code>. Inspect whether a handler returned <code>Continue</code>, <code>Error</code>, <code>Abort</code>, <code>Panic</code>, or <code>Timeout</code>.</p>
+<h3 id="resources-missing-from-the-startup-context">Resources missing from the startup context</h3>
+<p>Place files under the project <code>.rpi</code> directory or global <code>~/.rpi/agent</code>. Run <code>rpi --debug-system-prompt</code> to inspect the resolved system prompt, skills, and resource counts. Check project-over-global precedence and whether <code>--package-only</code>, <code>--no-skills</code>, or <code>--no-context-files</code> was supplied.</p>
+<h3 id="remote-connection-failures">Remote connection failures</h3>
+<p>Confirm that the server is listening on the expected address and port, and pass the exact startup token or <code>RPI_SERVER_TOKEN</code>. Remember that the client loads no local agent resources; provider credentials, extensions, and sessions must be available on the server.</p>
+<h2 id="9-development-tests-and-releases">9. Development, tests, and releases</h2>
+<p>Run the workspace checks before changing public APIs:</p>
+<pre><code class="language-bash">cargo fmt --all
+cargo check --workspace
+cargo test --workspace
+</code></pre>
+<p>The normal dependency publication order is:</p>
+<pre><code class="language-text">rpi-telemetry -&gt; rpi-ai -&gt; rpi-agent -&gt; rpi-tools -&gt; rpi-harness
+rpi-plugin-sdk -&gt; rpi-extensions -&gt; rpi-tui -&gt; rpi-cli
+</code></pre>
+<p>When a release changes user-visible behavior, update the release notes, README, website <code>data/docs.json</code>, and both language versions of this guide. The website is a static site; updating the Markdown source does not publish it automatically—run the repository's deployment task after building.</p>
+<h2 id="10-documentation-map">10. Documentation map</h2>
+<ul>
+<li>Online documentation: https://rpi.laofu.online/docs.html</li>
+<li>Repository: https://github.com/bigfish1913/pi-rust</li>
+<li>Rust API: https://docs.rs/rpi-agent and https://docs.rs/rpi-plugin-sdk</li>
+<li>Extension authoring: https://rpi.laofu.online/extension-authoring.md</li>
+<li>Remote mode: <code>docs/remote/user-guide.md</code></li>
+<li>Architecture: <code>docs/architecture/overview.md</code></li>
+</ul>
+<p>When the online site and an installed binary differ, use the documentation shipped with the matching Git tag and release. The CLI's <code>docs</code> tool can query the local documentation snapshot without depending on the website.</p>

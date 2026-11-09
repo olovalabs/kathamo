@@ -39,6 +39,6 @@ mod request;
 pub(crate) const DELTA_FLUSH_BYTES: usize = 64;
 
 /// Flush the first delta immediately. After that, amortize snapshots during
-/// bursts and release a pending batch within half of a 60 Hz frame.
+/// bursts and release a pending batch within roughly a quarter of a 60 Hz frame.
 #[cfg(feature = "providers")]
-pub(crate) const DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+pub(crate) const DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);

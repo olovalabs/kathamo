@@ -118,14 +118,7 @@ impl SseDecoderState {
 /// Find the next `\r` or `\n` boundary, returning the byte index (or `None` if
 /// neither is present). Mirrors `nextLineBreakIndex`.
 fn next_line_break_index(text: &str) -> Option<usize> {
-    let cr = text.find('\r');
-    let nl = text.find('\n');
-    match (cr, nl) {
-        (None, None) => None,
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (Some(a), Some(b)) => Some(a.min(b)),
-    }
+    memchr::memchr2(b'\r', b'\n', text.as_bytes())
 }
 
 /// Split the first complete line off `text`, consuming a trailing `\r\n` or
@@ -145,6 +138,12 @@ fn consume_line(text: &str) -> Option<(&str, &str)> {
 /// actually malformed sequence is replaced immediately so it cannot pin all
 /// following bytes in `utf8_buffer` until the response ends.
 fn append_utf8_chunk(buffer: &mut String, utf8_buffer: &mut Vec<u8>, chunk: &[u8]) {
+    if utf8_buffer.is_empty() {
+        if let Ok(text) = std::str::from_utf8(chunk) {
+            buffer.push_str(text);
+            return;
+        }
+    }
     utf8_buffer.extend_from_slice(chunk);
 
     loop {
@@ -195,6 +194,7 @@ pub struct SseEventStream {
     bytes_stream: futures::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>,
     state: SseDecoderState,
     buffer: String,
+    cursor: usize,
     utf8_buffer: Vec<u8>,
     skip_lf: bool,
     signal: CancellationToken,
@@ -212,6 +212,7 @@ impl SseEventStream {
             bytes_stream: response.bytes_stream().boxed(),
             state: SseDecoderState::new(),
             buffer: String::new(),
+            cursor: 0,
             utf8_buffer: Vec::new(),
             skip_lf: false,
             signal,
@@ -300,35 +301,28 @@ impl SseEventStream {
                     message: "Request was aborted".to_string(),
                 });
             }
-            // Try to flush a complete event from already-buffered lines first.
-            // Take ownership of the buffer so we can mutate `self` while
-            // dispatching on the borrowed slice (mirrors the TS string cursor).
-            let buffer = std::mem::take(&mut self.buffer);
-            let mut cursor = 0;
-            let mut produced = None;
-            while cursor < buffer.len() {
-                // A CR already terminated the previous line, even when it was
-                // the last byte received. Swallow only its optional LF partner.
-                if std::mem::take(&mut self.skip_lf) {
-                    if buffer[cursor..].starts_with('\n') {
-                        cursor += 1;
-                    }
+            // Retain the consumed prefix while buffered events remain. Moving
+            // the unread suffix after each event makes large bursts quadratic.
+            while self.cursor < self.buffer.len() {
+                if std::mem::take(&mut self.skip_lf) && self.buffer[self.cursor..].starts_with('\n')
+                {
+                    self.cursor += 1;
                 }
-                let slice = &buffer[cursor..];
+                let slice = &self.buffer[self.cursor..];
                 let Some((line, rest)) = consume_line(slice) else {
                     break;
                 };
-                let consumed = slice.len() - rest.len();
                 self.skip_lf = rest.is_empty() && slice.ends_with('\r');
-                cursor += consumed;
+                self.cursor += slice.len() - rest.len();
                 if let Some(event) = self.state.decode_line(line) {
-                    produced = Some(event);
-                    break;
+                    return Ok(Some(self.record_diagnostic_event(event)));
                 }
             }
-            self.buffer = buffer[cursor..].to_string();
-            if let Some(event) = produced {
-                return Ok(Some(self.record_diagnostic_event(event)));
+            // Reclaim the prefix once per body read, reusing the allocation and
+            // preserving any partial line across a cancelled read or deadline.
+            if self.cursor != 0 {
+                self.buffer.drain(..self.cursor);
+                self.cursor = 0;
             }
 
             if self.done {
@@ -337,16 +331,12 @@ impl SseEventStream {
                         .push_str(&String::from_utf8_lossy(&self.utf8_buffer));
                     self.utf8_buffer.clear();
                 }
-                // Tail flush: the last partial line (no terminator) then the
-                // trailing event. Mirrors the post-loop decode + final flush.
-                let mut buffer = std::mem::take(&mut self.buffer);
-                if !buffer.is_empty() {
-                    let pending = std::mem::take(&mut buffer);
-                    if let Some(event) = self.state.decode_line(&pending) {
-                        self.buffer = buffer;
+                if !self.buffer.is_empty() {
+                    let event = self.state.decode_line(&self.buffer);
+                    self.buffer.clear();
+                    if let Some(event) = event {
                         return Ok(Some(self.record_diagnostic_event(event)));
                     }
-                    self.buffer = buffer;
                 }
                 let flushed = self.state.flush();
                 return Ok(self.record_diagnostic_option(flushed));
@@ -558,6 +548,7 @@ mod tests {
             bytes_stream: chunks,
             state: SseDecoderState::new(),
             buffer: String::new(),
+            cursor: 0,
             utf8_buffer: Vec::new(),
             skip_lf: false,
             signal: CancellationToken::new(),
@@ -666,6 +657,31 @@ mod tests {
             assert!(stream.next_event().await.unwrap().is_none());
             writer.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn buffered_burst_keeps_events_in_order_across_chunk_boundaries() {
+        use std::fmt::Write as _;
+
+        let (sender, mut stream) = idle_test_stream();
+        let mut burst = String::new();
+        for index in 0..1024 {
+            write!(burst, "data: {index}\r\n\r\n").unwrap();
+        }
+        burst.pop();
+        sender.send(Bytes::from(burst)).await.unwrap();
+        sender
+            .send(Bytes::from_static(b"\ndata: last"))
+            .await
+            .unwrap();
+        drop(sender);
+
+        for index in 0..1024 {
+            let event = stream.next_event().await.unwrap().unwrap();
+            assert_eq!(event.data, index.to_string());
+        }
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "last");
+        assert!(stream.next_event().await.unwrap().is_none());
     }
 
     #[tokio::test(start_paused = true)]

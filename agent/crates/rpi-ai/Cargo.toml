@@ -25,6 +25,7 @@ schemars = { workspace = true }
 jsonschema = { workspace = true }
 reqwest = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+memchr = { version = "2", optional = true }
 eventsource-stream = { workspace = true, optional = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -42,6 +43,6 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = []
 # Real HTTP providers (anthropic). Off by default so core builds remain network-free.
-providers = ["dep:reqwest", "dep:bytes", "dep:eventsource-stream"]
+providers = ["dep:reqwest", "dep:bytes", "dep:memchr", "dep:eventsource-stream"]
 # Live network smoke test, gated further by the ANTHROPIC_API_KEY env var at runtime.
 smoke = ["providers"]

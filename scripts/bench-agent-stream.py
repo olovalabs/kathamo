@@ -120,10 +120,13 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(b"0\r\n\r\n")
             return
         frame = ("data: " + json.dumps(token) + "\n\n").encode()
-        for _ in range(tokens):
-            if not send(frame):
+        if burst:
+            if not send(frame * tokens):
                 return
-            if delay:
+        else:
+            for _ in range(tokens):
+                if not send(frame):
+                    return
                 time.sleep(delay)
         if send(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'):
             self.wfile.write(b"0\r\n\r\n")

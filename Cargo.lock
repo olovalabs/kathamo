@@ -7912,6 +7912,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "jsonschema",
+ "memchr",
  "regex",
  "reqwest",
  "rpi-telemetry",

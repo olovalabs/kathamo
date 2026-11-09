@@ -90,10 +90,7 @@ struct EmbeddedBridge {
 }
 
 impl AgentBridge {
-    pub fn spawn(cwd: &Path) -> Result<Self, String> {
-        Self::spawn_session(cwd, None, None)
-    }
-
+    #[cfg(test)]
     pub fn spawn_model(cwd: &Path, model: Option<&str>) -> Result<Self, String> {
         Self::spawn_session(cwd, None, model)
     }
@@ -150,15 +147,34 @@ impl AgentBridge {
         }
     }
 
+    #[cfg(test)]
     pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
+        self.send_prompt_with_context(prompt, None, None)
+    }
+
+    pub fn send_prompt_with_context(
+        &mut self,
+        prompt: &str,
+        resume: Option<&str>,
+        context: Option<String>,
+    ) -> Result<(), String> {
         match &mut self.backend {
             Backend::Embedded(bridge) => {
                 if bridge.closed {
                     return Err("The agent session has closed".into());
                 }
-                bridge.session.send_prompt(prompt)
+                bridge
+                    .session
+                    .send_prompt_with_context(prompt, resume, context)
             }
-            Backend::Rpc(bridge) => bridge.send_prompt(prompt),
+            Backend::Rpc(bridge) => {
+                let prompt = if resume.is_some() {
+                    prompt
+                } else {
+                    context.as_deref().unwrap_or(prompt)
+                };
+                bridge.send_prompt(prompt)
+            }
         }
     }
 
@@ -291,12 +307,17 @@ impl EmbeddedBridge {
                     name,
                     output,
                     failed,
-                } => events.push(AgentEvent::ToolEnd {
-                    id,
-                    name,
-                    output,
-                    failed,
-                }),
+                } => {
+                    if let Some(id) = id.as_deref() {
+                        crate::stream_timing::turn_tool_finished(self.trace_id, id);
+                    }
+                    events.push(AgentEvent::ToolEnd {
+                        id,
+                        name,
+                        output,
+                        failed,
+                    });
+                }
                 SessionEvent::Error(text) => events.push(AgentEvent::Error(text)),
                 SessionEvent::Done => events.push(AgentEvent::Done),
                 SessionEvent::Closed => {
@@ -320,6 +341,9 @@ pub(crate) const COALESCE_TEXT_LIMIT: usize = 16 * 1024;
 /// the same call. Tool starts, ends, statuses, errors and completion events are
 /// structural: they keep their order and are never merged away.
 pub(crate) fn coalesce_events(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+    if events.len() <= 1 {
+        return events;
+    }
     let mut last_update: HashMap<(Option<String>, String), usize> = HashMap::new();
     for (index, event) in events.iter().enumerate() {
         if let AgentEvent::ToolUpdate { id, name, .. } = event {
@@ -410,12 +434,17 @@ pub(crate) fn decode_tool_event(record: &Value) -> Option<AgentEvent> {
             name,
             output: tool_output(&record["partialResult"]),
         }),
-        "tool_execution_end" => Some(AgentEvent::ToolEnd {
-            id,
-            name,
-            output: tool_output(&record["result"]),
-            failed: record["isError"] == true,
-        }),
+        "tool_execution_end" => {
+            if let Some(id) = id.as_deref() {
+                crate::stream_timing::tool_finished(id);
+            }
+            Some(AgentEvent::ToolEnd {
+                id,
+                name,
+                output: tool_output(&record["result"]),
+                failed: record["isError"] == true,
+            })
+        }
         _ => None,
     }
 }

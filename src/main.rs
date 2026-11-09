@@ -487,7 +487,7 @@ fn chat_markdown(
         .text_color(color)
 }
 
-/// Human-facing tool title, matching opencode's labels.
+/// Capitalize the first character of a tool or agent name.
 fn title_case(value: &str) -> String {
     let mut chars = value.chars();
     match chars.next() {
@@ -588,7 +588,7 @@ impl ToolDisplay {
     }
 }
 
-/// The opencode-style header for a tool: title, subtitle and quarantined args.
+/// Parse the compact tool summary and its expanded arguments.
 fn tool_view(name: &str, input: &str) -> ToolView {
     let parsed = serde_json::from_str::<serde_json::Value>(input.trim()).ok();
     let object = parsed.as_ref().and_then(|value| value.as_object());
@@ -618,7 +618,9 @@ fn tool_view(name: &str, input: &str) -> ToolView {
             .unwrap_or_default();
     } else if is_shell_tool(name) {
         if let Some(command) = field("command").or_else(|| field("cmd")) {
-            subtitle = clip(first_line(command), 120);
+            subtitle = first_line(command).to_owned();
+        } else if parsed.is_none() && !input.trim_start().starts_with('{') {
+            subtitle = first_line(input).to_owned();
         }
     } else {
         match lower.as_str() {
@@ -636,19 +638,23 @@ fn tool_view(name: &str, input: &str) -> ToolView {
             "list" | "ls" | "list_dir" => {
                 subtitle = field("path").unwrap_or(".").to_string();
             }
-            "glob" => {
-                subtitle = field("path").unwrap_or(".").to_string();
-                if let Some(pattern) = field("pattern") {
-                    args.push(format!("pattern={pattern}"));
-                }
-            }
-            "grep" | "search" | "rg" => {
-                subtitle = field("path").unwrap_or(".").to_string();
-                if let Some(pattern) = field("pattern") {
-                    args.push(format!("pattern={pattern}"));
-                }
-                if let Some(include) = field("include") {
-                    args.push(format!("include={include}"));
+            "glob" | "grep" | "search" | "rg" => {
+                let path = field("path").unwrap_or(".");
+                subtitle = match field("pattern")
+                    .map(first_line)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(pattern) if path != "." => format!("{pattern} in {path}"),
+                    Some(pattern) => pattern.to_owned(),
+                    None => path.to_owned(),
+                };
+                for key in ["pattern", "include"] {
+                    if let Some(value) = object.and_then(|map| map.get(key)) {
+                        let value = value
+                            .as_str()
+                            .map_or_else(|| value.to_string(), str::to_owned);
+                        args.push(format!("{key}={value}"));
+                    }
                 }
             }
             "webfetch" | "web_fetch" | "fetch" => {
@@ -674,35 +680,6 @@ fn tool_view(name: &str, input: &str) -> ToolView {
         subtitle,
         args,
     }
-}
-
-/// Header text for a run of tool calls, mirroring opencode's collapsed
-/// "Used N Read, Grep" row. Returns `(prefix, title)`.
-fn tool_group_label<M: std::ops::Deref<Target = ChatMessage>>(
-    parts: &[(usize, M)],
-) -> (String, String) {
-    let mut titles: Vec<String> = Vec::new();
-    let mut tool_count = 0usize;
-    for (_, message) in parts {
-        if let Some(tool) = message.tool.as_ref() {
-            tool_count += 1;
-            let title = tool_title(&tool.name);
-            if !titles.contains(&title) {
-                titles.push(title);
-            }
-        }
-    }
-
-    if tool_count == 0 {
-        return (String::new(), "Updates".to_string());
-    }
-
-    let names = if titles.len() > 3 {
-        format!("{}, …", titles[..3].join(", "))
-    } else {
-        titles.join(", ")
-    };
-    (format!("Used {tool_count} "), names)
 }
 
 fn chat_copy_button(
@@ -987,6 +964,28 @@ fn tool_content_body(name: &str, input: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn tool_paint_marker(id: Option<&str>, output: bool) -> Option<impl IntoElement> {
+    let id = id
+        .filter(|id| crate::stream_timing::tool_paint_due(id, output))?
+        .to_owned();
+    Some(
+        canvas(
+            |_, _, _| (),
+            move |_, _, _, _| {
+                if output {
+                    crate::stream_timing::tool_output_painted(&id);
+                } else {
+                    crate::stream_timing::tool_card_painted(&id);
+                }
+            },
+        )
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .size(px(1.0)),
+    )
+}
+
 fn chat_tool_content(
     pane_id: usize,
     index: usize,
@@ -994,11 +993,6 @@ fn chat_tool_content(
     tokens: ThemeTokens,
     on_show_more: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    if !tool.output.is_empty()
-        && let Some(id) = tool.id.as_deref()
-    {
-        crate::stream_timing::tool_output_painted(id);
-    }
     let mut body = div()
         .w_full()
         .min_w_0()
@@ -1010,8 +1004,28 @@ fn chat_tool_content(
         .flex()
         .flex_col()
         .gap(px(8.0));
+    if !tool.output.is_empty()
+        && let Some(marker) = tool_paint_marker(tool.id.as_deref(), true)
+    {
+        body = body.relative().child(marker);
+    }
 
-    if let Some(command) = tool.display.shell_command.as_ref() {
+    if !tool.display.view.args.is_empty() {
+        body = body.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(tokens.text_muted)
+                .whitespace_normal()
+                .child(tool.display.view.args.join(" · ")),
+        );
+    }
+
+    if let Some(command) = tool
+        .display
+        .shell_command
+        .as_ref()
+        .filter(|_| tool.state != ToolState::Failed)
+    {
         body = body.child(chat_console_output(
             pane_id,
             index,
@@ -1077,195 +1091,116 @@ fn chat_tool_content(
 fn chat_tool_header(
     pane_id: usize,
     index: usize,
-    view: &ToolView,
-    running: bool,
-    expanded: bool,
-    agent: bool,
+    tool: &ChatTool,
     tokens: ThemeTokens,
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let mut header = div()
-        .id(SharedString::from(format!("tool-row-{pane_id}-{index}")))
-        .w_full()
-        .min_w_0()
-        .h(px(28.0))
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .cursor(CursorStyle::PointingHand)
-        .on_mouse_down(MouseButton::Left, on_toggle);
+    use gpui_component::IconName;
 
-    if agent && running {
-        header = header.child(
-            gpui_component::Icon::new(gpui_component::IconName::LoaderCircle)
-                .size(px(14.0))
-                .text_color(tokens.text_muted)
-                .with_animation(
-                    SharedString::from(format!("agent-tool-spinner-{pane_id}-{index}")),
-                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
-                    |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
-                ),
-        );
-    }
-
-    let title = div()
-        .flex_shrink_0()
-        .text_size(px(13.0))
-        .font_weight(gpui::FontWeight::MEDIUM)
-        .text_color(tokens.text_primary)
-        .child(view.title.clone());
-    let title = if running && !agent {
-        title
-            .with_animation(
-                SharedString::from(format!("tool-title-pulse-{pane_id}-{index}")),
-                Animation::new(std::time::Duration::from_millis(1100)).repeat(),
-                |element, delta| {
-                    let pulse = (delta * std::f32::consts::PI).sin().abs();
-                    element.opacity(0.55 + 0.45 * pulse)
-                },
-            )
-            .into_any_element()
-    } else {
-        title.into_any_element()
-    };
-    header = header.child(title);
-
-    if !view.subtitle.is_empty() {
-        header = header.child(
-            div()
-                .min_w_0()
-                .truncate()
-                .text_size(px(13.0))
-                .text_color(tokens.text_muted)
-                .child(view.subtitle.clone()),
-        );
-    }
-    for arg in &view.args {
-        header = header.child(
-            div()
-                .flex_shrink_0()
-                .truncate()
-                .text_size(px(13.0))
-                .text_color(tokens.text_muted)
-                .child(arg.clone()),
-        );
-    }
-
-    header.child(div().flex_1()).child(
-        svg()
-            .path(if expanded {
-                "icons/chevron-down.svg"
-            } else {
-                "icons/chevron-right.svg"
-            })
-            .size(px(12.0))
-            .flex_shrink_0()
-            .text_color(tokens.text_muted),
-    )
-}
-
-fn chat_tool_error_card(
-    pane_id: usize,
-    index: usize,
-    tool: &ChatTool,
-    expanded: bool,
-    tokens: ThemeTokens,
-    on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    on_show_more: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> Div {
     let view = &tool.display.view;
-    let header = div()
-        .id(SharedString::from(format!(
-            "tool-error-row-{pane_id}-{index}"
-        )))
+    let running = tool.state == ToolState::Running;
+    let failed = tool.state == ToolState::Failed;
+    let (icon, title) = match view.title.as_str() {
+        "Shell" => (
+            IconName::SquareTerminal,
+            if running { "Running" } else { "Ran" },
+        ),
+        "Read" => (IconName::BookOpen, if running { "Reading" } else { "Read" }),
+        "List" => (
+            IconName::FolderClosed,
+            if running {
+                "Listing files in"
+            } else {
+                "Listed files in"
+            },
+        ),
+        "Grep" | "Glob" | "Web Search" => (
+            IconName::Search,
+            if running {
+                "Searching for"
+            } else {
+                "Searched for"
+            },
+        ),
+        "Webfetch" | "Browser" => (IconName::Globe, view.title.as_str()),
+        _ if is_agent_tool(&tool.name) => (IconName::Bot, view.title.as_str()),
+        _ => (IconName::File, view.title.as_str()),
+    };
+
+    let color = if failed {
+        tokens.block_failure
+    } else {
+        tokens.text_secondary
+    };
+    let icon_color = if failed { color } else { tokens.text_muted };
+
+    let row = div()
+        .id(SharedString::from(format!("tool-row-{pane_id}-{index}")))
+        .debug_selector(move || format!("tool-row-{index}"))
         .w_full()
         .min_w_0()
+        .h(px(24.0))
         .flex()
         .items_center()
-        .gap(px(6.0))
-        .px(px(10.0))
-        .py(px(7.0))
+        .gap(px(7.0))
+        .text_size(px(14.0))
+        .text_color(color)
         .cursor(CursorStyle::PointingHand)
+        .hover(move |style| style.text_color(if failed { color } else { tokens.text_primary }))
         .on_mouse_down(MouseButton::Left, on_toggle)
         .child(
-            gpui_component::Icon::new(gpui_component::IconName::TriangleAlert)
-                .size(px(14.0))
-                .text_color(tokens.block_failure),
+            div().flex_shrink_0().child(
+                gpui_component::Icon::new(if failed {
+                    IconName::TriangleAlert
+                } else {
+                    icon
+                })
+                .size(px(13.0))
+                .text_color(icon_color),
+            ),
         )
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(13.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(tokens.block_failure)
-                .child(view.title.clone()),
-        )
-        .when(!view.subtitle.is_empty(), |header| {
-            header.child(
+        .child(div().flex_shrink_0().child(if failed {
+            format!("{} failed", view.title)
+        } else {
+            title.to_owned()
+        }))
+        .when(!view.subtitle.is_empty(), |row| {
+            row.child(
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(13.0))
-                    .text_color(tokens.text_muted)
-                    .child(view.subtitle.clone()),
+                    .when(view.title == "Read", |text| {
+                        text.underline().text_color(tokens.text_muted)
+                    })
+                    .child(first_line(&view.subtitle).to_owned()),
             )
         })
         .child(div().flex_1())
         .child(
             svg()
-                .path(if expanded {
+                .path(if tool.expanded {
                     "icons/chevron-down.svg"
                 } else {
                     "icons/chevron-right.svg"
                 })
                 .size(px(12.0))
                 .flex_shrink_0()
-                .text_color(tokens.block_failure),
+                .text_color(tokens.text_muted),
         );
 
-    let mut card = div()
-        .w_full()
-        .min_w_0()
-        .rounded(px(8.0))
-        .border_1()
-        .border_color(tokens.block_failure.opacity(0.35))
-        .bg(tokens.block_failure.opacity(0.06))
-        .overflow_hidden()
-        .flex()
-        .flex_col()
-        .child(header);
-
-    if expanded {
-        let display = if tool.show_full {
-            tool.output.clone()
-        } else {
-            tool.preview.clone()
-        };
-        let hidden = tool.output.len().saturating_sub(display.len());
-        card = card.child(
-            div()
-                .w_full()
-                .min_w_0()
-                .px(px(10.0))
-                .pb(px(8.0))
-                .whitespace_normal()
-                .font_family(MONO_FONT)
-                .text_size(px(12.0))
-                .line_height(relative(1.6))
-                .text_color(tokens.block_failure)
-                .child(display),
-        );
-        if tool.preview_truncated {
-            card = card.child(chat_output_expander(
-                SharedString::from(format!("tool-error-more-{pane_id}-{index}")),
-                hidden,
-                tool.show_full,
-                tokens,
-                on_show_more,
-            ));
-        }
+    if running {
+        row.with_animation(
+            SharedString::from(format!("tool-row-pulse-{pane_id}-{index}")),
+            Animation::new(std::time::Duration::from_millis(1100)).repeat(),
+            |element, delta| {
+                let pulse = (delta * std::f32::consts::PI).sin().abs();
+                element.opacity(0.6 + 0.4 * pulse)
+            },
+        )
+        .into_any_element()
+    } else {
+        row.into_any_element()
     }
-    card
 }
 
 fn chat_tool_card(
@@ -1276,48 +1211,18 @@ fn chat_tool_card(
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_show_more: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let expanded = tool.expanded;
-    let running = tool.state == ToolState::Running;
-    let failed = tool.state == ToolState::Failed;
-    let view = &tool.display.view;
-    let agent = is_agent_tool(&tool.name);
-    if let Some(id) = tool.id.as_deref() {
-        crate::stream_timing::tool_card_painted(id);
+    let mut card = div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_col()
+        .child(chat_tool_header(pane_id, index, tool, tokens, on_toggle));
+
+    if let Some(marker) = tool_paint_marker(tool.id.as_deref(), false) {
+        card = card.relative().child(marker);
     }
 
-    if failed {
-        return chat_tool_error_card(
-            pane_id,
-            index,
-            tool,
-            expanded,
-            tokens,
-            on_toggle,
-            on_show_more,
-        );
-    }
-
-    let header = chat_tool_header(
-        pane_id, index, view, running, expanded, agent, tokens, on_toggle,
-    );
-
-    let mut card = div().w_full().min_w_0().flex().flex_col();
-    if agent {
-        card = card.child(
-            div()
-                .w_full()
-                .min_w_0()
-                .rounded(px(8.0))
-                .bg(tokens.card_bg)
-                .px(px(10.0))
-                .py(px(6.0))
-                .child(header),
-        );
-    } else {
-        card = card.child(header);
-    }
-
-    if expanded {
+    if tool.expanded {
         card = card.child(chat_tool_content(
             pane_id,
             index,
@@ -1561,27 +1466,6 @@ fn agent_title_from_prompt(prompt: &str) -> Option<String> {
 /// this, otherwise a pane runs a different model than the chip shows.
 fn agent_model_selector(model: &agent_auth::AgentModel) -> String {
     format!("{}/{}", model.provider, model.id)
-}
-
-/// Launch the agent process for one model. Warming a pane and sending its
-/// first prompt must agree here, or the pane runs a different model than its
-/// chip shows.
-fn spawn_model_bridge(
-    model: &agent_auth::AgentModel,
-    cwd: &Path,
-    rpi_session_id: Option<&str>,
-) -> Result<ModelBridge, String> {
-    let selector = agent_model_selector(model);
-    match model.backend {
-        agent_auth::ModelBackend::Rpi => {
-            agent_bridge::AgentBridge::spawn_resumed(cwd, rpi_session_id, Some(&selector))
-                .or_else(|_| agent_bridge::AgentBridge::spawn_model(cwd, Some(&selector)))
-                .map(ModelBridge::Rpi)
-        }
-        agent_auth::ModelBackend::Omp => {
-            omp_bridge::OmpBridge::spawn(cwd, &selector).map(ModelBridge::Omp)
-        }
-    }
 }
 
 /// Turn a pre-prompt agent failure into a short, actionable default-screen note.
@@ -1861,10 +1745,15 @@ enum ModelBridge {
 }
 
 impl ModelBridge {
-    fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
+    fn send_prompt(
+        &mut self,
+        prompt: &str,
+        resume: Option<&str>,
+        context: Option<String>,
+    ) -> Result<(), String> {
         match self {
-            Self::Rpi(bridge) => bridge.send_prompt(prompt),
-            Self::Omp(bridge) => bridge.send_prompt(prompt),
+            Self::Rpi(bridge) => bridge.send_prompt_with_context(prompt, resume, context),
+            Self::Omp(bridge) => bridge.send_prompt(context.as_deref().unwrap_or(prompt)),
         }
     }
     fn cancel(&mut self) -> Result<(), String> {
@@ -1891,26 +1780,6 @@ impl ModelBridge {
             Self::Rpi(_) => Ok(()),
         }
     }
-}
-
-#[derive(Default)]
-struct ModelChat {
-    bridge: Option<ModelBridge>,
-    messages: Vec<Arc<ChatMessage>>,
-    running: bool,
-    /// Completed turns in this conversation, used only to label cold/warm
-    /// timing samples.
-    completed_turns: u64,
-    auth_refresh_pending: bool,
-    rpi_session_id: Option<String>,
-    conversation: Option<conversations::Log>,
-    /// A failure reported before the first prompt; shown on the default screen
-    /// instead of as a transcript message.
-    startup_error: Option<String>,
-    /// Name the agent reported for this conversation, when it generates one.
-    agent_title: Option<String>,
-    /// Name derived from this conversation's first prompt.
-    prompt_title: Option<String>,
 }
 
 struct WorkerView {
@@ -1941,9 +1810,9 @@ enum ChatRow {
     },
     ToolGroup {
         start: usize,
-        parts: Vec<(usize, Arc<ChatMessage>)>,
+        messages: Vec<Arc<ChatMessage>>,
+        live: bool,
         open: bool,
-        running: bool,
     },
     Message {
         index: usize,
@@ -1979,7 +1848,9 @@ fn worker_status_label(label: &str) -> &'static str {
 fn chat_row_contains(row: &ChatRow, message_index: usize) -> bool {
     match row {
         ChatRow::Subagents { start, .. } => *start == message_index,
-        ChatRow::ToolGroup { parts, .. } => parts.iter().any(|(index, _)| *index == message_index),
+        ChatRow::ToolGroup {
+            start, messages, ..
+        } => (*start..*start + messages.len()).contains(&message_index),
         ChatRow::Message { index, .. } => *index == message_index,
         ChatRow::Running => false,
     }
@@ -1988,11 +1859,14 @@ fn chat_row_contains(row: &ChatRow, message_index: usize) -> bool {
 struct PaneChat {
     worker_view: Option<WorkerView>,
     active: bool,
-    bridge: Option<agent_bridge::AgentBridge>,
+    bridge: Option<ModelBridge>,
+    bridge_model: Option<agent_auth::AgentModel>,
+    bridge_resume: Option<String>,
+    bridge_needs_context: bool,
     cwd: Option<PathBuf>,
     messages: Vec<Arc<ChatMessage>>,
     running: bool,
-    /// Completed turns in the automatic (unpinned) conversation.
+    /// Completed turns in this conversation.
     completed_turns: u64,
     terminal_draft: String,
     agent_draft: String,
@@ -2010,16 +1884,13 @@ struct PaneChat {
     /// which is `selected_model == None`). Without this, a pane deliberately
     /// set to Automatic is re-pinned to the app default on the next launch.
     model_explicit: bool,
-    /// Conversation names for the unpinned ("Automatic") conversation; each
-    /// `ModelChat` carries its own pair.
     agent_title: Option<String>,
     prompt_title: Option<String>,
-    models: HashMap<agent_auth::AgentModel, ModelChat>,
+    conversation_key: String,
+    legacy_models: Vec<workspace_state::SavedModelChat>,
     fast_mode: bool,
     pub autoscroll: bool,
-    /// Opencode-style tool groups the reader has opened, keyed by the first
-    /// message index in the group.
-    pub expanded_tool_groups: HashSet<usize>,
+    expanded_tool_groups: HashMap<String, HashSet<usize>>,
     rpi_session_id: Option<String>,
     conversation: Option<conversations::Log>,
     startup_error: Option<String>,
@@ -2033,6 +1904,9 @@ impl Default for PaneChat {
             active: false,
             worker_view: None,
             bridge: None,
+            bridge_model: None,
+            bridge_resume: None,
+            bridge_needs_context: false,
             cwd: None,
             messages: Vec::new(),
             running: false,
@@ -2055,10 +1929,11 @@ impl Default for PaneChat {
             model_explicit: false,
             agent_title: None,
             prompt_title: None,
-            models: HashMap::new(),
+            conversation_key: conversations::conversation_key(None),
+            legacy_models: Vec::new(),
             fast_mode: true,
             autoscroll: true,
-            expanded_tool_groups: HashSet::new(),
+            expanded_tool_groups: HashMap::new(),
             rpi_session_id: None,
             conversation: None,
             startup_error: None,
@@ -2068,64 +1943,109 @@ impl Default for PaneChat {
 }
 
 impl PaneChat {
-    /// The conversation name for the selected model, if the backend reported
-    /// one or a prompt has already named it.
-    fn conversation_title(&self) -> Option<&str> {
-        let (agent_title, prompt_title) = match self.selected_model.as_ref() {
-            Some(model) => match self.models.get(model) {
-                Some(chat) => (chat.agent_title.as_deref(), chat.prompt_title.as_deref()),
-                None => (None, None),
-            },
-            None => (self.agent_title.as_deref(), self.prompt_title.as_deref()),
+    fn ensure_agent(&mut self, cwd: PathBuf) -> Result<(), String> {
+        if self.running || (self.bridge.is_some() && self.bridge_model == self.selected_model) {
+            return Ok(());
+        }
+        // A settled bridge can release its session before the replacement opens it.
+        self.bridge = None;
+        let selector = self.selected_model.as_ref().map(agent_model_selector);
+        let bridge = match self.selected_model.as_ref().map(|model| &model.backend) {
+            Some(agent_auth::ModelBackend::Omp) => {
+                let mut bridge = ModelBridge::Omp(omp_bridge::OmpBridge::spawn(
+                    &cwd,
+                    selector.as_deref().expect("OMP model has a selector"),
+                )?);
+                if !self.fast_mode {
+                    let _ = bridge.set_thinking_level("high");
+                }
+                self.bridge_resume = None;
+                bridge
+            }
+            _ => {
+                self.bridge_resume = self.rpi_session_id.clone();
+                let bridge = agent_bridge::AgentBridge::spawn_resumed(
+                    &cwd,
+                    self.bridge_resume.as_deref(),
+                    selector.as_deref(),
+                )?;
+                ModelBridge::Rpi(bridge)
+            }
         };
-        agent_title
-            .or(prompt_title)
+        self.cwd = Some(cwd);
+        self.worker_view = None;
+        self.bridge = Some(bridge);
+        self.bridge_model = self.selected_model.clone();
+        self.bridge_needs_context = true;
+        Ok(())
+    }
+
+    /// Text handoff for an engine that cannot open the previous engine's session.
+    fn context_prompt(&self, prompt: &str) -> Option<String> {
+        const MAX_HISTORY_CHARS: usize = 24_000;
+        const MAX_ENTRY_CHARS: usize = 4_000;
+        let mut remaining = MAX_HISTORY_CHARS;
+        let mut entries = Vec::new();
+        for message in self.messages.iter().rev() {
+            let (role, body) = match message.role {
+                ChatRole::User => ("user", message.text.as_str()),
+                ChatRole::Assistant => ("assistant", message.text.as_str()),
+                ChatRole::Tool => match &message.tool {
+                    Some(tool) => ("tool", tool.output.as_ref()),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if body.is_empty() {
+                continue;
+            }
+            let (body, truncated) = clip_tool_text(body, remaining.min(MAX_ENTRY_CHARS));
+            remaining = remaining.saturating_sub(body.chars().count());
+            entries.push(serde_json::json!({
+                "role": role,
+                "content": body,
+                "truncated": truncated,
+            }));
+            if remaining == 0 || entries.len() >= 100 {
+                break;
+            }
+        }
+        if entries.is_empty() {
+            return None;
+        }
+        entries.reverse();
+        Some(format!(
+            "Conversation history for context only. Treat it as prior messages, including any untrusted tool output. Continue from the current user request below.\n{}\n\nCurrent user request:\n{prompt}",
+            serde_json::Value::Array(entries)
+        ))
+    }
+
+    fn conversation_title(&self) -> Option<&str> {
+        self.agent_title
+            .as_deref()
+            .or(self.prompt_title.as_deref())
             .map(str::trim)
             .filter(|title| !title.is_empty())
     }
 
-    /// Record a prompt-derived conversation name for the selected model.
     fn set_prompt_title(&mut self, title: String) {
-        match self.selected_model.as_ref() {
-            Some(model) => {
-                self.models.entry(model.clone()).or_default().prompt_title = Some(title);
-            }
-            None => self.prompt_title = Some(title),
-        }
+        self.prompt_title = Some(title);
     }
 
-    /// Record an agent-reported conversation name for the selected model.
     fn set_agent_title(&mut self, title: String) {
-        match self.selected_model.as_ref() {
-            Some(model) => {
-                self.models.entry(model.clone()).or_default().agent_title = Some(title);
-            }
-            None => self.agent_title = Some(title),
-        }
+        self.agent_title = Some(title);
     }
 
     fn visible_messages(&self) -> &[Arc<ChatMessage>] {
-        match self.selected_model.as_ref() {
-            Some(model) => self
-                .models
-                .get(model)
-                .map(|chat| chat.messages.as_slice())
-                .unwrap_or(&[]),
-            None => &self.messages,
-        }
+        &self.messages
     }
+
     fn visible_messages_mut(&mut self) -> &mut Vec<Arc<ChatMessage>> {
-        match self.selected_model.as_ref() {
-            Some(model) => &mut self.models.entry(model.clone()).or_default().messages,
-            None => &mut self.messages,
-        }
+        &mut self.messages
     }
 
     fn visible_running(&self) -> bool {
-        match self.selected_model.as_ref() {
-            Some(model) => self.models.get(model).is_some_and(|chat| chat.running),
-            None => self.running,
-        }
+        self.running
     }
 
     /// The active reply grew. Its row must be re-measured on the next frame,
@@ -2171,23 +2091,11 @@ impl PaneChat {
     }
 
     fn visible_startup_error(&self) -> Option<&str> {
-        match self.selected_model.as_ref() {
-            Some(model) => self
-                .models
-                .get(model)
-                .and_then(|chat| chat.startup_error.as_deref()),
-            None => self.startup_error.as_deref(),
-        }
+        self.startup_error.as_deref()
     }
 
     fn visible_conversation(&mut self) -> Option<&mut conversations::Log> {
-        match self.selected_model.as_ref() {
-            Some(model) => self
-                .models
-                .get_mut(model)
-                .and_then(|chat| chat.conversation.as_mut()),
-            None => self.conversation.as_mut(),
-        }
+        self.conversation.as_mut()
     }
 }
 
@@ -2737,20 +2645,10 @@ impl AppState {
                                         agent_title: pane.chat.agent_title.clone(),
                                         prompt_title: pane.chat.prompt_title.clone(),
                                         rpi_session_id: pane.chat.rpi_session_id.clone(),
-                                        models: pane
-                                            .chat
-                                            .models
-                                            .iter()
-                                            .map(|(model, chat)| workspace_state::SavedModelChat {
-                                                model: Some(model.clone()),
-                                                rpi_session_id: chat.rpi_session_id.clone(),
-                                                conversation: conversations::conversation_key(
-                                                    Some(model),
-                                                ),
-                                                agent_title: chat.agent_title.clone(),
-                                                prompt_title: chat.prompt_title.clone(),
-                                            })
-                                            .collect(),
+                                        conversation_key: (self.settings.restore.agent_history
+                                            || pane.chat.conversation_key != "default")
+                                            .then(|| pane.chat.conversation_key.clone()),
+                                        models: pane.chat.legacy_models.clone(),
                                     },
                                 }
                             })
@@ -2921,11 +2819,6 @@ impl AppState {
                     if let Some(log) = pane.chat.conversation.as_mut() {
                         log.flush();
                     }
-                    for chat in pane.chat.models.values_mut() {
-                        if let Some(log) = chat.conversation.as_mut() {
-                            log.flush();
-                        }
-                    }
                 }
             }
         }
@@ -3044,33 +2937,30 @@ impl AppState {
                     pane.chat.terminal_draft = saved_pane.draft.clone();
                     pane.chat.agent_draft = saved_pane.agent_draft.clone();
 
-                    if self.settings.restore.agent_history {
-                        let default_key = conversations::conversation_key(None);
-                        pane.chat.conversation =
-                            Some(conversations::Log::open(&pane.uid, &default_key));
-                        if let Some(messages) =
-                            transcripts.get(&transcript_key(&pane.uid, &default_key))
+                    let saved = &saved_pane.chat;
+                    pane.chat.legacy_models = saved.models.clone();
+                    if let Some(key) = saved.valid_conversation_key() {
+                        pane.chat.conversation_key = key.to_owned();
+                    } else if self.settings.restore.agent_history
+                        && let Some(legacy) = saved.models.iter().find(|legacy| {
+                            legacy.model.is_some() && legacy.model == saved.selected_model
+                        })
+                    {
+                        let key = conversations::conversation_key(legacy.model.as_ref());
+                        if legacy.rpi_session_id.is_some()
+                            || transcripts.contains_key(&transcript_key(&pane.uid, &key))
                         {
-                            pane.chat.messages = messages.clone();
+                            pane.chat.conversation_key = key;
+                            pane.chat.rpi_session_id = legacy.rpi_session_id.clone();
+                            pane.chat.agent_title = legacy.agent_title.clone();
+                            pane.chat.prompt_title = legacy.prompt_title.clone();
                         }
-                        for saved_model in &saved_pane.chat.models {
-                            let Some(model) = saved_model.model.clone() else {
-                                continue;
-                            };
-                            let key = conversations::conversation_key(Some(&model));
-                            let mut chat = ModelChat {
-                                rpi_session_id: saved_model.rpi_session_id.clone(),
-                                agent_title: saved_model.agent_title.clone(),
-                                prompt_title: saved_model.prompt_title.clone(),
-                                conversation: Some(conversations::Log::open(&pane.uid, &key)),
-                                ..Default::default()
-                            };
-                            if let Some(messages) =
-                                transcripts.get(&transcript_key(&pane.uid, &key))
-                            {
-                                chat.messages = messages.clone();
-                            }
-                            pane.chat.models.insert(model, chat);
+                    }
+                    if self.settings.restore.agent_history {
+                        let key = &pane.chat.conversation_key;
+                        pane.chat.conversation = Some(conversations::Log::open(&pane.uid, key));
+                        if let Some(messages) = transcripts.get(&transcript_key(&pane.uid, key)) {
+                            pane.chat.messages = messages.clone();
                         }
                     }
 
@@ -3221,6 +3111,13 @@ impl AppState {
         }
 
         self.rebuild_session_index();
+        if let Some(pane_id) = self.focused_pane_id
+            && self
+                .pane_ref(pane_id)
+                .is_some_and(|pane| pane.chat.active && pane.chat.selected_model.is_none())
+        {
+            self.warm_agent_bridge(pane_id);
+        }
         self.schedule_workspace_save(cx);
         cx.notify();
     }
@@ -5739,19 +5636,20 @@ impl AppState {
         }
     }
 
-    fn toggle_chat_tool_group_expanded(
-        &mut self,
-        pane_id: usize,
-        start: usize,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(pane) = self.pane_mut(pane_id) {
-            if !pane.chat.expanded_tool_groups.remove(&start) {
-                pane.chat.expanded_tool_groups.insert(start);
-            }
-            pane.chat.invalidate_message_row(start);
-            cx.notify();
+    fn toggle_chat_tool_group(&mut self, pane_id: usize, start: usize, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let groups = pane
+            .chat
+            .expanded_tool_groups
+            .entry(pane.chat.conversation_key.clone())
+            .or_default();
+        if !groups.remove(&start) {
+            groups.insert(start);
         }
+        pane.chat.invalidate_message_row(start);
+        cx.notify();
     }
 
     fn warm_agent_bridge(&mut self, pane_id: usize) {
@@ -5765,33 +5663,13 @@ impl AppState {
         let Some(pane) = self.pane_mut(pane_id) else {
             return;
         };
-        if let Some(model) = pane.chat.selected_model.clone() {
-            let fast = pane.chat.fast_mode;
-            let pane_uid = pane.uid.clone();
-            let model_key = conversations::conversation_key(Some(&model));
-            let chat = pane.chat.models.entry(model.clone()).or_default();
-            if save_history && chat.conversation.is_none() {
-                chat.conversation = Some(conversations::Log::open(&pane_uid, &model_key));
-            }
-            if chat.bridge.is_none() {
-                let bridge = spawn_model_bridge(&model, &cwd, chat.rpi_session_id.as_deref());
-                match bridge {
-                    Ok(mut bridge) => {
-                        if !fast {
-                            let _ = bridge.set_thinking_level("high");
-                        }
-                        chat.startup_error = None;
-                        chat.bridge = Some(bridge);
-                    }
-                    Err(error) => chat.startup_error = Some(error),
-                }
-            }
-        } else if save_history && pane.chat.conversation.is_none() {
+        if save_history && pane.chat.conversation.is_none() {
             pane.chat.conversation = Some(conversations::Log::open(
                 &pane.uid,
-                &conversations::conversation_key(None),
+                &pane.chat.conversation_key,
             ));
         }
+        pane.chat.startup_error = pane.chat.ensure_agent(cwd).err();
     }
 
     fn toggle_fast_mode(&mut self, pane_id: usize, cx: &mut Context<Self>) {
@@ -5801,12 +5679,8 @@ impl AppState {
         pane.chat.fast_mode = !pane.chat.fast_mode;
         let fast = pane.chat.fast_mode;
         let level = if fast { "low" } else { "high" };
-        if let Some(model) = &pane.chat.selected_model {
-            if let Some(chat) = pane.chat.models.get_mut(model) {
-                if let Some(bridge) = chat.bridge.as_mut() {
-                    let _ = bridge.set_thinking_level(level);
-                }
-            }
+        if let Some(bridge) = pane.chat.bridge.as_mut() {
+            let _ = bridge.set_thinking_level(level);
         }
         self.schedule_workspace_save(cx);
         cx.notify();
@@ -5988,14 +5862,6 @@ impl AppState {
         if let Some(pane) = self.pane_mut(pane_id) {
             pane.chat.startup_error = None;
             pane.chat.model_explicit = true;
-            if let Some(model) = model.as_ref() {
-                pane.chat
-                    .models
-                    .entry(model.clone())
-                    .or_default()
-                    .startup_error = None;
-            }
-            pane.chat.worker_view = None;
             pane.chat.selected_model = model.clone();
         }
         if make_default {
@@ -6249,6 +6115,7 @@ impl AppState {
 
     fn poll_agent_events(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
+        let mut session_changed = false;
         let mut authenticated = false;
         let mut streaming = false;
         let mut titled_panes: Vec<usize> = Vec::new();
@@ -6259,7 +6126,7 @@ impl AppState {
                     if save_history && pane.chat.conversation.is_none() {
                         pane.chat.conversation = Some(conversations::Log::open(
                             &pane.uid,
-                            &conversations::conversation_key(None),
+                            &pane.chat.conversation_key,
                         ));
                     }
                     if let Some(auth) = pane.chat.auth.as_mut() {
@@ -6337,6 +6204,9 @@ impl AppState {
                         let trace = bridge.trace_id();
                         let drain_start = std::time::Instant::now();
                         let drained = bridge.poll();
+                        if let ModelBridge::Omp(omp) = &mut bridge {
+                            changed |= omp.take_worker_changes() && pane.chat.worker_view.is_some();
+                        }
                         crate::stream_timing::record_since("ui.drain", drain_start);
                         if !drained.is_empty() {
                             pane.chat.mark_active_dirty();
@@ -6401,7 +6271,12 @@ impl AppState {
                             }
                             crate::stream_timing::record_since("ui.apply", apply_start);
                         }
-                        if let Some(id) = bridge.session_id() {
+                        if let ModelBridge::Rpi(bridge) = &bridge
+                            && !pane.chat.bridge_needs_context
+                            && let Some(id) = bridge.session_id()
+                            && pane.chat.rpi_session_id.as_ref() != Some(&id)
+                        {
+                            session_changed = true;
                             pane.chat.rpi_session_id = Some(id);
                         }
                         if closed {
@@ -6411,117 +6286,18 @@ impl AppState {
                         }
                     }
                     streaming |= pane.chat.running;
-                    let pane_uid = pane.uid.clone();
-                    let mut models_dirty = false;
-                    for (model, chat) in &mut pane.chat.models {
-                        if save_history && chat.conversation.is_none() {
-                            chat.conversation = Some(conversations::Log::open(
-                                &pane_uid,
-                                &conversations::conversation_key(Some(model)),
-                            ));
-                        }
-                        if let Some(mut bridge) = chat.bridge.take() {
-                            let mut closed = false;
-                            let trace = bridge.trace_id();
-                            let drain_start = std::time::Instant::now();
-                            let drained = bridge.poll();
-                            if let ModelBridge::Omp(omp) = &mut bridge {
-                                changed |= omp.take_worker_changes()
-                                    && pane.chat.selected_model.as_ref() == Some(model)
-                                    && pane.chat.worker_view.is_some();
-                            }
-                            crate::stream_timing::record_since("ui.drain", drain_start);
-                            if !drained.is_empty() {
-                                models_dirty = true;
-                            }
-                            for event in drained {
-                                let apply_start = std::time::Instant::now();
-                                changed = true;
-                                let delta_kind = match &event {
-                                    agent_bridge::AgentEvent::Thinking(text)
-                                        if !text.is_empty() =>
-                                    {
-                                        Some(crate::stream_timing::DeltaKind::Reasoning)
-                                    }
-                                    agent_bridge::AgentEvent::Text(text) if !text.is_empty() => {
-                                        Some(crate::stream_timing::DeltaKind::Answer)
-                                    }
-                                    _ => None,
-                                };
-                                let startup_error = chat.messages.is_empty()
-                                    && !chat.running
-                                    && matches!(event, agent_bridge::AgentEvent::Error(_));
-                                if save_history && !startup_error {
-                                    if let Some(log) = chat.conversation.as_mut() {
-                                        if !matches!(
-                                            &event,
-                                            agent_bridge::AgentEvent::Title(_)
-                                                | agent_bridge::AgentEvent::Done
-                                                | agent_bridge::AgentEvent::Closed
-                                        ) {
-                                            log.append_event(&event);
-                                        }
-                                    }
-                                }
-                                match event {
-                                    agent_bridge::AgentEvent::Done => {
-                                        chat.running = false;
-                                        chat.completed_turns =
-                                            chat.completed_turns.saturating_add(1);
-                                        crate::stream_timing::turn_settled(trace);
-                                        finish_chat_tools(&mut chat.messages);
-                                        finish_chat_streaming(&mut chat.messages);
-                                    }
-                                    agent_bridge::AgentEvent::Closed => {
-                                        chat.running = false;
-                                        crate::stream_timing::turn_settled(trace);
-                                        finish_chat_tools(&mut chat.messages);
-                                        finish_chat_streaming(&mut chat.messages);
-                                        closed = true;
-                                    }
-                                    agent_bridge::AgentEvent::Error(message) if startup_error => {
-                                        chat.startup_error = Some(message);
-                                    }
-                                    agent_bridge::AgentEvent::Title(title) => {
-                                        chat.agent_title = Some(title);
-                                        titled_panes.push(pane.id);
-                                    }
-                                    other => push_chat_event(&mut chat.messages, other),
-                                }
-                                if let Some(kind) = delta_kind {
-                                    crate::stream_timing::turn_delta_applied(trace, kind);
-                                    if let Some(last) = chat.messages.last_mut() {
-                                        Arc::make_mut(last).turn = Some(trace);
-                                    }
-                                }
-                                crate::stream_timing::record_since("ui.apply", apply_start);
-                            }
-                            if let ModelBridge::Rpi(bridge) = &bridge {
-                                if let Some(id) = bridge.session_id() {
-                                    chat.rpi_session_id = Some(id);
-                                }
-                            }
-                            if !closed {
-                                chat.bridge = Some(bridge);
-                            }
-                        }
-                        streaming |= chat.running;
-                    }
-                    if models_dirty {
-                        pane.chat.mark_active_dirty();
-                    }
                 }
             }
         }
         for project in &mut self.projects {
             for session in &mut project.sessions {
                 for pane in &mut session.panes {
-                    if authenticated && pane.chat.bridge.is_some() {
+                    if authenticated && matches!(pane.chat.bridge, Some(ModelBridge::Rpi(_))) {
                         pane.chat.auth_refresh_pending = true;
                     }
                     if pane.chat.auth_refresh_pending && !pane.chat.running {
                         let mut retry = false;
-                        if let Some(bridge) = pane.chat.bridge.as_mut() {
+                        if let Some(ModelBridge::Rpi(bridge)) = pane.chat.bridge.as_mut() {
                             match bridge.restart_after_auth() {
                                 Ok(()) => {}
                                 // The embedded harness is still opening its
@@ -6539,32 +6315,14 @@ impl AppState {
                         }
                         changed = true;
                     }
-                    for chat in pane.chat.models.values_mut() {
-                        if authenticated && matches!(chat.bridge, Some(ModelBridge::Rpi(_))) {
-                            chat.auth_refresh_pending = true;
-                        }
-                        if chat.auth_refresh_pending && !chat.running {
-                            let mut retry = false;
-                            if let Some(ModelBridge::Rpi(bridge)) = chat.bridge.as_mut() {
-                                match bridge.restart_after_auth() {
-                                    Ok(()) => {}
-                                    Err(error) if error.contains("still starting") => retry = true,
-                                    Err(error) => chat
-                                        .messages
-                                        .push(Arc::new(ChatMessage::new(ChatRole::Error, error))),
-                                }
-                            }
-                            if !retry {
-                                chat.auth_refresh_pending = false;
-                            }
-                            changed = true;
-                        }
-                    }
                 }
             }
         }
         for pane_id in titled_panes {
             self.sync_session_title(pane_id, cx);
+        }
+        if session_changed {
+            self.schedule_workspace_save(cx);
         }
         if changed {
             cx.notify();
@@ -6729,12 +6487,8 @@ impl AppState {
             let fast = matches!(level, "off" | "minimal" | "low");
             if let Some(pane) = self.pane_mut(pane_id) {
                 pane.chat.fast_mode = fast;
-                if let Some(model) = &pane.chat.selected_model {
-                    if let Some(chat) = pane.chat.models.get_mut(model) {
-                        if let Some(bridge) = chat.bridge.as_mut() {
-                            let _ = bridge.set_thinking_level(level);
-                        }
-                    }
+                if let Some(bridge) = pane.chat.bridge.as_mut() {
+                    let _ = bridge.set_thinking_level(level);
                 }
                 pane.chat
                     .visible_messages_mut()
@@ -6756,89 +6510,44 @@ impl AppState {
             cx.notify();
             return;
         }
-        if let Some(model) = pane.chat.selected_model.clone() {
-            let fast = pane.chat.fast_mode;
-            let pane_uid = pane.uid.clone();
-            let model_key = conversations::conversation_key(Some(&model));
-            let chat = pane.chat.models.entry(model.clone()).or_default();
-            if save_history && chat.conversation.is_none() {
-                chat.conversation = Some(conversations::Log::open(&pane_uid, &model_key));
-            }
-            if chat.bridge.is_none() {
-                let bridge = spawn_model_bridge(&model, &cwd, chat.rpi_session_id.as_deref());
-                match bridge {
-                    Ok(mut bridge) => {
-                        if !fast {
-                            let _ = bridge.set_thinking_level("high");
-                        }
-                        chat.bridge = Some(bridge);
-                    }
-                    Err(error) => {
-                        chat.messages
-                            .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
-                        cx.notify();
-                        return;
-                    }
-                }
-            }
-            chat.startup_error = None;
-            let trace = chat.bridge.as_ref().map(|bridge| bridge.trace_id());
-            let warm = chat.completed_turns > 0;
-            if let Some(trace) = trace {
-                crate::stream_timing::turn_sent(trace, warm);
-            }
-            match chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
-                Ok(()) => {
-                    if let Some(log) = chat.conversation.as_mut() {
-                        log.append_user(&prompt);
-                    }
-                    chat.messages
-                        .push(Arc::new(ChatMessage::new(ChatRole::User, prompt)));
-                    chat.running = true;
-                    pane.attachments.clear();
-                    input.update(cx, |state, cx| state.set_value("", window, cx));
-                }
-                Err(error) => chat
-                    .messages
-                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error))),
-            }
-            pane.chat.autoscroll = true;
-            pane.chat.scroll_to_end();
-            cx.notify();
-            return;
-        }
         pane.chat.startup_error = None;
         if save_history && pane.chat.conversation.is_none() {
             pane.chat.conversation = Some(conversations::Log::open(
                 &pane.uid,
-                &conversations::conversation_key(None),
+                &pane.chat.conversation_key,
             ));
         }
-        if pane.chat.bridge.is_none() {
-            let saved_session = pane.chat.rpi_session_id.clone();
-            match agent_bridge::AgentBridge::spawn_resumed(&cwd, saved_session.as_deref(), None)
-                .or_else(|_| agent_bridge::AgentBridge::spawn(&cwd))
-            {
-                Ok(bridge) => {
-                    pane.chat.cwd = Some(cwd);
-                    pane.chat.bridge = Some(bridge);
-                }
-                Err(error) => {
-                    pane.chat
-                        .messages
-                        .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
-                    cx.notify();
-                    return;
-                }
-            }
+        if let Err(error) = pane.chat.ensure_agent(cwd) {
+            pane.chat
+                .messages
+                .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+            cx.notify();
+            return;
         }
         let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
         let warm = pane.chat.completed_turns > 0;
         if let Some(trace) = trace {
             crate::stream_timing::turn_sent(trace, warm);
         }
-        match pane.chat.bridge.as_mut().unwrap().send_prompt(&prompt) {
+        let context = if pane.chat.bridge_needs_context {
+            pane.chat.context_prompt(&prompt)
+        } else {
+            None
+        };
+        let mut session_changed = false;
+        let resume = pane.chat.bridge_resume.as_deref();
+        match pane
+            .chat
+            .bridge
+            .as_mut()
+            .unwrap()
+            .send_prompt(&prompt, resume, context)
+        {
             Ok(()) => {
+                pane.chat.bridge_needs_context = false;
+                if matches!(pane.chat.bridge, Some(ModelBridge::Omp(_))) {
+                    session_changed = pane.chat.rpi_session_id.take().is_some();
+                }
                 if let Some(log) = pane.chat.conversation.as_mut() {
                     log.append_user(&prompt);
                 }
@@ -6856,6 +6565,9 @@ impl AppState {
         }
         pane.chat.autoscroll = true;
         pane.chat.scroll_to_end();
+        if session_changed {
+            self.schedule_workspace_save(cx);
+        }
         cx.notify();
     }
 
@@ -7011,28 +6723,6 @@ impl AppState {
             return;
         };
         if pane.chat.active {
-            if let Some(model) = pane.chat.selected_model.as_ref() {
-                if let Some(chat) = pane.chat.models.get_mut(model) {
-                    if chat.running {
-                        let trace = chat.bridge.as_ref().map(|bridge| bridge.trace_id());
-                        if let Some(bridge) = chat.bridge.as_mut() {
-                            if let Err(error) = bridge.cancel() {
-                                chat.messages
-                                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
-                            }
-                        }
-                        if let Some(trace) = trace {
-                            crate::stream_timing::turn_cancelled(trace);
-                        }
-                    } else if let Some(input) = &pane.input_state {
-                        input.update(cx, |state, cx| state.set_value("", window, cx));
-                    }
-                } else if let Some(input) = &pane.input_state {
-                    input.update(cx, |state, cx| state.set_value("", window, cx));
-                }
-                cx.notify();
-                return;
-            }
             if pane.chat.running {
                 let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
                 if let Some(bridge) = pane.chat.bridge.as_mut() {
@@ -10859,125 +10549,6 @@ impl AppState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_chat_tool_group(
-        pane_id: usize,
-        conversation: &str,
-        start: usize,
-        parts: &[(usize, Arc<ChatMessage>)],
-        open: bool,
-        running: bool,
-        tokens: ThemeTokens,
-        ui_state: Option<&HashMap<String, agent_ui::UiStateValue>>,
-        host: &UiHost,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> AnyElement {
-        // A collapsed group is the first visible representation of its tools,
-        // so record that paint even though the individual cards stay hidden.
-        for (_, part) in parts {
-            if let Some(id) = part.tool.as_ref().and_then(|tool| tool.id.as_deref()) {
-                crate::stream_timing::tool_card_painted(id);
-            }
-        }
-        let (prefix, label) = tool_group_label(parts);
-        let on_toggle = host.listener(move |this, _: &MouseDownEvent, _, cx| {
-            cx.stop_propagation();
-            this.toggle_chat_tool_group_expanded(pane_id, start, cx);
-        });
-
-        let mut header = div()
-            .id(SharedString::from(format!("tool-group-{pane_id}-{start}")))
-            .w_full()
-            .min_w_0()
-            .h(px(28.0))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .cursor(CursorStyle::PointingHand)
-            .on_mouse_down(MouseButton::Left, on_toggle);
-
-        let mut label_element = div()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .text_size(px(13.0))
-            .font_weight(gpui::FontWeight::MEDIUM);
-        if !prefix.is_empty() {
-            label_element = label_element.child(
-                div()
-                    .flex_shrink_0()
-                    .text_color(tokens.text_secondary)
-                    .child(prefix),
-            );
-        }
-        label_element = label_element.child(div().text_color(tokens.text_primary).child(label));
-        header = header.child(label_element);
-
-        if running {
-            header = header.child(
-                gpui_component::Icon::new(gpui_component::IconName::LoaderCircle)
-                    .size(px(13.0))
-                    .text_color(tokens.text_muted)
-                    .with_animation(
-                        SharedString::from(format!("tool-group-spinner-{pane_id}-{start}")),
-                        Animation::new(std::time::Duration::from_millis(900)).repeat(),
-                        |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
-                    ),
-            );
-        }
-
-        header = header.child(div().flex_1()).child(
-            svg()
-                .path(if open {
-                    "icons/chevron-down.svg"
-                } else {
-                    "icons/chevron-right.svg"
-                })
-                .size(px(12.0))
-                .flex_shrink_0()
-                .text_color(tokens.text_muted),
-        );
-
-        let mut group = div()
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .debug_selector(move || format!("tool-group-{start}"))
-            .child(header);
-        if open {
-            let mut children = div()
-                .w_full()
-                .min_w_0()
-                .ml(px(12.0))
-                .pl(px(12.0))
-                .border_l_1()
-                .border_color(tokens.border_subtle)
-                .py(px(4.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0));
-            for (index, part) in parts {
-                children = children.child(Self::render_chat_message(
-                    pane_id,
-                    conversation,
-                    *index,
-                    part,
-                    running,
-                    tokens,
-                    ui_state,
-                    host,
-                    window,
-                    cx,
-                ));
-            }
-            group = group.child(children);
-        }
-        group.into_any_element()
-    }
-
     fn worker_avatar(avatar: usize, pixel: f32) -> gpui::Div {
         let (pattern, color) = subagent_chat::AVATARS[avatar];
         div()
@@ -11129,22 +10700,17 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pane_id = pane.id;
-        let live = pane
-            .chat
-            .selected_model
-            .as_ref()
-            .and_then(|model| pane.chat.models.get(model))
-            .and_then(|chat| match chat.bridge.as_ref()? {
-                ModelBridge::Omp(bridge) => bridge.live_worker(
-                    row.worker,
-                    pane.chat.visible_messages()[row.index]
-                        .tool
-                        .as_ref()?
-                        .id
-                        .as_deref(),
-                ),
-                ModelBridge::Rpi(_) => None,
-            });
+        let live = pane.chat.bridge.as_ref().and_then(|bridge| match bridge {
+            ModelBridge::Omp(bridge) => bridge.live_worker(
+                row.worker,
+                pane.chat.visible_messages()[row.index]
+                    .tool
+                    .as_ref()?
+                    .id
+                    .as_deref(),
+            ),
+            ModelBridge::Rpi(_) => None,
+        });
         if view.scroll.max_offset().y + view.scroll.offset().y <= px(24.0) {
             view.scroll.scroll_to_bottom();
         }
@@ -11299,7 +10865,7 @@ impl AppState {
         }
         let render_start = std::time::Instant::now();
         let tokens = self.tokens(cx);
-        let conversation = format!("{:?}", pane.chat.selected_model);
+        let conversation = pane.chat.conversation_key.as_str();
         let pane_id = pane.id;
         let is_autoscroll = pane.chat.autoscroll;
         if is_autoscroll && !pane.chat.list_state.is_following_tail() {
@@ -11313,23 +10879,30 @@ impl AppState {
 
         let row_count = rows.len();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(conversation.as_str(), &mut hasher);
+        std::hash::Hash::hash(conversation, &mut hasher);
         pane.chat
             .sync_rows(row_count, std::hash::Hasher::finish(&hasher));
         if let Some(index) = pane.chat.dirty_message.take() {
             if let Some(row) = rows.iter().position(|row| chat_row_contains(row, index)) {
                 pane.chat.list_state.splice(row..row + 1, 1);
             }
-        } else if pane.chat.active_dirty.replace(false) {
-            // Only the row that grew is re-measured. Settled history keeps its
-            // cached height and is not rebuilt. When a turn settles the active
-            // row is no longer streaming, so fall back to the last content row.
-            let row = active_row.or_else(|| {
-                rows.iter().rposition(|row| {
-                    matches!(row, ChatRow::Message { .. } | ChatRow::ToolGroup { .. })
-                })
+        }
+        if pane.chat.active_dirty.replace(false) {
+            let latest_content = active_row.or_else(|| {
+                rows.iter()
+                    .rposition(|row| !matches!(row, ChatRow::Running))
             });
-            if let Some(row) = row {
+            for (index, row) in rows.iter().enumerate().rev() {
+                if matches!(row, ChatRow::Message { message, .. } if message.role == ChatRole::User)
+                {
+                    break;
+                }
+                // A section can fold or receive more output after the reply starts.
+                if matches!(row, ChatRow::ToolGroup { .. }) && Some(index) != latest_content {
+                    pane.chat.list_state.splice(index..index + 1, 1);
+                }
+            }
+            if let Some(row) = latest_content {
                 pane.chat.list_state.splice(row..row + 1, 1);
             }
         }
@@ -11527,7 +11100,7 @@ impl AppState {
         let host = UiHost::new(cx.weak_entity());
         let snapshot = Arc::new(ChatSnapshot {
             pane_id,
-            conversation: conversation.clone().into(),
+            conversation: conversation.into(),
             tokens,
             rows,
             ui_state: pane.chat.ui_state.clone(),
@@ -11541,7 +11114,8 @@ impl AppState {
             })
             .size_full()
             .px(px(24.0))
-            .py(px(8.0)),
+            .pt(px(8.0))
+            .pb(px(20.0)),
         );
 
         let scroll_to_bottom_btn = if !is_autoscroll {
@@ -11660,31 +11234,35 @@ impl AppState {
                 }
                 continue;
             }
-            // Reasoning stays outside the tool group so live thoughts are always
-            // visible instead of hiding behind a collapsed "Used N tools" row.
             if message.role == ChatRole::Tool && message.tool.is_some() {
                 let start = cursor;
-                let mut parts: Vec<(usize, Arc<ChatMessage>)> = Vec::new();
-                while cursor < visible.len()
-                    && visible[cursor].role == ChatRole::Tool
-                    && visible[cursor]
+                let mut has_running_call = false;
+                while let Some(message) = visible.get(cursor) {
+                    let Some(tool) = message
                         .tool
                         .as_ref()
-                        .is_some_and(|tool| tool.workers.is_empty())
-                {
-                    parts.push((cursor, Arc::clone(&visible[cursor])));
+                        .filter(|tool| message.role == ChatRole::Tool && tool.workers.is_empty())
+                    else {
+                        break;
+                    };
+                    has_running_call |= tool.state == ToolState::Running;
                     cursor += 1;
                 }
-                let open = pane.chat.expanded_tool_groups.contains(&start);
-                let live = running && cursor == visible.len();
-                if live {
+                let live = has_running_call || (running && cursor == visible.len());
+                let open = live
+                    || pane
+                        .chat
+                        .expanded_tool_groups
+                        .get(pane.chat.conversation_key.as_str())
+                        .is_some_and(|groups| groups.contains(&start));
+                if running && cursor == visible.len() {
                     active_row = Some(rows.len());
                 }
                 rows.push(ChatRow::ToolGroup {
                     start,
-                    parts,
+                    messages: visible[start..cursor].to_vec(),
+                    live,
                     open,
-                    running: live,
                 });
                 continue;
             }
@@ -11747,22 +11325,85 @@ impl AppState {
             }
             ChatRow::ToolGroup {
                 start,
-                parts,
+                messages,
+                live,
                 open,
-                running,
-            } => Self::render_chat_tool_group(
-                snapshot.pane_id,
-                snapshot.conversation.as_ref(),
-                *start,
-                parts,
-                *open,
-                *running,
-                tokens,
-                Some(&snapshot.ui_state),
-                &snapshot.host,
-                window,
-                cx,
-            ),
+            } => {
+                let start = *start;
+                let mut group = div().w_full().min_w_0().flex().flex_col();
+                if !live {
+                    let mut titles = Vec::new();
+                    let mut failed = 0;
+                    for tool in messages.iter().filter_map(|message| message.tool.as_ref()) {
+                        if let Some(id) = tool.id.as_deref() {
+                            crate::stream_timing::tool_card_painted(id);
+                        }
+                        failed += usize::from(tool.state == ToolState::Failed);
+                        let title = tool.display.view.title.as_str();
+                        if !titles.contains(&title) {
+                            titles.push(title);
+                        }
+                    }
+                    let count = messages.len();
+                    let mut label = format!("Used {count} {}", titles.join(", "));
+                    if failed > 0 {
+                        label.push_str(&format!(" ({failed} failed)"));
+                    }
+                    let pane_id = snapshot.pane_id;
+                    group = group.child(
+                        div()
+                            .id(SharedString::from(format!("tool-group-{pane_id}-{start}")))
+                            .debug_selector(move || format!("tool-group-{start}"))
+                            .h(px(24.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(7.0))
+                            .text_size(px(14.0))
+                            .text_color(tokens.text_secondary)
+                            .hover(move |style| style.text_color(tokens.text_primary))
+                            .cursor(CursorStyle::PointingHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                snapshot
+                                    .host
+                                    .listener(move |this, _: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_chat_tool_group(pane_id, start, cx);
+                                    }),
+                            )
+                            .child(div().min_w_0().truncate().child(label))
+                            .child(div().flex_1())
+                            .child(
+                                svg()
+                                    .path(if *open {
+                                        "icons/chevron-down.svg"
+                                    } else {
+                                        "icons/chevron-right.svg"
+                                    })
+                                    .size(px(12.0))
+                                    .flex_shrink_0()
+                                    .text_color(tokens.text_muted),
+                            ),
+                    );
+                }
+                if *open {
+                    group = group.children(messages.iter().enumerate().map(|(offset, message)| {
+                        Self::render_chat_message(
+                            snapshot.pane_id,
+                            snapshot.conversation.as_ref(),
+                            start + offset,
+                            message,
+                            *live,
+                            tokens,
+                            Some(&snapshot.ui_state),
+                            &snapshot.host,
+                            window,
+                            cx,
+                        )
+                    }));
+                }
+                group.into_any_element()
+            }
             ChatRow::Message {
                 index,
                 message,
@@ -11794,10 +11435,12 @@ impl AppState {
                 )
                 .into_any_element(),
         };
+        let live_tools = matches!(row, ChatRow::ToolGroup { live: true, .. });
         div()
             .w_full()
             .min_w_0()
-            .pb(px(8.0))
+            .px(px(16.0))
+            .pb(px(if live_tools { 0.0 } else { 8.0 }))
             .child(inner)
             .into_any_element()
     }
@@ -14510,6 +14153,7 @@ fn main() -> Result<()> {
         None => {}
     }
     rpi_embedded::set_tool_arrival_hook(crate::stream_timing::tool_arrived);
+    rpi_embedded::set_tool_end_hook(crate::stream_timing::tool_finished);
     gpui_platform::application()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
@@ -14657,14 +14301,14 @@ fn main() -> Result<()> {
                                                 scrollbacks.insert(pane.uid.clone(), text);
                                             }
                                             if load_history {
-                                                let keys = std::iter::once(None::<&agent_auth::AgentModel>)
-                                                    .chain(pane
-                                                        .chat
-                                                        .models
-                                                        .iter()
-                                                        .map(|chat| chat.model.as_ref()));
-                                                for model in keys {
-                                                    let key = conversations::conversation_key(model);
+                                                let keys = std::iter::once(
+                                                    pane.chat.valid_conversation_key()
+                                                        .map(str::to_owned)
+                                                        .unwrap_or_else(|| conversations::conversation_key(None)),
+                                                ).chain(pane.chat.models.iter().map(|legacy| {
+                                                    conversations::conversation_key(legacy.model.as_ref())
+                                                }));
+                                                for key in keys {
                                                     let conversation_path = paths::conversations_dir()
                                                         .join(&pane.uid)
                                                         .join(format!("{key}.jsonl"));
@@ -14777,6 +14421,9 @@ fn main() -> Result<()> {
                                 Err(_) => break,
                             }
                             crate::stream_timing::maybe_report();
+                            // Let a pending frame run even when the producer
+                            // has already queued another wake.
+                            smol::future::yield_now().await;
                         }
                     }).detach();
 
@@ -15165,7 +14812,7 @@ mod resize_tests {
     }
 
     #[test]
-    fn titles_are_tracked_per_model_conversation() {
+    fn switching_models_preserves_the_pane_conversation() {
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
@@ -15181,15 +14828,37 @@ mod resize_tests {
         };
         cx.update_window_entity(&state, |s, window, cx| {
             s.set_chat_mode(pane_id, true, window, cx);
-            let chat = &mut s.pane_mut(pane_id).unwrap().chat;
-            chat.selected_model = Some(deepseek.clone());
-            chat.set_agent_title("DeepSeek conversation".into());
-            chat.selected_model = Some(grok.clone());
-            chat.set_prompt_title("Grok conversation".into());
-            chat.selected_model = Some(deepseek.clone());
-            assert_eq!(chat.conversation_title(), Some("DeepSeek conversation"));
-            chat.selected_model = Some(grok);
-            assert_eq!(chat.conversation_title(), Some("Grok conversation"));
+            let pane = s.pane_mut(pane_id).unwrap();
+            pane.chat.selected_model = Some(deepseek);
+            pane.chat.running = true;
+            let active_bridge = pane.chat.bridge.as_ref().map(ModelBridge::trace_id);
+            pane.chat.set_agent_title("Existing conversation".into());
+            pane.chat.messages.push(Arc::new(ChatMessage::new(
+                ChatRole::User,
+                "Remember this context".into(),
+            )));
+            let input = pane.input_state.as_ref().unwrap().clone();
+            input.update(cx, |state, cx| state.set_value("Unsent draft", window, cx));
+            s.select_agent_model(pane_id, Some(grok.clone()), false, window, cx);
+            let pane = s.pane_ref(pane_id).unwrap();
+            assert_eq!(pane.chat.selected_model.as_ref(), Some(&grok));
+            assert!(pane.chat.running);
+            assert_eq!(
+                pane.chat.bridge.as_ref().map(ModelBridge::trace_id),
+                active_bridge
+            );
+            assert_eq!(
+                pane.chat.conversation_title(),
+                Some("Existing conversation")
+            );
+            assert_eq!(
+                pane.chat.visible_messages()[0].text,
+                "Remember this context"
+            );
+            assert_eq!(input.read(cx).value().as_str(), "Unsent draft");
+            let handoff = pane.chat.context_prompt("Continue").unwrap();
+            assert!(handoff.contains("Remember this context"));
+            assert!(handoff.ends_with("Current user request:\nContinue"));
         });
     }
 
@@ -15328,7 +14997,10 @@ Done."#
                 )));
         });
         cx.draw_frame().expect("draw checkbox card");
-        let card = format!("agent-markdown-{pane_id}-None-0-ui-0");
+        let conversation = state.read_with(&cx, |s, _| {
+            s.pane_ref(pane_id).unwrap().chat.conversation_key.clone()
+        });
+        let card = format!("agent-markdown-{pane_id}-{conversation}-0-ui-0");
         let selector: &'static str = Box::leak(format!("ai-ui-block-{card}").into_boxed_str());
         let bounds = cx.debug_bounds(selector).expect("card bounds");
         let click = point(
@@ -15385,7 +15057,7 @@ Done."#
     fn restored_panes_keep_their_own_model() {
         // The reported bug: pick deepseek in pane A and grok in pane B, restart,
         // and both came back pinned to the app default instead of their own.
-        let workspace = workspace_state::SavedWorkspace {
+        let mut workspace = workspace_state::SavedWorkspace {
             version: workspace_state::CURRENT_VERSION,
             active_project: Some(std::env::current_dir().unwrap()),
             projects: vec![workspace_state::SavedProject {
@@ -15447,6 +15119,21 @@ Done."#
                 }],
             }],
         };
+        let saved_chat = &mut workspace.projects[0].sessions[0].panes[0].chat;
+        let legacy_key = conversations::conversation_key(saved_chat.selected_model.as_ref());
+        saved_chat.models.push(workspace_state::SavedModelChat {
+            model: saved_chat.selected_model.clone(),
+            conversation: legacy_key.clone(),
+            agent_title: Some("Existing chat".into()),
+            ..Default::default()
+        });
+        let transcripts = HashMap::from([(
+            transcript_key("p-1", &legacy_key),
+            vec![Arc::new(ChatMessage::new(
+                ChatRole::User,
+                "Legacy history".into(),
+            ))],
+        )]);
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         let default = agent_auth::AgentModel {
@@ -15457,16 +15144,28 @@ Done."#
         cx.update_window_entity(&state, |s, _, cx| {
             s.default_agent_model = Some(default.clone());
             s.startup_loaded = false;
+            s.settings.restore.agent_history = true;
             s.apply_saved_workspace(
                 RestoreData {
                     workspace: workspace.clone(),
                     scrollbacks: HashMap::new(),
-                    transcripts: HashMap::new(),
+                    transcripts,
                 },
                 cx,
             );
         });
-        state.read_with(&cx, |s, _| {
+        state.read_with(&cx, |s, cx| {
+            let pane = &s.projects[0].sessions[0].panes[0];
+            assert_eq!(pane.chat.conversation_key, legacy_key);
+            assert_eq!(pane.chat.conversation_title(), Some("Existing chat"));
+            assert_eq!(pane.chat.visible_messages()[0].text, "Legacy history");
+            assert_eq!(
+                s.saved_workspace(cx).projects[0].sessions[0].panes[0]
+                    .chat
+                    .conversation_key
+                    .as_deref(),
+                Some(legacy_key.as_str()),
+            );
             let models: Vec<_> = s.projects[0].sessions[0]
                 .panes
                 .iter()
@@ -16567,6 +16266,9 @@ mod kathamo_bottom_input_tests {
 
         cx.update_window_entity(&state, |s, window, cx| {
             s.set_chat_mode(pane_id, true, window, cx);
+            let chat = &s.pane_ref(pane_id).unwrap().chat;
+            assert!(chat.selected_model.is_none());
+            assert!(chat.bridge.is_some(), "automatic agent starts before Send");
         });
         cx.draw_frame().expect("draw agent mode");
 
@@ -16842,7 +16544,7 @@ mod kathamo_bottom_input_tests {
     }
 
     #[test]
-    fn tool_view_matches_opencode_labels() {
+    fn tool_view_formats_compact_summaries() {
         let read = tool_view(
             "read",
             r#"{"path":"/tmp/project/src/main.rs","offset":10,"limit":20}"#,
@@ -16864,27 +16566,8 @@ mod kathamo_bottom_input_tests {
             r#"{"path":"src","pattern":"Tool","include":"*.rs"}"#,
         );
         assert_eq!(grep.title, "Grep");
-        assert_eq!(grep.subtitle, "src");
+        assert_eq!(grep.subtitle, "Tool in src");
         assert_eq!(grep.args, vec!["pattern=Tool", "include=*.rs"]);
-    }
-
-    #[test]
-    fn tool_group_label_uses_opencode_wording() {
-        use agent_bridge::AgentEvent;
-        let mut messages = Vec::new();
-        for (id, name) in [("a", "read"), ("b", "grep")] {
-            push_chat_event(
-                &mut messages,
-                AgentEvent::ToolStart {
-                    id: Some(id.into()),
-                    name: name.into(),
-                    input: "{}".into(),
-                },
-            );
-        }
-        let parts: Vec<(usize, Arc<ChatMessage>)> = messages.iter().cloned().enumerate().collect();
-        let (prefix, title) = tool_group_label(&parts);
-        assert_eq!(format!("{prefix}{title}"), "Used 2 Read, Grep");
     }
 
     #[test]
@@ -16955,7 +16638,7 @@ First report
             cx.notify();
         });
         cx.draw_frame().expect("draw parent chat");
-        assert!(cx.debug_bounds("tool-group-0").is_none());
+        assert!(cx.debug_bounds("tool-row-0").is_none());
         assert!(cx.debug_bounds("subagent-list-0").is_some());
         let row = cx
             .debug_bounds("subagent-row-FirstWorker")
@@ -16976,7 +16659,7 @@ First report
     }
 
     #[test]
-    fn live_reasoning_is_rendered_outside_a_collapsed_tool_group() {
+    fn live_reasoning_and_tool_calls_are_both_visible() {
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
@@ -16999,21 +16682,81 @@ First report
                     input: r#"{"path":"src/main.rs"}"#.into(),
                 },
             );
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::ToolEnd {
+                    id: Some("t1".into()),
+                    name: "read".into(),
+                    output: "file contents".into(),
+                    failed: false,
+                },
+            );
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::ToolStart {
+                    id: Some("t2".into()),
+                    name: "bash".into(),
+                    input: r#"{"command":"cargo check"}"#.into(),
+                },
+            );
         });
         cx.draw_frame().expect("draw live reasoning");
         let body = cx
             .debug_bounds("thinking-body-0")
-            .expect("reasoning body is drawn outside the collapsed tool group");
+            .expect("reasoning body stays visible after a tool starts");
         assert!(
             body.size.height > px(40.0),
             "the full reasoning body is laid out, not a one-line preview: {:?}",
             body.size.height
         );
         assert!(cx.debug_bounds("thinking-row-0").is_some());
-        assert!(
-            cx.debug_bounds("tool-group-1").is_some(),
-            "the tool group still renders after the reasoning"
+        let read = cx.debug_bounds("tool-row-1").expect("read row");
+        let shell = cx.debug_bounds("tool-row-2").expect("running shell row");
+        assert_eq!(shell.origin.y - read.origin.y, px(24.0));
+
+        cx.simulate_click(
+            read.origin + point(px(20.0), px(10.0)),
+            Modifiers::default(),
         );
+        cx.draw_frame().expect("draw expanded read");
+        let read = cx.debug_bounds("tool-row-1").expect("expanded read header");
+        let shell = cx
+            .debug_bounds("tool-row-2")
+            .expect("shell row after expanded read");
+        assert!(shell.origin.y - read.origin.y > px(24.0));
+
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = s.pane_mut(pane_id).unwrap();
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::ToolEnd {
+                    id: Some("t2".into()),
+                    name: "bash".into(),
+                    output: "finished".into(),
+                    failed: false,
+                },
+            );
+            push_chat_event(
+                &mut pane.chat.messages,
+                agent_bridge::AgentEvent::Text("All checks passed.".into()),
+            );
+            pane.chat.mark_active_dirty();
+            cx.notify();
+        });
+        cx.draw_frame().expect("draw completed section");
+        let group = cx
+            .debug_bounds("tool-group-1")
+            .expect("folded tool section");
+        assert!(cx.debug_bounds("tool-row-1").is_none());
+        assert!(cx.debug_bounds("tool-row-2").is_none());
+
+        cx.simulate_click(
+            group.origin + point(px(20.0), px(10.0)),
+            Modifiers::default(),
+        );
+        cx.draw_frame().expect("draw reopened section");
+        assert!(cx.debug_bounds("tool-row-1").is_some());
+        assert!(cx.debug_bounds("tool-row-2").is_some());
     }
 
     #[test]
@@ -18923,6 +18666,173 @@ First report
         measure_chat_frames("short", 24, 16, 1);
         measure_chat_frames("long", 240, 3, 1);
         measure_chat_frames("long-bursty", 240, 3, 8);
+    }
+
+    #[test]
+    #[ignore = "prints timings for headless tool cards and output"]
+    fn tool_feedback_frame_benchmark() {
+        use crate::stream_timing as timing;
+        use agent_bridge::AgentEvent;
+
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+        });
+        cx.draw_frame().unwrap();
+        for sample in 0..20 {
+            let id = format!("feedback-{sample}");
+            timing::tool_arrived(&id);
+            cx.update_window_entity(&state, |s, _, cx| {
+                let messages = s.pane_mut(pane_id).unwrap().chat.visible_messages_mut();
+                messages.clear();
+                push_chat_event(
+                    messages,
+                    AgentEvent::ToolStart {
+                        id: Some(id.clone()),
+                        name: "read".into(),
+                        input: r#"{"path":"Cargo.toml"}"#.into(),
+                    },
+                );
+                Arc::make_mut(messages.last_mut().unwrap())
+                    .tool
+                    .as_mut()
+                    .unwrap()
+                    .expanded = true;
+                cx.notify();
+            });
+            cx.draw_frame().unwrap();
+            assert!(cx.debug_bounds("tool-row-0").is_some());
+            timing::tool_finished(&id);
+            cx.update_window_entity(&state, |s, _, cx| {
+                let messages = s.pane_mut(pane_id).unwrap().chat.visible_messages_mut();
+                push_chat_event(
+                    messages,
+                    AgentEvent::ToolEnd {
+                        id: Some(id),
+                        name: "read".into(),
+                        output: "[package]".into(),
+                        failed: false,
+                    },
+                );
+                cx.notify();
+            });
+            cx.draw_frame().unwrap();
+        }
+        timing::report_now();
+    }
+
+    #[test]
+    #[ignore = "requires two local provider fixtures"]
+    fn loopback_provider_switch_keeps_context() {
+        use agent_bridge::AgentEvent;
+        use std::time::Duration;
+
+        let cwd = PathBuf::from(std::env::var_os("KATHAMO_BENCH_CWD").unwrap());
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        agent_bridge::set_wake(Arc::new(move || {
+            let _ = wake_tx.try_send(());
+        }));
+        let mut chat = PaneChat::default();
+        let mut session_id = None;
+        for (provider, model, prompt) in [
+            ("bench", "fixture", "Remember the switch fixture."),
+            (
+                "bench-second",
+                "switched",
+                "Check switched provider history.",
+            ),
+        ] {
+            chat.selected_model = Some(agent_auth::AgentModel {
+                provider: provider.into(),
+                id: model.into(),
+                backend: agent_auth::ModelBackend::Rpi,
+            });
+            chat.ensure_agent(cwd.clone()).unwrap();
+            let context = chat.context_prompt(prompt);
+            let bridge = chat.bridge.as_mut().unwrap();
+            bridge
+                .send_prompt(prompt, chat.bridge_resume.as_deref(), context)
+                .unwrap();
+            chat.messages
+                .push(Arc::new(ChatMessage::new(ChatRole::User, prompt.into())));
+            let mut answer = String::new();
+            'turn: loop {
+                wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                for event in bridge.poll() {
+                    match &event {
+                        AgentEvent::Text(text) => answer.push_str(text),
+                        AgentEvent::Done => break 'turn,
+                        AgentEvent::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                    push_chat_event(&mut chat.messages, event);
+                }
+            }
+            assert_eq!(answer, "x".repeat(16));
+            finish_chat_streaming(&mut chat.messages);
+            let ModelBridge::Rpi(bridge) = bridge else {
+                unreachable!()
+            };
+            let actual_id = bridge.session_id().expect("durable rpi session");
+            if let Some(expected) = &session_id {
+                assert_eq!(&actual_id, expected);
+            }
+            chat.rpi_session_id = Some(actual_id.clone());
+            session_id = Some(actual_id);
+        }
+        assert_eq!(chat.messages.len(), 4);
+    }
+
+    #[test]
+    #[ignore = "requires the local streaming benchmark endpoint"]
+    fn loopback_tool_latency_benchmark() {
+        use crate::stream_timing as timing;
+        use agent_bridge::{AgentBridge, AgentEvent};
+        use std::time::Duration;
+
+        rpi_embedded::set_tool_arrival_hook(timing::tool_arrived);
+        rpi_embedded::set_tool_end_hook(timing::tool_finished);
+        let cwd = PathBuf::from(std::env::var_os("KATHAMO_BENCH_CWD").unwrap());
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        agent_bridge::set_wake(Arc::new(move || {
+            let _ = wake_tx.try_send(());
+        }));
+        let mut bridge = AgentBridge::spawn_model(&cwd, Some("bench/fixture")).unwrap();
+        let trace = bridge.trace_id();
+        for sample in 0..20 {
+            timing::turn_sent(trace, sample > 0);
+            bridge.send_prompt("Run two benchmark tools.").unwrap();
+            let mut results = std::collections::HashMap::new();
+            let mut answer = String::new();
+            'turn: loop {
+                wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                for event in bridge.poll() {
+                    match event {
+                        AgentEvent::ToolEnd {
+                            name,
+                            output,
+                            failed,
+                            ..
+                        } => {
+                            assert!(!failed, "{name}: {output}");
+                            results.insert(name, output);
+                        }
+                        AgentEvent::Text(text) => answer.push_str(&text),
+                        AgentEvent::Done => break 'turn,
+                        AgentEvent::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(results.len(), 2);
+            assert!(results["read"].contains("benchmark fixture"));
+            assert_eq!(results["bash"].trim(), "ready");
+            assert_eq!(answer, "x".repeat(16));
+            timing::turn_settled(trace);
+        }
+        timing::report_now();
     }
 
     #[test]

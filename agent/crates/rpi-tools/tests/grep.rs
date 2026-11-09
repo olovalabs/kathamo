@@ -223,3 +223,42 @@ async fn grep_glob_filter() {
         "txt should be filtered out: {out}"
     );
 }
+
+#[tokio::test]
+async fn grep_native_walk_respects_ignore_rules_and_preserves_breadth_first_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for subdir in [".git", "nested/deep", "target"] {
+        std::fs::create_dir_all(root.join(subdir)).unwrap();
+    }
+    for (name, contents) in [
+        (".gitignore", "/target/\n*.tmp\n"),
+        ("nested/.gitignore", "!keep.tmp\n"),
+        ("z.txt", "needle\r\nother\n"),
+        ("nested/keep.tmp", "needle\n"),
+        ("nested/skip.tmp", "needle\n"),
+        ("nested/deep/a.txt", "needle\n"),
+        ("target/output.txt", "needle\n"),
+    ] {
+        std::fs::write(root.join(name), contents).unwrap();
+    }
+    let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(root.into()));
+    let ctx = ExecutionToolContext::new(env, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
+
+    let result = run_grep(tool.clone(), serde_json::json!({"pattern": "needle"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        text_output(&result),
+        "z.txt:1: needle\nnested/keep.tmp:1: needle\nnested/deep/a.txt:1: needle"
+    );
+
+    let explicit = run_grep(
+        tool,
+        serde_json::json!({"pattern": "needle", "path": "target/output.txt"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(text_output(&explicit), "output.txt:1: needle");
+}

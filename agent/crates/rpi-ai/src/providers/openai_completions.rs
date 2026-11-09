@@ -939,6 +939,7 @@ impl StreamState {
     async fn push_text(&mut self, producer: &mut AssistantMessageEventStreamProducer, delta: &str) {
         // Flush before even the start snapshot can expose buffered thinking.
         self.flush_thinking(producer).await;
+        let first_text = self.text_index.is_none();
         let index = match self.text_index {
             Some(index) => index,
             None => {
@@ -960,7 +961,7 @@ impl StreamState {
         // Batch: `partial` is a full message clone per event, so one event per
         // SSE chunk makes a long stream quadratic. See `DELTA_FLUSH_BYTES`.
         self.pending_text.push_str(delta);
-        if self.should_flush(&self.pending_text) {
+        if first_text || self.should_flush(&self.pending_text) {
             self.flush_text(producer).await;
         }
     }
@@ -973,6 +974,7 @@ impl StreamState {
         // Keep channel order strict: text already streamed must be emitted before
         // the first thinking delta of a new block.
         self.flush_text(producer).await;
+        let first_thinking = self.thinking_index.is_none();
         let index = match self.thinking_index {
             Some(index) => index,
             None => {
@@ -997,7 +999,7 @@ impl StreamState {
             thinking.thinking.push_str(delta);
         }
         self.pending_thinking.push_str(delta);
-        if self.should_flush(&self.pending_thinking) {
+        if first_thinking || self.should_flush(&self.pending_thinking) {
             self.flush_thinking(producer).await;
         }
     }
@@ -1275,6 +1277,27 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_answer_delta_is_immediate_after_thinking() {
+        let model = model();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer).await;
+
+        state.apply_chunk(&mut producer, &thinking_chunk("a")).await;
+        state.apply_chunk(&mut producer, &thinking_chunk("b")).await;
+        state
+            .apply_chunk(&mut producer, &text_chunk("answer"))
+            .await;
+        assert!(state.pending_thinking.is_empty());
+        assert!(state.pending_text.is_empty());
+        assert!(state.flush_deadline().is_none());
+
+        state.apply_chunk(&mut producer, &stop_chunk()).await;
+        state.finish(&mut producer, &model).await;
+        assert_eq!(text_deltas(&drain(&mut stream).await), vec!["answer"]);
     }
 
     #[tokio::test(start_paused = true)]

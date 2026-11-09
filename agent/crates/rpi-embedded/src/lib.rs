@@ -85,12 +85,18 @@ pub fn providers() -> Result<Vec<ProviderState>, String> {
 }
 
 static TOOL_ARRIVAL_HOOK: OnceLock<fn(&str)> = OnceLock::new();
+static TOOL_END_HOOK: OnceLock<fn(&str)> = OnceLock::new();
 
 /// Install a host callback invoked when a tool-start event reaches the embedded
 /// forwarder. Hosts use it to correlate RPC arrival with the first painted card.
 /// It never changes agent behavior.
 pub fn set_tool_arrival_hook(hook: fn(&str)) {
     let _ = TOOL_ARRIVAL_HOOK.set(hook);
+}
+
+/// Install a host callback invoked when a tool-end event reaches the forwarder.
+pub fn set_tool_end_hook(hook: fn(&str)) {
+    let _ = TOOL_END_HOOK.set(hook);
 }
 
 /// Events delivered to the host. This mirrors Kathamo's existing chat event
@@ -194,7 +200,10 @@ impl SessionOptions {
 }
 
 enum Command {
-    Prompt(String),
+    Prompt {
+        text: String,
+        fallback: Option<(Option<String>, String)>,
+    },
     Abort,
     Shutdown,
 }
@@ -279,11 +288,24 @@ impl EmbeddedSession {
     }
 
     pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
+        self.send_prompt_with_context(prompt, None, None)
+    }
+
+    /// Supply prior context for a fresh session or a missing durable session.
+    pub fn send_prompt_with_context(
+        &mut self,
+        prompt: &str,
+        resume: Option<&str>,
+        context: Option<String>,
+    ) -> Result<(), String> {
         if self.closed {
             return Err("The agent session has closed".into());
         }
         self.commands
-            .send(Command::Prompt(prompt.to_string()))
+            .send(Command::Prompt {
+                text: prompt.to_owned(),
+                fallback: context.map(|context| (resume.map(str::to_owned), context)),
+            })
             .map_err(|_| "The agent session has closed".to_string())
     }
 
@@ -510,13 +532,18 @@ async fn run_session(
 
     while let Some(command) = commands.recv().await {
         match command {
-            Command::Prompt(text) => {
+            Command::Prompt { mut text, fallback } => {
                 if running.swap(true, Ordering::SeqCst) {
                     let _ = events.send(SessionEvent::Error(
                         "The agent is already running a prompt".into(),
                     ));
                     wake.signal();
                     continue;
+                }
+                if let Some((expected, context)) = fallback {
+                    if expected.as_deref() != Some(harness.session_id().as_str()) {
+                        text = context;
+                    }
                 }
                 let lane: Arc<dyn AgentLane> = harness.clone();
                 let finished = finished.clone();
@@ -616,6 +643,9 @@ fn forward_event(event: RpiEvent, events: &mpsc::Sender<SessionEvent>) -> bool {
             result,
             is_error,
         } => {
+            if let Some(hook) = TOOL_END_HOOK.get() {
+                hook(&tool_call_id);
+            }
             let _ = events.send(SessionEvent::ToolEnd {
                 id: Some(tool_call_id),
                 name: tool_name,

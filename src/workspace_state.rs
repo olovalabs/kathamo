@@ -105,7 +105,19 @@ pub struct SavedChat {
     /// Name derived from the first prompt, shown until the agent reports one.
     pub prompt_title: Option<String>,
     pub rpi_session_id: Option<String>,
+    pub conversation_key: Option<String>,
     pub models: Vec<SavedModelChat>,
+}
+
+impl SavedChat {
+    pub fn valid_conversation_key(&self) -> Option<&str> {
+        self.conversation_key.as_deref().filter(|key| {
+            !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_' | b'.'))
+        })
+    }
 }
 
 impl Default for SavedChat {
@@ -117,6 +129,7 @@ impl Default for SavedChat {
             agent_title: None,
             prompt_title: None,
             rpi_session_id: None,
+            conversation_key: None,
             models: Vec::new(),
         }
     }
@@ -678,6 +691,7 @@ mod tests {
                                 agent_title: None,
                                 prompt_title: None,
                                 rpi_session_id: Some("session-1".into()),
+                                conversation_key: None,
                                 models: vec![SavedModelChat {
                                     model: Some(AgentModel {
                                         provider: "commandcode".into(),

@@ -8083,6 +8083,7 @@ dependencies = [
  "fast_image_resize",
  "futures",
  "globset",
+ "ignore",
  "image",
  "jsonschema",
  "nix 0.29.0",

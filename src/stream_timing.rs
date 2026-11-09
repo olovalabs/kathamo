@@ -15,7 +15,7 @@
 //! - `ui.apply`       applying one event to the visible transcript
 //! - `ui.render_rows` building chat rows in a frame
 //! - `markdown.*`     initial and update parses (components crate)
-//! - `tool.*`         RPC arrival → UI apply / first card / first output
+//! - `tool.*`         event arrival → completion / UI apply / first card / first output
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -140,6 +140,7 @@ fn report() {
 
 struct ToolTrace {
     arrived: Instant,
+    ended: Option<Instant>,
     card_painted: bool,
     output_painted: bool,
 }
@@ -164,10 +165,37 @@ pub fn tool_arrived(id: &str) {
         id.to_owned(),
         ToolTrace {
             arrived: Instant::now(),
+            ended: None,
             card_painted: false,
             output_painted: false,
         },
     );
+}
+
+/// Time between the start and end events reaching the bridge. Includes agent
+/// preparation and finalization as well as the tool call itself.
+pub fn tool_finished(id: &str) {
+    if !enabled() {
+        return;
+    }
+    let now = Instant::now();
+    let arrived = lock(&TOOLS)
+        .get_mut(id)
+        .and_then(|tool| tool.ended.replace(now).is_none().then_some(tool.arrived));
+    if let Some(arrived) = arrived {
+        record("tool.start_to_end", now.saturating_duration_since(arrived));
+    }
+}
+
+/// Associate the most recent tool end with the next model delta in this turn.
+pub fn turn_tool_finished(trace: u64, id: &str) {
+    if !enabled() {
+        return;
+    }
+    let ended = lock(&TOOLS).get(id).and_then(|tool| tool.ended);
+    if let Some(turn) = lock(&TURNS).get_mut(&trace) {
+        turn.last_tool_end = ended;
+    }
 }
 
 /// RPC arrival → the event was applied to the visible transcript.
@@ -179,6 +207,17 @@ pub fn tool_applied(id: &str) {
     if let Some(arrived) = arrived {
         record_since("tool.arrival_to_apply", arrived);
     }
+}
+
+pub fn tool_paint_due(id: &str, output: bool) -> bool {
+    enabled()
+        && lock(&TOOLS).get(id).is_some_and(|trace| {
+            if output {
+                !trace.output_painted
+            } else {
+                !trace.card_painted
+            }
+        })
 }
 
 /// RPC arrival → the tool card first entered a frame.
@@ -225,10 +264,18 @@ struct TurnTrace {
     sent: Instant,
     warm: bool,
     provider_request: Option<Instant>,
+    last_tool_end: Option<Instant>,
     first: [Option<Instant>; 2],
     applied: [bool; 2],
     painted: [bool; 2],
     cancelled: Option<Instant>,
+    settled: bool,
+}
+
+impl TurnTrace {
+    fn awaiting_paint(&self) -> bool {
+        (0..self.first.len()).any(|index| self.applied[index] && !self.painted[index])
+    }
 }
 
 static TURNS: LazyLock<Mutex<HashMap<u64, TurnTrace>>> =
@@ -280,10 +327,12 @@ pub fn turn_sent(trace: u64, warm: bool) {
             sent: Instant::now(),
             warm,
             provider_request: None,
+            last_tool_end: None,
             first: [None; 2],
             applied: [false; 2],
             painted: [false; 2],
             cancelled: None,
+            settled: false,
         },
     );
 }
@@ -318,21 +367,31 @@ pub fn turn_delta_arrived(trace: u64, kind: DeltaKind) {
     let Some(turn) = turns.get_mut(&trace) else {
         return;
     };
-    if turn.first[index].is_some() {
-        return;
-    }
     let now = Instant::now();
-    turn.first[index] = Some(now);
-    let sent = turn.sent;
-    let label = phase_label(
-        turn.warm,
-        match kind {
-            DeltaKind::Reasoning => "reasoning.send_to_first_delta",
-            DeltaKind::Answer => "answer.send_to_first_delta",
-        },
-    );
+    let last_tool_end = turn.last_tool_end.take();
+    let first = if turn.first[index].is_none() {
+        turn.first[index] = Some(now);
+        let label = phase_label(
+            turn.warm,
+            match kind {
+                DeltaKind::Reasoning => "reasoning.send_to_first_delta",
+                DeltaKind::Answer => "answer.send_to_first_delta",
+            },
+        );
+        Some((label, turn.sent))
+    } else {
+        None
+    };
     drop(turns);
-    record(label, now.saturating_duration_since(sent));
+    if let Some(ended) = last_tool_end {
+        record(
+            "tool.end_to_model_delta",
+            now.saturating_duration_since(ended),
+        );
+    }
+    if let Some((label, sent)) = first {
+        record(label, now.saturating_duration_since(sent));
+    }
 }
 
 /// The first delta for `kind` was applied to the visible transcript.
@@ -419,6 +478,9 @@ pub fn turn_painted(trace: u64, kind: DeltaKind) {
         },
     );
     let sent = turn.sent;
+    if turn.settled && !turn.awaiting_paint() {
+        turns.remove(&trace);
+    }
     drop(turns);
     record(sent_label, now.saturating_duration_since(sent));
     record(delta_label, now.saturating_duration_since(arrived));
@@ -442,10 +504,27 @@ pub fn turn_settled(trace: u64) {
     if !enabled() {
         return;
     }
-    let cancelled = {
+    let (sent, warm, cancelled) = {
         let mut turns = lock(&TURNS);
-        turns.remove(&trace).and_then(|turn| turn.cancelled)
+        let Some(turn) = turns.get_mut(&trace) else {
+            return;
+        };
+        if std::mem::replace(&mut turn.settled, true) {
+            return;
+        }
+        let sample = (turn.sent, turn.warm, turn.cancelled);
+        // Completion and the first text can be drained in the same UI batch.
+        if !turn.awaiting_paint() {
+            turns.remove(&trace);
+        }
+        sample
     };
+    let label = if warm {
+        "turn.warm.send_to_settle"
+    } else {
+        "turn.cold.send_to_settle"
+    };
+    record_since(label, sent);
     if let Some(cancelled) = cancelled {
         record_since("turn.cancel_to_settle", cancelled);
     }

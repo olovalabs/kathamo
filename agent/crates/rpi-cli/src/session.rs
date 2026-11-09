@@ -221,6 +221,8 @@ pub fn default_system_prompt_with_tool_prompts(
         "- Show file paths clearly when working with files",
         "- Prefer the smallest change that solves the problem",
         working_state_rule,
+        "- Request independent reads and searches together in one batch when their inputs are known.
+  Wait for results before requesting dependent calls or making edits.",
         "- Read only what you need. If a file or search result was already shown earlier in this
   conversation, use it instead of fetching it again.",
     ];

@@ -179,6 +179,8 @@ pub trait ReadFile: Send + Sync {
     }
 }
 
+pub type SearchTree = std::collections::HashMap<PathBuf, Vec<(PathBuf, FileKind)>>;
+
 /// Mirrors TS `FileSystem`. All methods async, never panic.
 /// Backends should check cancellation at entry and during long operations.
 #[async_trait]
@@ -293,6 +295,16 @@ pub trait FileSystem: Send + Sync {
         path: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<FileInfo>, FileError>;
+
+    /// Native snapshot of recursive search entries grouped by parent directory.
+    /// Backends without a bulk walker can enumerate directories on demand.
+    async fn search_tree(
+        &self,
+        _path: &str,
+        _cancel: Option<&CancellationToken>,
+    ) -> Result<Option<SearchTree>, FileError> {
+        Ok(None)
+    }
 
     /// Follows symlinks (`canonicalize`). Mirrors TS `canonicalPath`. Backends
     /// may return `not_found` or `not_supported` for missing/unsupported paths;

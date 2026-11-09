@@ -723,6 +723,44 @@ impl FileSystem for OsExecutionEnv {
         Ok(out)
     }
 
+    async fn search_tree(
+        &self,
+        path: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<crate::env::SearchTree>, FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        let cancel = cancel.cloned();
+        tokio::task::spawn_blocking(move || {
+            let mut tree = crate::env::SearchTree::new();
+            let walker = ignore::WalkBuilder::new(&abs)
+                .hidden(false)
+                .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+                .build();
+            for entry in walker {
+                check_cancel_file(cancel.as_ref(), None)?;
+                let Ok(entry) = entry else { continue };
+                if entry.depth() == 0 {
+                    continue;
+                }
+                let kind = match entry.file_type() {
+                    Some(kind) if kind.is_file() => FileKind::File,
+                    Some(kind) if kind.is_dir() => FileKind::Directory,
+                    _ => continue,
+                };
+                let path = entry.into_path();
+                if let Some(parent) = path.parent() {
+                    tree.entry(parent.to_path_buf())
+                        .or_default()
+                        .push((path, kind));
+                }
+            }
+            Ok(Some(tree))
+        })
+        .await
+        .map_err(|error| io_to_file_error(std::io::Error::other(error), Some(path)))?
+    }
+
     async fn canonical_path(
         &self,
         path: &str,

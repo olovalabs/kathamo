@@ -4,22 +4,16 @@
 //! Read-only — goes through the `FileSystem` trait so it runs against both
 //! `OsExecutionEnv` and `InMemoryExecutionEnv`.
 //!
-//! Divergence from TS (documented): the TS tool **shells out to `rg`**
-//! (ripgrep), parsing its `--json` stream, and re-reads files only for context
-//! blocks. The Rust port implements search **in-process** via the `FileSystem`
-//! trait + the `regex` crate, so the tool works against any `ExecutionEnv`
-//! (including `InMemoryExecutionEnv`, which has no shell). Trade-offs: no
-//! `.gitignore` awareness in v1 (only `.git/` directories are skipped; revisit
-//! via the `ignore` crate for an `OsExecutionEnv`-only fast path), no
-//! auto-download of a binary, and traversal order is a deterministic sorted BFS
-//! rather than rg's walk order. Output shape, match/context line formats,
-//! per-line + byte truncation, and the match-limit semantics match TS exactly.
+//! Searches in-process through the filesystem backend. Native directory
+//! searches honor ignore rules and prefetch file contents in bounded batches,
+//! while matches are collected in deterministic breadth-first order.
 
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{stream, StreamExt};
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::error::AgentError;
 use rpi_agent::types::{AgentToolResult, TextContentOrImage, ToolResultPartial};
@@ -39,6 +33,7 @@ use crate::truncate::{
 
 /// Default max matches. Mirrors TS `grep.ts::DEFAULT_LIMIT`.
 const DEFAULT_LIMIT: u32 = 100;
+const PREFETCH_FILES: usize = 8;
 
 /// Input for the grep tool. Mirrors TS `GrepToolInput`. `camelCase` field names
 /// match the TS wire schema (so `ignoreCase`/`ignore_case` deserialization lines
@@ -98,7 +93,7 @@ impl GrepTool {
             name: "grep".to_string(),
             description: format!(
                 "Search file contents for a pattern. Returns matching lines with file paths and \
-                 line numbers. Skips `.git/` directories. Output is truncated to {DEFAULT_LIMIT} \
+                 line numbers. Native directory searches respect ignore rules. Output is truncated to {DEFAULT_LIMIT} \
                  matches or {kb}KB (whichever is hit first). Long lines are truncated to \
                  {GREP_MAX_LINE_LENGTH} chars.",
                 kb = DEFAULT_MAX_BYTES / 1024
@@ -203,82 +198,113 @@ impl AgentTool for GrepTool {
         if root_kind == FileKind::Directory {
             // Iterative BFS walk (avoids async-recursion boxing). Sorted entries
             // for deterministic output order.
-            let mut queue: VecDeque<(String, String)> = VecDeque::new();
-            queue.push_back((search_path.clone(), String::new()));
+            let mut tree = self
+                .env
+                .search_tree(&search_path, cancel)
+                .await
+                .map_err(file_err_to_agent)?;
+            let mut queue =
+                VecDeque::from([(Path::new(&search_path).to_path_buf(), String::new())]);
             while let Some((abs_dir, rel_dir)) = queue.pop_front() {
                 if matches >= effective_limit {
                     break;
                 }
-                let mut entries = match self.env.list_dir(&abs_dir, cancel).await {
-                    Ok(e) => e,
-                    Err(_) => continue, // unreadable dir — skip (TS relies on rg to ignore)
+                check_cancel(&signal)?;
+                let mut entries = if let Some(tree) = &mut tree {
+                    tree.remove(&abs_dir).unwrap_or_default()
+                } else {
+                    match self.env.list_dir(&abs_dir.to_string_lossy(), cancel).await {
+                        Ok(entries) => entries
+                            .into_iter()
+                            .map(|entry| (entry.path, entry.kind))
+                            .collect(),
+                        Err(_) => {
+                            check_cancel(&signal)?;
+                            continue;
+                        }
+                    }
                 };
-                entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-                for entry in entries {
+                entries.sort_by_cached_key(|(path, _)| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase()
+                });
+                let mut prefetched = stream::iter(entries)
+                    .map(|(path, kind)| {
+                        let rel_dir = &rel_dir;
+                        let glob = glob.as_ref();
+                        async move {
+                            let name = path.file_name().unwrap_or_default().to_string_lossy();
+                            let rel = if rel_dir.is_empty() {
+                                name.into_owned()
+                            } else {
+                                format!("{rel_dir}/{name}")
+                            };
+                            let text = if kind == FileKind::File && matches_glob(glob, &path, &rel)
+                            {
+                                self.env
+                                    .read_text_file(&path.to_string_lossy(), cancel)
+                                    .await
+                                    .ok()
+                            } else {
+                                None
+                            };
+                            (path, kind, rel, text)
+                        }
+                    })
+                    .buffered(PREFETCH_FILES);
+                while let Some((path, kind, rel, text)) = prefetched.next().await {
+                    check_cancel(&signal)?;
                     if matches >= effective_limit {
                         match_limit_reached = true;
                         break;
                     }
-                    let child_abs = entry.path.to_string_lossy().into_owned();
-                    match entry.kind {
-                        FileKind::Directory => {
-                            // Skip `.git/` (v1 has no full .gitignore support).
-                            if entry.name == ".git" {
-                                continue;
-                            }
-                            let rel = if rel_dir.is_empty() {
-                                entry.name.clone()
-                            } else {
-                                format!("{rel_dir}/{}", entry.name)
-                            };
-                            queue.push_back((child_abs, rel));
-                        }
-                        FileKind::File => {
-                            let rel = if rel_dir.is_empty() {
-                                entry.name.clone()
-                            } else {
-                                format!("{rel_dir}/{}", entry.name)
-                            };
-                            search_file(
-                                &*self.env,
-                                cancel,
-                                &re,
-                                glob.as_ref(),
-                                context_val,
-                                effective_limit,
-                                &child_abs,
-                                &rel,
-                                &mut matches,
-                                &mut match_limit_reached,
-                                &mut lines_truncated,
-                                &mut output_lines,
-                            )
-                            .await?;
-                        }
-                        FileKind::Symlink => {
-                            // Skip symlinks during the walk (avoids loops). The
-                            // search root symlink is followed above.
-                        }
+                    if kind == FileKind::Directory
+                        && path.file_name().is_some_and(|name| name != ".git")
+                    {
+                        queue.push_back((path, rel));
+                        continue;
+                    }
+                    if let Some(text) = text {
+                        search_text(
+                            &text,
+                            &re,
+                            context_val,
+                            effective_limit,
+                            &rel,
+                            &mut matches,
+                            &mut match_limit_reached,
+                            &mut lines_truncated,
+                            &mut output_lines,
+                        );
                     }
                 }
             }
         } else if root_kind == FileKind::File {
-            let rel = basename(&search_path);
-            search_file(
-                &*self.env,
-                cancel,
-                &re,
-                glob.as_ref(),
-                context_val,
-                effective_limit,
-                &search_path,
-                &rel,
-                &mut matches,
-                &mut match_limit_reached,
-                &mut lines_truncated,
-                &mut output_lines,
-            )
-            .await?;
+            let path = Path::new(&search_path);
+            let rel = path.file_name().map_or_else(
+                || search_path.as_str().into(),
+                |name| name.to_string_lossy(),
+            );
+            let text = if matches_glob(glob.as_ref(), path, &rel) {
+                self.env.read_text_file(&search_path, cancel).await.ok()
+            } else {
+                None
+            };
+            if let Some(text) = text {
+                search_text(
+                    &text,
+                    &re,
+                    context_val,
+                    effective_limit,
+                    &rel,
+                    &mut matches,
+                    &mut match_limit_reached,
+                    &mut lines_truncated,
+                    &mut output_lines,
+                );
+            }
         } else {
             // Symlink root that didn't resolve to a file/dir (or not_supported).
             return Err(AgentError::Tool(format!(
@@ -286,6 +312,7 @@ impl AgentTool for GrepTool {
             )));
         }
 
+        check_cancel(&signal)?;
         if output_lines.is_empty() {
             return Ok(AgentToolResult {
                 content: vec![TextContentOrImage::text("No matches found")],
@@ -341,51 +368,48 @@ impl AgentTool for GrepTool {
     }
 }
 
-/// Search a single file for `re`, appending formatted match/context lines to
-/// `output_lines` and bumping `matches`. Reads via the `FileSystem` trait; an
-/// unreadable file (non-UTF-8, etc.) is silently skipped (a clean divergence —
-/// in-process search can't match lines it can't decode).
+fn check_cancel(signal: &CancellationToken) -> Result<(), AgentError> {
+    if signal.is_cancelled() {
+        return Err(file_err_to_agent(crate::error::FileError::aborted()));
+    }
+    Ok(())
+}
+
+fn matches_glob(glob: Option<&(globset::GlobMatcher, bool)>, path: &Path, rel: &str) -> bool {
+    match glob {
+        Some((matcher, true)) => matcher.is_match(rel),
+        Some((matcher, false)) => matcher.is_match(path.file_name().unwrap_or(path.as_os_str())),
+        None => true,
+    }
+}
+
+/// Append match and context lines for one file, maintaining the global limit.
 #[allow(clippy::too_many_arguments)]
-async fn search_file(
-    env: &dyn ExecutionEnv,
-    cancel: Option<&CancellationToken>,
+fn search_text(
+    text: &str,
     re: &regex::Regex,
-    glob: Option<&(globset::GlobMatcher, bool)>,
     context_val: usize,
     effective_limit: usize,
-    abs: &str,
     rel: &str,
     matches: &mut usize,
     match_limit_reached: &mut bool,
     lines_truncated: &mut bool,
     output_lines: &mut Vec<String>,
-) -> Result<(), AgentError> {
-    // Glob filter (basename vs full-relative-path per `has_separator`).
-    if let Some((matcher, has_sep)) = glob {
-        let basename = basename(abs);
-        let passes = if *has_sep {
-            matcher.is_match(rel)
-        } else {
-            matcher.is_match(&basename)
-        };
-        if !passes {
-            return Ok(());
-        }
-    }
-
-    // Read; skip on failure (non-UTF-8 / unreadable).
-    let text = match env.read_text_file(abs, cancel).await {
-        Ok(t) => t,
-        Err(_) => return Ok(()),
+) {
+    // Preserve CRLF and lone-CR handling without copying ordinary LF files.
+    let normalized;
+    let text = if text.contains('\r') {
+        normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        normalized.as_str()
+    } else {
+        text
     };
-    // Normalize line endings, split on `\n` (mirror TS getFileLines).
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<&str> = normalized.split('\n').collect();
+    let context_lines = (context_val != 0).then(|| text.split('\n').collect::<Vec<_>>());
 
-    for (idx, line) in lines.iter().enumerate() {
+    for (idx, line) in text.split('\n').enumerate() {
         if *matches >= effective_limit {
             *match_limit_reached = true;
-            return Ok(());
+            return;
         }
         if !re.is_match(line) {
             continue;
@@ -393,40 +417,21 @@ async fn search_file(
         let line_number = idx + 1; // 1-indexed.
         *matches += 1;
 
-        if context_val == 0 {
-            // No context: emit the single match line (truncated).
-            let out = truncate_line_default(line);
-            if out.was_truncated {
-                *lines_truncated = true;
-            }
-            output_lines.push(format!("{rel}:{line_number}: {}", out.text));
-        } else {
-            // Context block: match line uses `:`, context lines use `-`.
+        if let Some(lines) = &context_lines {
             let start = line_number.saturating_sub(context_val).max(1);
-            let end = (line_number + context_val).min(lines.len());
+            let end = line_number.saturating_add(context_val).min(lines.len());
             for current in start..=end {
-                let text_line = lines.get(current - 1).copied().unwrap_or("");
-                let out = truncate_line_default(text_line);
-                if out.was_truncated {
-                    *lines_truncated = true;
-                }
-                if current == line_number {
-                    output_lines.push(format!("{rel}:{current}: {}", out.text));
-                } else {
-                    output_lines.push(format!("{rel}-{current}- {}", out.text));
-                }
+                let out = truncate_line_default(lines[current - 1]);
+                *lines_truncated |= out.was_truncated;
+                let separator = if current == line_number { ':' } else { '-' };
+                output_lines.push(format!("{rel}{separator}{current}{separator} {}", out.text));
             }
+        } else {
+            let out = truncate_line_default(line);
+            *lines_truncated |= out.was_truncated;
+            output_lines.push(format!("{rel}:{line_number}: {}", out.text));
         }
     }
-    Ok(())
-}
-
-/// Filename component of a path string (POSIX-agnostic: splits on `/` and `\`).
-fn basename(p: &str) -> String {
-    Path::new(p)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string())
 }
 
 /// Map a `FileError` into an `AgentError::Tool` (same shape as `read.rs`).

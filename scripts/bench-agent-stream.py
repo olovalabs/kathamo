@@ -48,7 +48,25 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         ][:1]
         burst = any(BURST_PROMPT in prompt for prompt in prompts)
         slow = any("Slow 200 tokens." in prompt for prompt in prompts)
+        run_tools = any("Run two benchmark tools." in prompt for prompt in prompts)
+        messages = body.get("messages", [])
+        request_tools = run_tools and messages and messages[-1]["role"] != "tool"
         fail = any("Fail request." in prompt for prompt in prompts)
+        if "Check switched provider history." in prompts:
+            prior_turn = any(
+                message["role"] == "user" and message.get("content") == "Remember the switch fixture."
+                for message in messages
+            )
+            prior_answer = any(
+                message["role"] == "assistant" and message.get("content") == "x" * TOKENS
+                for message in messages
+            )
+            fail = (
+                body.get("model") != "switched"
+                or not self.path.startswith("/second/")
+                or not prior_turn
+                or not prior_answer
+            )
         if fail:
             self.send_response(400)
             self.send_header("Content-Type", "text/plain")
@@ -75,9 +93,32 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             "id": "bench",
             "object": "chat.completion.chunk",
             "created": 0,
-            "model": "fixture",
+            "model": body["model"],
             "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}],
         }
+        if request_tools:
+            tools = [
+                ("read", {"path": "fixture.txt"}),
+                ("bash", {"command": "printf ready"}),
+            ]
+            calls = [
+                {
+                    "index": index,
+                    "id": f"call_bench_{len(messages)}_{index}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                }
+                for index, (name, arguments) in enumerate(tools)
+            ]
+            token["choices"][0]["delta"] = {"tool_calls": calls}
+            frame = ("data: " + json.dumps(token) + "\n\n").encode()
+            end = (
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+                b"data: [DONE]\n\n"
+            )
+            if send(frame) and send(end):
+                self.wfile.write(b"0\r\n\r\n")
+            return
         frame = ("data: " + json.dumps(token) + "\n\n").encode()
         for _ in range(tokens):
             if not send(frame):
@@ -155,14 +196,20 @@ def main():
         config.mkdir()
         cwd = Path(tmp, "project")
         cwd.mkdir()
-        (config / "models.json").write_text(json.dumps({
-            "providers": {"bench": {
+        (cwd / "fixture.txt").write_text("benchmark fixture\n")
+        providers = {
+            name: {
                 "api": "openai-completions",
-                "baseUrl": f"http://127.0.0.1:{server.server_port}/v1",
+                "baseUrl": f"http://127.0.0.1:{server.server_port}{route}/v1",
                 "apiKey": "loopback",
-                "models": [{"id": "fixture"}],
-            }}
-        }))
+                "models": [{"id": model}],
+            }
+            for name, model, route in (
+                ("bench", "fixture", ""),
+                ("bench-second", "switched", "/second"),
+            )
+        }
+        (config / "models.json").write_text(json.dumps({"providers": providers}))
         env = dict(os.environ, RPI_CODING_AGENT_DIR=str(config),
                    RPI_CODING_AGENT_SESSION_DIR=str(Path(tmp, "sessions")),
                    KATHAMO_BENCH_CWD=str(cwd))
@@ -191,6 +238,11 @@ def main():
             print(f"matching JSON requests: "
                   f"{sum(left == right for left, right in zip(server.requests[:primary], direct))}"
                   f"/{primary}")
+        subprocess.run([args.test_executable, "loopback_tool_latency_benchmark",
+                        "--ignored", "--nocapture"],
+                       env=dict(env, KATHAMO_STREAM_TIMINGS="1"), check=True, timeout=60)
+        subprocess.run([args.test_executable, "loopback_provider_switch_keeps_context",
+                        "--ignored", "--nocapture"], env=env, check=True, timeout=60)
 
 
 if __name__ == "__main__":

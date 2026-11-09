@@ -50,6 +50,7 @@ encoding_rs = "0.8"
 codepage = "0.1"
 regex = { workspace = true }
 globset = { workspace = true }
+ignore = "0.4.23"
 # Image processing (resize, convert, EXIF). Image's default features minus
 # `avif` and `rayon`: rpi never encodes AVIF, and the AVIF encoder stack
 # (ravif -> rav1e -> aligned) needs Rust 1.85+ and stays in Cargo.lock even when

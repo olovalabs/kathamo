@@ -1,11 +1,12 @@
 //! Mirrors `packages/agent/src/harness/tools/bash.ts` — the built-in `bash`
-//! `AgentTool`. Drives `execute_shell_with_capture` with a 2-second checkpoint
-//! throttle, and converts ALL failures (non-zero exit, timeout, abort,
-//! executionError) into `Err(AgentError)` — the agent loop encodes those into an
-//! error `ToolResultMessage`.
+//! `AgentTool`. Drives `execute_shell_with_capture` with an incremental
+//! checkpoint throttle, and converts ALL failures (non-zero exit, timeout,
+//! abort, executionError) into `Err(AgentError)` — the agent loop encodes those
+//! into an error `ToolResultMessage`.
 //!
-//! Throttle mirrors the TS `BASH_CHECKPOINT_INTERVAL_MS`: at most one
-//! checkpoint update per 2-second window; a final flush always follows capture
+//! The first chunk is emitted immediately. Later checkpoints are coalesced into
+//! a short window (100 ms by default, overridable with
+//! `RPI_BASH_UPDATE_THROTTLE_MS`); a final flush always follows capture
 //! resolution.
 
 use futures::future::BoxFuture;
@@ -32,18 +33,21 @@ use crate::shell_output::{
 use crate::tools::tool_context::ExecutionToolContext;
 use crate::truncate::{format_size, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
-/// Throttle window for bash `on_update` flushes. Mirrors `BASH_UPDATE_THROTTLE_MS`.
-const BASH_UPDATE_THROTTLE_MS: u64 = 2_000;
+/// Default throttle window for bash `on_update` flushes. The first chunk is
+/// emitted immediately; this window only coalesces later checkpoints.
+const BASH_UPDATE_THROTTLE_MS: u64 = 100;
 
-/// The active checkpoint window. The default is unchanged; hosts measuring the
-/// first-byte-to-visible-output contribution can override it separately from
-/// the embedding change with `RPI_BASH_UPDATE_THROTTLE_MS`.
+/// The active checkpoint window, resolved once. Reading the environment on every
+/// chunk allocated a `String` and ran a lookup in the read loop.
 fn update_throttle() -> Duration {
-    std::env::var("RPI_BASH_UPDATE_THROTTLE_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(BASH_UPDATE_THROTTLE_MS))
+    static THROTTLE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *THROTTLE.get_or_init(|| {
+        std::env::var("RPI_BASH_UPDATE_THROTTLE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_millis(BASH_UPDATE_THROTTLE_MS))
+    })
 }
 
 /// Default Bash deadline when neither the caller nor the host specifies one.
@@ -213,6 +217,7 @@ impl AgentTool for BashTool {
         // dirty + schedules a flush) and the post-capture final flush.
         let throttle = Arc::new(Mutex::new(ThrottleState {
             dirty: false,
+            first_chunk: true,
             last_flush: Instant::now(),
             latest_output: String::new(),
             latest_truncation: None,
@@ -221,50 +226,52 @@ impl AgentTool for BashTool {
 
         let throttle_for_cb = throttle.clone();
         let on_update_for_cb = on_update.clone();
-        let on_chunk: Box<dyn FnMut(&str, &dyn Fn() -> ShellCaptureProgress) + Send> = Box::new(
-            move |_chunk, get_progress: &dyn Fn() -> ShellCaptureProgress| {
-                let progress = get_progress();
-                // Snapshot the fields we need from the progress before touching
-                // the async mutex — the on_chunk callback runs on whatever thread
-                // the env's stdout/stderr callback is invoked from, which may be
-                // a runtime worker. Use try_lock so we never block (and never
-                // panic on a held lock); a missed flush is fine — the final
-                // post-capture flush always emits the terminal state.
-                let new_output = progress.output.clone();
-                let new_truncation = if progress.truncation.truncated {
-                    Some(progress.truncation.clone())
-                } else {
-                    None
-                };
-                let new_full_path = progress
-                    .full_output_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().into_owned());
-                let mut st = match throttle_for_cb.try_lock() {
-                    Ok(g) => g,
-                    Err(_) => return, // busy — skip this update; final flush covers it
-                };
-                st.latest_output = new_output;
-                st.latest_truncation = new_truncation;
-                st.latest_full_path = new_full_path;
-                st.dirty = true;
-                let elapsed = st.last_flush.elapsed();
-                let throttle_duration = update_throttle();
-                if elapsed >= throttle_duration {
+        let on_chunk: Box<dyn FnMut(&str, &dyn Fn() -> Option<ShellCaptureProgress>) + Send> =
+            Box::new(
+                move |_chunk, get_progress: &dyn Fn() -> Option<ShellCaptureProgress>| {
+                    // Decide under a short try_lock; never block the read task. A
+                    // chunk inside the window only marks the state dirty. There is
+                    // deliberately no per-chunk timer task: the first chunk is
+                    // emitted immediately and later checkpoints fire as output
+                    // keeps arriving, while the terminal flush always runs.
+                    let due = match throttle_for_cb.try_lock() {
+                        Ok(mut st) => {
+                            let due =
+                                st.first_chunk || st.last_flush.elapsed() >= update_throttle();
+                            if !due {
+                                st.dirty = true;
+                            }
+                            due
+                        }
+                        Err(_) => return,
+                    };
+                    if !due {
+                        return;
+                    }
+                    // The snapshot runs tail truncation and copies the tail, so only
+                    // build it for a checkpoint that is actually emitted.
+                    let Some(progress) = get_progress() else {
+                        return;
+                    };
+                    let ShellCaptureProgress {
+                        output,
+                        truncation,
+                        full_output_path,
+                        ..
+                    } = progress;
+                    let mut st = match throttle_for_cb.try_lock() {
+                        Ok(g) => g,
+                        Err(_) => return,
+                    };
+                    st.first_chunk = false;
+                    st.latest_output = output;
+                    st.latest_truncation = truncation.truncated.then_some(truncation);
+                    st.latest_full_path =
+                        full_output_path.map(|path| path.to_string_lossy().into_owned());
+                    st.dirty = true;
                     flush_now(&mut st, &on_update_for_cb);
-                } else {
-                    // Schedule a delayed flush (mirrors TS setTimeout)
-                    let remaining = throttle_duration - elapsed;
-                    let throttle_clone = throttle_for_cb.clone();
-                    let on_update_clone = on_update_for_cb.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(remaining).await;
-                        let mut st = throttle_clone.lock().await;
-                        flush_now(&mut st, &on_update_clone);
-                    });
-                }
-            },
-        );
+                },
+            );
 
         let cwd = execution.cwd;
         let env = self.env.clone();
@@ -385,6 +392,7 @@ impl AgentTool for BashTool {
 /// Throttle state, shared between the on_chunk callback and the final flush.
 struct ThrottleState {
     dirty: bool,
+    first_chunk: bool,
     last_flush: Instant,
     latest_output: String,
     latest_truncation: Option<TruncationResult>,
@@ -401,9 +409,9 @@ fn flush_now(st: &mut ThrottleState, on_update: &Arc<dyn Fn(ToolResultPartial) +
     st.last_flush = Instant::now();
     emit_update(
         on_update,
-        st.latest_output.clone(),
-        st.latest_truncation.clone(),
-        st.latest_full_path.clone(),
+        std::mem::take(&mut st.latest_output),
+        st.latest_truncation.take(),
+        st.latest_full_path.take(),
     );
 }
 

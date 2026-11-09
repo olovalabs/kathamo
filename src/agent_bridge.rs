@@ -1,7 +1,29 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rpi_embedded::{EmbeddedSession, SessionEvent, SessionOptions};
+
+/// Host wakeup installed once by the UI. Bridges signal it as soon as they
+/// queue an event so the UI can drain immediately instead of waiting for a
+/// fixed polling tick.
+static WAKE: OnceLock<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>> = OnceLock::new();
+
+pub fn set_wake(callback: Arc<dyn Fn() + Send + Sync>) {
+    let slot = WAKE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(callback);
+    }
+}
+
+pub(crate) fn signal_wake() {
+    let callback = WAKE
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|guard| guard.clone()));
+    if let Some(callback) = callback {
+        callback();
+    }
+}
 
 #[path = "agent_bridge_rpc.rs"]
 mod agent_bridge_rpc;
@@ -168,12 +190,14 @@ impl EmbeddedBridge {
             .with_selector(model)
             .with_session(session);
         let spawn_start = std::time::Instant::now();
-        let session = EmbeddedSession::spawn(options).map_err(|error| {
+        let mut session = EmbeddedSession::spawn(options).map_err(|error| {
             format!(
                 "Could not start the embedded rpi agent in {}: {error}",
                 cwd.display()
             )
         })?;
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(signal_wake);
+        session.set_wake(wake);
         crate::stream_timing::record_since("engine.embedded.spawn", spawn_start);
         Ok(Self {
             session,

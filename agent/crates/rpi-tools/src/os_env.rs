@@ -1028,6 +1028,9 @@ impl Shell for OsExecutionEnv {
         // Collect stdout/stderr via separate read tasks, firing callbacks.
         let mut stdout_buf = String::new();
         let mut stderr_buf = String::new();
+        // Streaming consumers (the bash capture layer) already keep the output
+        // they need, so do not retain a second unbounded copy here.
+        let capture_output = options.capture_output;
         let cancel = options.cancel;
         let stop_readers = CancellationToken::new();
         let mut on_stdout = options.on_stdout;
@@ -1067,14 +1070,18 @@ impl Shell for OsExecutionEnv {
                         // v1 simplifies — the callback contract is best-effort).
                         cb(&chunk);
                     }
-                    stdout_buf.push_str(&chunk);
+                    if capture_output {
+                        stdout_buf.push_str(&chunk);
+                    }
                 }
                 let tail = decoder.finish();
                 if !tail.is_empty() {
                     if let Some(cb) = on_stdout.as_mut() {
                         cb(&tail);
                     }
-                    stdout_buf.push_str(&tail);
+                    if capture_output {
+                        stdout_buf.push_str(&tail);
+                    }
                 }
             }
         };
@@ -1107,14 +1114,18 @@ impl Shell for OsExecutionEnv {
                     if let Some(cb) = on_stderr.as_mut() {
                         cb(&chunk);
                     }
-                    stderr_buf.push_str(&chunk);
+                    if capture_output {
+                        stderr_buf.push_str(&chunk);
+                    }
                 }
                 let tail = decoder.finish();
                 if !tail.is_empty() {
                     if let Some(cb) = on_stderr.as_mut() {
                         cb(&tail);
                     }
-                    stderr_buf.push_str(&tail);
+                    if capture_output {
+                        stderr_buf.push_str(&tail);
+                    }
                 }
             }
         };

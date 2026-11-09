@@ -4917,13 +4917,16 @@ impl AgentHarness {
                         let compaction_signal = compaction_signal.clone();
                         let stream_options = stream_options.clone();
                         let compaction_run_id = compaction_run_id.clone();
-                        let context = ctx.context.clone();
                         let new_messages_len = ctx.new_messages.len();
+                        // Estimate from the borrowed context. Cloning the entire
+                        // history here ran on every turn just to answer "is
+                        // compaction needed?"; only snapshot it when it is.
+                        let tokens = estimate_context_tokens(&ctx.context.messages).tokens;
+                        if !should_compact(tokens, model.context_window as i64, &settings) {
+                            return Box::pin(async { None });
+                        }
+                        let context = ctx.context.clone();
                         Box::pin(async move {
-                            let tokens = estimate_context_tokens(&context.messages).tokens;
-                            if !should_compact(tokens, model.context_window as i64, &settings) {
-                                return None;
-                            }
                             let entries: Vec<Entry> = context.messages.iter().enumerate().map(|(i, message)| Entry::Message(crate::session::types::MessageEntry {
                                 base: crate::session::types::EntryBase { entry_type: "message".into(), id: format!("runtime-{i}"), seq: i as u64 + 1, parent_id: None, timestamp: i as i64 },
                                 message: message.clone(), terminate: None,

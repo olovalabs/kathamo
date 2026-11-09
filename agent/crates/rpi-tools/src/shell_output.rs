@@ -69,7 +69,8 @@ pub struct ShellCaptureOptions<'a> {
     pub inherit_env: bool,
     pub timeout: Option<f64>,
     pub cancel: Option<&'a CancellationToken>,
-    pub on_chunk: Option<Box<dyn FnMut(&str, &dyn Fn() -> ShellCaptureProgress) + Send + 'a>>,
+    pub on_chunk:
+        Option<Box<dyn FnMut(&str, &dyn Fn() -> Option<ShellCaptureProgress>) + Send + 'a>>,
     pub return_execution_errors: bool,
 }
 
@@ -249,33 +250,30 @@ pub async fn execute_shell_with_capture(
     // same onChunk); we share it via Arc<Mutex<Option<Box>>> so both closures can
     // call it without moving the Box twice.
     let user_cb: Arc<
-        Mutex<Option<Box<dyn FnMut(&str, &dyn Fn() -> ShellCaptureProgress) + Send>>>,
+        Mutex<Option<Box<dyn FnMut(&str, &dyn Fn() -> Option<ShellCaptureProgress>) + Send>>>,
     > = Arc::new(Mutex::new(options.on_chunk));
 
     let state_stdout = state.clone();
     let user_cb_stdout = user_cb.clone();
     let on_stdout: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
         let text = sanitize_and_strip_cr(chunk);
-        // Snapshot the progress BEFORE ingest so on_chunk sees the pre-chunk
-        // state? The TS calls onChunk after updating, with the post-chunk
-        // progress. We match: ingest first, then snapshot.
-        let snap = {
+        {
             let mut s = match state_stdout.try_lock() {
                 Ok(g) => g,
                 Err(_) => return, // contention — skip this chunk's callback
             };
             s.ingest_chunk(&text);
-            s.create_progress()
-        };
+        }
         let mut cbg = match user_cb_stdout.try_lock() {
             Ok(g) => g,
             Err(_) => return,
         };
         if let Some(cb) = cbg.as_mut() {
-            // The TS onChunk receives (chunk_text, getProgress). We pass the
-            // snapshot getter as a closure returning the already-captured value.
-            let snap = snap.clone();
-            let getter = move || snap.clone();
+            // The progress snapshot is O(tail) because it runs tail truncation
+            // and copies the output. Build it lazily so a throttled consumer
+            // only pays for it on the checkpoints it actually emits.
+            let progress_state = state_stdout.clone();
+            let getter = move || progress_state.try_lock().ok().map(|s| s.create_progress());
             cb(chunk, &getter);
         }
     });
@@ -284,21 +282,20 @@ pub async fn execute_shell_with_capture(
     let user_cb_stderr = user_cb.clone();
     let on_stderr: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
         let text = sanitize_and_strip_cr(chunk);
-        let snap = {
+        {
             let mut s = match state_stderr.try_lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
             s.ingest_chunk(&text);
-            s.create_progress()
-        };
+        }
         let mut cbg = match user_cb_stderr.try_lock() {
             Ok(g) => g,
             Err(_) => return,
         };
         if let Some(cb) = cbg.as_mut() {
-            let snap = snap.clone();
-            let getter = move || snap.clone();
+            let progress_state = state_stderr.clone();
+            let getter = move || progress_state.try_lock().ok().map(|s| s.create_progress());
             cb(chunk, &getter);
         }
     });
@@ -312,6 +309,10 @@ pub async fn execute_shell_with_capture(
         cancel: options.cancel,
         on_stdout: Some(on_stdout),
         on_stderr: Some(on_stderr),
+        // The capture state below already keeps the bounded tail that the
+        // result is built from; retaining a second full copy in the exec
+        // layer only costs memory and copies.
+        capture_output: false,
     };
 
     let exec_result = env.exec(command, exec_opts).await;

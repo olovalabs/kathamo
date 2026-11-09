@@ -119,6 +119,7 @@ impl RpcAgentBridge {
                 match reader.read_line(&mut line) {
                     Ok(0) => {
                         let _ = sender.send(Incoming::Closed(None));
+                        crate::agent_bridge::signal_wake();
                         break;
                     }
                     Err(e) => {
@@ -169,6 +170,7 @@ impl RpcAgentBridge {
                             return;
                         }
                     }
+                    crate::agent_bridge::signal_wake();
                 }
             }
         });

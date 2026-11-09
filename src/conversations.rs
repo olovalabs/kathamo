@@ -30,7 +30,9 @@ enum WriteJob {
     Append {
         path: PathBuf,
         max_bytes: u64,
-        line: Vec<u8>,
+        /// Owned so the writer thread, not the UI thread, applies the byte cap
+        /// and JSON serialization.
+        entry: Entry,
     },
     Flush {
         ack: mpsc::Sender<()>,
@@ -69,9 +71,17 @@ fn writer_loop(receiver: mpsc::Receiver<WriteJob>) {
             WriteJob::Append {
                 path,
                 max_bytes,
-                line,
+                entry,
             } => {
                 let write_start = std::time::Instant::now();
+                let mut line = match serde_json::to_vec(&bounded_entry(entry)) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        eprintln!("failed to encode conversation {}: {error}", path.display());
+                        continue;
+                    }
+                };
+                line.push(b'\n');
                 let result = write_line(&mut files, &path, max_bytes, &line);
                 crate::stream_timing::record_since("transcript.write", write_start);
                 if let Err(error) = result {
@@ -181,43 +191,32 @@ impl Log {
     }
 
     pub fn append_user(&mut self, text: &str) {
-        self.append(&Entry::User {
-            text: cap_text(text, MAX_ENTRY_BYTES),
+        self.append(Entry::User {
+            text: text.to_string(),
         });
     }
 
     pub fn append_local(&mut self, role: ChatRole, text: &str) {
-        self.append(&Entry::Local {
+        self.append(Entry::Local {
             role,
-            text: cap_text(text, MAX_ENTRY_BYTES),
+            text: text.to_string(),
         });
     }
 
     pub fn append_event(&mut self, event: &AgentEvent) {
-        self.append(&Entry::Event {
-            event: bounded_event(event),
+        self.append(Entry::Event {
+            event: event.clone(),
         });
     }
 
-    pub fn append(&mut self, entry: &Entry) {
+    pub fn append(&mut self, entry: Entry) {
         let enqueue_start = std::time::Instant::now();
-        let mut line = match serde_json::to_vec(entry) {
-            Ok(line) => line,
-            Err(error) => {
-                eprintln!(
-                    "failed to encode conversation {}: {error}",
-                    self.path.display()
-                );
-                return;
-            }
-        };
-        line.push(b'\n');
         if self
             .sender
             .send(WriteJob::Append {
                 path: self.path.clone(),
                 max_bytes: self.max_bytes,
-                line,
+                entry,
             })
             .is_err()
         {
@@ -252,9 +251,9 @@ impl Drop for Log {
     }
 }
 
-fn cap_text(text: &str, max_bytes: usize) -> String {
+fn cap_owned(text: String, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
-        return text.to_string();
+        return text;
     }
     let mut end = max_bytes;
     while end > 0 && !text.is_char_boundary(end) {
@@ -265,21 +264,36 @@ fn cap_text(text: &str, max_bytes: usize) -> String {
     capped
 }
 
-fn bounded_event(event: &AgentEvent) -> AgentEvent {
-    match event.clone() {
-        AgentEvent::Text(text) => AgentEvent::Text(cap_text(&text, MAX_ENTRY_BYTES)),
-        AgentEvent::Thinking(text) => AgentEvent::Thinking(cap_text(&text, MAX_ENTRY_BYTES)),
-        AgentEvent::Status(text) => AgentEvent::Status(cap_text(&text, MAX_ENTRY_BYTES)),
-        AgentEvent::Tool(text) => AgentEvent::Tool(cap_text(&text, MAX_ENTRY_BYTES)),
+fn bounded_entry(entry: Entry) -> Entry {
+    match entry {
+        Entry::User { text } => Entry::User {
+            text: cap_owned(text, MAX_ENTRY_BYTES),
+        },
+        Entry::Local { role, text } => Entry::Local {
+            role,
+            text: cap_owned(text, MAX_ENTRY_BYTES),
+        },
+        Entry::Event { event } => Entry::Event {
+            event: bounded_event(event),
+        },
+    }
+}
+
+fn bounded_event(event: AgentEvent) -> AgentEvent {
+    match event {
+        AgentEvent::Text(text) => AgentEvent::Text(cap_owned(text, MAX_ENTRY_BYTES)),
+        AgentEvent::Thinking(text) => AgentEvent::Thinking(cap_owned(text, MAX_ENTRY_BYTES)),
+        AgentEvent::Status(text) => AgentEvent::Status(cap_owned(text, MAX_ENTRY_BYTES)),
+        AgentEvent::Tool(text) => AgentEvent::Tool(cap_owned(text, MAX_ENTRY_BYTES)),
         AgentEvent::ToolStart { id, name, input } => AgentEvent::ToolStart {
             id,
             name,
-            input: cap_text(&input, MAX_ENTRY_BYTES),
+            input: cap_owned(input, MAX_ENTRY_BYTES),
         },
         AgentEvent::ToolUpdate { id, name, output } => AgentEvent::ToolUpdate {
             id,
             name,
-            output: cap_text(&output, MAX_ENTRY_BYTES),
+            output: cap_owned(output, MAX_ENTRY_BYTES),
         },
         AgentEvent::ToolEnd {
             id,
@@ -289,23 +303,21 @@ fn bounded_event(event: &AgentEvent) -> AgentEvent {
         } => AgentEvent::ToolEnd {
             id,
             name,
-            output: cap_text(&output, MAX_ENTRY_BYTES),
+            output: cap_owned(output, MAX_ENTRY_BYTES),
             failed,
         },
-        AgentEvent::Subagents {
+        AgentEvent::Subagents { tool_id, workers } => AgentEvent::Subagents {
             tool_id,
-            mut workers,
-        } => {
-            for worker in &mut workers {
-                worker.result = worker
-                    .result
-                    .take()
-                    .map(|text| cap_text(&text, MAX_ENTRY_BYTES));
-            }
-            AgentEvent::Subagents { tool_id, workers }
-        }
-        AgentEvent::Error(text) => AgentEvent::Error(cap_text(&text, MAX_ENTRY_BYTES)),
-        AgentEvent::Title(text) => AgentEvent::Title(cap_text(&text, 200)),
+            workers: workers
+                .into_iter()
+                .map(|mut worker| {
+                    worker.result = worker.result.map(|text| cap_owned(text, MAX_ENTRY_BYTES));
+                    worker
+                })
+                .collect(),
+        },
+        AgentEvent::Error(text) => AgentEvent::Error(cap_owned(text, MAX_ENTRY_BYTES)),
+        AgentEvent::Title(text) => AgentEvent::Title(cap_owned(text, 200)),
         AgentEvent::Done => AgentEvent::Done,
         AgentEvent::Closed => AgentEvent::Closed,
     }
@@ -565,7 +577,7 @@ mod tests {
     #[test]
     fn capped_text_respects_utf8_boundaries() {
         let text = "α".repeat(100);
-        let capped = cap_text(&text, 10);
+        let capped = cap_owned(text, 10);
         assert!(capped.starts_with("ααααα"));
         assert!(capped.ends_with("(truncated)"));
     }

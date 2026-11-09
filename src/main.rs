@@ -1380,6 +1380,45 @@ fn chat_thinking_row(
         .child(header);
 
     if expanded {
+        let body_id = SharedString::from(format!("thinking-body-{pane_id}-{index}"));
+        let mut body = div().w_full().min_w_0().flex().flex_col().gap(px(6.0));
+        if let Some(view) = message.stream.as_ref() {
+            if !view.settled.trim().is_empty() {
+                body = body.child(chat_markdown(
+                    body_id,
+                    view.settled.clone(),
+                    px(12.5),
+                    rems(0.4),
+                    tokens.text_muted,
+                    tokens,
+                    window,
+                    cx,
+                ));
+            }
+            if !view.tail.is_empty() {
+                body = body.child(chat_markdown(
+                    SharedString::from(format!("thinking-body-{pane_id}-{index}-live")),
+                    view.tail.clone(),
+                    px(12.5),
+                    rems(0.4),
+                    tokens.text_muted,
+                    tokens,
+                    window,
+                    cx,
+                ));
+            }
+        } else {
+            body = body.child(chat_markdown(
+                body_id,
+                message.text.clone(),
+                px(12.5),
+                rems(0.4),
+                tokens.text_muted,
+                tokens,
+                window,
+                cx,
+            ));
+        }
         row = row.child(
             div()
                 .w_full()
@@ -1390,16 +1429,7 @@ fn chat_thinking_row(
                 .border_color(tokens.border_subtle)
                 .py(px(6.0))
                 .debug_selector(move || format!("thinking-body-{index}"))
-                .child(chat_markdown(
-                    SharedString::from(format!("thinking-body-{pane_id}-{index}")),
-                    message.text.clone(),
-                    px(12.5),
-                    rems(0.4),
-                    tokens.text_muted,
-                    tokens,
-                    window,
-                    cx,
-                )),
+                .child(body),
         );
     }
     row
@@ -1695,23 +1725,28 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
         {
             if message.role == ChatRole::Thinking {
                 message.expanded = false;
+                // The block is complete: fold the live tail back into the full
+                // text and drop the streaming split.
+                message.streaming = false;
+                message.stream = None;
             }
         }
-    } else if role != ChatRole::Assistant {
+    } else if role != ChatRole::Assistant && messages.last().is_none_or(|last| last.role != role) {
         finish_chat_streaming(messages);
     }
     if matches!(role, ChatRole::Assistant | ChatRole::Thinking)
         && let Some(last) = messages.last_mut().filter(|message| message.role == role)
     {
         last.text.push_str(&text);
-        if role == ChatRole::Assistant {
-            last.streaming = true;
-            refresh_stream_view(last, text.contains('\n'));
-        }
+        // Reasoning streams like assistant text: settled blocks stay cached and
+        // only the live tail is re-parsed, instead of reparsing the whole block
+        // on every throttled tick.
+        last.streaming = true;
+        refresh_stream_view(last, text.contains('\n'));
         return;
     }
     let mut message = ChatMessage::new(role, text);
-    if role == ChatRole::Assistant {
+    if matches!(role, ChatRole::Assistant | ChatRole::Thinking) {
         message.streaming = true;
         refresh_stream_view(&mut message, true);
     }
@@ -8010,11 +8045,28 @@ impl AppState {
 
     fn pane_cwd_path(&self, pane: &TerminalPane) -> Option<std::path::PathBuf> {
         #[cfg(target_os = "linux")]
-        if let Some(link) = pane
-            .pid
-            .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/cwd")).ok())
-        {
-            return Some(link);
+        if let Some(pid) = pane.pid {
+            // The input bar asks for this every frame. `/proc/<pid>/cwd` and the
+            // git lookup below only change when the shell/user moves, so a short
+            // TTL removes the syscalls from the render path.
+            static PROC_CWD_CACHE: std::sync::LazyLock<
+                Mutex<HashMap<u32, (std::time::Instant, Option<PathBuf>)>>,
+            > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+            let now = std::time::Instant::now();
+            let cached = PROC_CWD_CACHE.lock().get(&pid).and_then(|(at, path)| {
+                (now.duration_since(*at) < std::time::Duration::from_secs(1)).then(|| path.clone())
+            });
+            if let Some(path) = cached {
+                if path.is_some() {
+                    return path;
+                }
+            } else {
+                let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok();
+                PROC_CWD_CACHE.lock().insert(pid, (now, link.clone()));
+                if link.is_some() {
+                    return link;
+                }
+            }
         }
         if let Some(cwd) = pane.cwd.clone().filter(|path| path.is_dir()) {
             return Some(cwd);
@@ -8037,6 +8089,23 @@ impl AppState {
     }
 
     fn detect_git_branch(dir: &std::path::Path) -> Option<String> {
+        static BRANCH_CACHE: std::sync::LazyLock<
+            Mutex<HashMap<PathBuf, (std::time::Instant, Option<String>)>>,
+        > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+        let now = std::time::Instant::now();
+        if let Some((at, branch)) = BRANCH_CACHE.lock().get(dir)
+            && now.duration_since(*at) < std::time::Duration::from_secs(1)
+        {
+            return branch.clone();
+        }
+        let branch = Self::detect_git_branch_uncached(dir);
+        BRANCH_CACHE
+            .lock()
+            .insert(dir.to_path_buf(), (now, branch.clone()));
+        branch
+    }
+
+    fn detect_git_branch_uncached(dir: &std::path::Path) -> Option<String> {
         let mut current = dir;
         loop {
             let git_path = current.join(".git");
@@ -8102,10 +8171,15 @@ impl AppState {
     }
 
     fn format_path_display(path: &std::path::Path) -> String {
-        let home = directories::UserDirs::new()
-            .map(|u| u.home_dir().to_path_buf())
-            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from));
-        if let Some(rel) = home.as_ref().and_then(|h| path.strip_prefix(h).ok()) {
+        // Resolving the home directory walks platform config; it is constant
+        // for the process.
+        static HOME_DIR: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+            directories::UserDirs::new()
+                .map(|u| u.home_dir().to_path_buf())
+                .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        });
+        let home = HOME_DIR.as_ref();
+        if let Some(rel) = home.and_then(|h| path.strip_prefix(h).ok()) {
             if rel.as_os_str().is_empty() {
                 return "~".to_string();
             } else {
@@ -14163,14 +14237,56 @@ fn main() -> Result<()> {
                     })
                     .detach();
 
+                    // Wake-driven agent pump. Bridges signal a capacity-1 channel
+                    // as soon as they queue an event, so an update reaches the UI
+                    // on the next frame instead of waiting for a fixed 16 ms tick.
+                    // A low-frequency ticker remains as a safety net for events
+                    // produced by backends that do not signal.
+                    let (wake_tx, wake_rx) = smol::channel::bounded::<()>(1);
+                    crate::agent_bridge::set_wake({
+                        let wake_tx = wake_tx.clone();
+                        std::sync::Arc::new(move || {
+                            let _ = wake_tx.try_send(());
+                        })
+                    });
+                    let agent_streaming =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    {
+                        let tick_tx = wake_tx.clone();
+                        let agent_streaming = agent_streaming.clone();
+                        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                            loop {
+                                let interval = if agent_streaming
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    50
+                                } else {
+                                    250
+                                };
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(interval))
+                                    .await;
+                                if tick_tx.try_send(()).is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .detach();
+                    }
                     let agent_state_weak = app_state.downgrade();
                     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-                        let mut streaming = false;
                         loop {
-                            let interval = if streaming { 16 } else { 50 };
-                            cx.background_executor().timer(std::time::Duration::from_millis(interval)).await;
-                            match agent_state_weak.update(cx, |state, cx| state.poll_agent_events(cx)) {
-                                Ok(active) => streaming = active,
+                            if wake_rx.recv().await.is_err() {
+                                break;
+                            }
+                            // Coalesce a burst into one drain: every queued event
+                            // is visible to the poll below.
+                            while wake_rx.try_recv().is_ok() {}
+                            match agent_state_weak
+                                .update(cx, |state, cx| state.poll_agent_events(cx))
+                            {
+                                Ok(active) => agent_streaming
+                                    .store(active, std::sync::atomic::Ordering::Relaxed),
                                 Err(_) => break,
                             }
                             crate::stream_timing::maybe_report();
@@ -18196,7 +18312,7 @@ First report
         let mut log = conversations::Log::at_path(path.clone(), u64::MAX);
         let start = Instant::now();
         for _ in 0..2_000 {
-            log.append(&entry);
+            log.append(entry.clone());
         }
         let new_history_enqueue = start.elapsed();
         log.flush();

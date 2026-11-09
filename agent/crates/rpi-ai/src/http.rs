@@ -188,7 +188,12 @@ pub fn client_builder_for(
     idle_timeout_ms: Option<i64>,
     env: Option<&HashMap<String, String>>,
 ) -> Result<reqwest::ClientBuilder, String> {
-    let mut builder = reqwest::Client::builder();
+    // A provider request that cannot establish a connection should fail fast
+    // rather than consuming the whole response deadline (10 minutes by default).
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(8);
     if let Some(proxy_url) = resolve_http_proxy_url_for_target(target_url, env)? {
         let proxy = reqwest::Proxy::all(proxy_url.as_str()).map_err(|e| e.to_string())?;
         builder = builder.proxy(proxy);

@@ -188,9 +188,11 @@ impl OmpBridge {
                     {
                         return;
                     }
+                    crate::agent_bridge::signal_wake();
                 }
             }
             let _ = sender.send(Incoming::Closed);
+            crate::agent_bridge::signal_wake();
         });
         // Request incremental updates rather than repeatedly transmitting the
         // entire growing message. Older OMP versions may reject this optional
@@ -291,6 +293,7 @@ impl OmpBridge {
             let title = read_session_title(&path);
             crate::stream_timing::record_since("omp.title_read", start);
             let _ = sender.send(Incoming::TitleRead(title));
+            crate::agent_bridge::signal_wake();
         });
     }
 

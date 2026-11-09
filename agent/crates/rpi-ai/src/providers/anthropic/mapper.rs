@@ -10,11 +10,12 @@
 //! `Vec<BlockScratch>` tracking each content block's Anthropic `index` and, for
 //! tool calls, the `partial_json` accumulation.
 //!
-//! Tool-call arg parsing invariant (plan §5.15): re-parse partial JSON on every
-//! `input_json_delta` and do the final authoritative parse on
-//! `content_block_stop`. The streaming arm uses [`parse_streaming_json`] so a
-//! truncated delta never produces unparseable args — `ToolCallEnd` always
-//! carries a real object.
+//! Tool-call arg parsing invariant (plan §5.15): batch `input_json_delta`
+//! snapshots on the same byte/interval cadence as text (the snapshot carries a
+//! full message clone and re-parses the accumulated JSON), and do the final
+//! authoritative parse on `content_block_stop`. The streaming arm uses
+//! [`parse_streaming_json`] so a truncated delta never produces unparseable args
+//! — `ToolCallEnd` always carries a real object.
 
 use crate::error::AiError;
 use crate::event_stream::AssistantMessageEventStreamProducer;
@@ -79,6 +80,12 @@ pub struct MapperState {
     pending_text_index: Option<usize>,
     pending_thinking: String,
     pending_thinking_index: Option<usize>,
+    /// Tool-call argument deltas batched but not yet emitted. A snapshot
+    /// re-parses the accumulated partial JSON and clones the whole message, so
+    /// emitting one per wire delta made large `write`/`edit` arguments
+    /// quadratic. The authoritative parse still happens at block stop.
+    pending_tool: String,
+    pending_tool_index: Option<usize>,
     /// When a batched delta was last emitted, for [`DELTA_FLUSH_INTERVAL`].
     last_flush: std::time::Instant,
 }
@@ -101,6 +108,8 @@ impl MapperState {
             pending_text_index: None,
             pending_thinking: String::new(),
             pending_thinking_index: None,
+            pending_tool: String::new(),
+            pending_tool_index: None,
             last_flush: std::time::Instant::now(),
         }
     }
@@ -117,6 +126,7 @@ impl MapperState {
     async fn flush_pending(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
         self.flush_text(prod).await;
         self.flush_thinking(prod).await;
+        self.flush_tool(prod).await;
     }
 
     async fn flush_text(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
@@ -148,6 +158,37 @@ impl MapperState {
         let delta = std::mem::take(&mut self.pending_thinking);
         self.last_flush = std::time::Instant::now();
         prod.push(AssistantMessageEvent::ThinkingDelta {
+            content_index,
+            delta,
+            partial: Arc::new(self.output.clone()),
+        })
+        .await;
+    }
+
+    async fn flush_tool(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+        if self.pending_tool.is_empty() {
+            return;
+        }
+        let Some(content_index) = self.pending_tool_index else {
+            self.pending_tool.clear();
+            return;
+        };
+        let delta = std::mem::take(&mut self.pending_tool);
+        // Re-parse the accumulated partial JSON once per emitted checkpoint, not
+        // once per wire delta. The final parse at block stop stays authoritative.
+        let arguments = match self
+            .blocks
+            .iter()
+            .find(|block| block.content_index == content_index)
+        {
+            Some(scratch) => parse_streaming_json(Some(&scratch.partial_json)),
+            None => serde_json::Value::Object(serde_json::Map::new()),
+        };
+        if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index) {
+            slot.arguments = arguments;
+        }
+        self.last_flush = std::time::Instant::now();
+        prod.push(AssistantMessageEvent::ToolCallDelta {
             content_index,
             delta,
             partial: Arc::new(self.output.clone()),
@@ -444,6 +485,9 @@ impl MapperState {
                 if let Some(Content::Text(slot)) = self.output.content.get_mut(content_index) {
                     slot.text.push_str(&text);
                 }
+                // Channel switch: a batched tool-call delta must reach the
+                // consumer before this text delta.
+                self.flush_tool(prod).await;
                 // Batch: `partial` is a full message clone per event.
                 self.pending_text_index = Some(content_index);
                 self.pending_text.push_str(&text);
@@ -460,9 +504,11 @@ impl MapperState {
                 if let Some(Content::Thinking(slot)) = self.output.content.get_mut(content_index) {
                     slot.thinking.push_str(&thinking);
                 }
-                // Keep channel order strict: text already streamed must reach the
-                // consumer before the first thinking delta of a new block.
+                // Keep channel order strict: text and tool-call deltas already
+                // streamed must reach the consumer before the first thinking
+                // delta of a new block.
                 self.flush_text(prod).await;
+                self.flush_tool(prod).await;
                 self.pending_thinking_index = Some(content_index);
                 self.pending_thinking.push_str(&thinking);
                 if self.should_flush(&self.pending_thinking) {
@@ -490,22 +536,19 @@ impl MapperState {
                 // A tool-call block is a new channel; flush what is batched so
                 // the consumer never sees tool events before the text that
                 // preceded them.
+                // Flush the previous channel's tail (including any earlier
+                // tool-call checkpoint) before appending this delta.
                 self.flush_pending(prod).await;
-                let scratch = &mut self.blocks[scratch_index];
-                scratch.partial_json.push_str(&partial);
-                // Re-parse the accumulated partial JSON on every delta so the
-                // partial assistant message renders args live. Mirrors the TS
-                // `block.arguments = parseStreamingJson(block.partialJson)`.
-                let arguments = parse_streaming_json(Some(&scratch.partial_json));
-                if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index) {
-                    slot.arguments = arguments;
+                self.blocks[scratch_index].partial_json.push_str(&partial);
+                self.pending_tool_index = Some(content_index);
+                self.pending_tool.push_str(&partial);
+                // Batch the live-args snapshot: re-parsing the accumulated JSON
+                // and cloning the message once per wire delta is quadratic for
+                // large `write`/`edit` arguments. The final parse at block stop
+                // remains authoritative.
+                if self.should_flush(&self.pending_tool) {
+                    self.flush_tool(prod).await;
                 }
-                prod.push(AssistantMessageEvent::ToolCallDelta {
-                    content_index,
-                    delta: partial,
-                    partial: Arc::new(self.output.clone()),
-                })
-                .await;
             }
             // Redacted-thinking blocks receive no deltas; unknown delta types
             // are ignored (forward-compat for future delta variants).

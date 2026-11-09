@@ -642,12 +642,17 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
         let comp_chunk = comp.clone();
         let tui_chunk = tui.clone();
         let on_chunk: Box<
-            dyn FnMut(&str, &dyn Fn() -> rpi_tools::shell_output::ShellCaptureProgress) + Send,
+            dyn FnMut(&str, &dyn Fn() -> Option<rpi_tools::shell_output::ShellCaptureProgress>)
+                + Send,
         > = Box::new(move |_chunk, get_progress| {
             // The capture layer reports the complete tail captured so far, not
-            // a delta; `append_output` replaces its snapshot accordingly.
-            comp_chunk.append_output(&get_progress().output);
-            tui_chunk.request_render(false);
+            // a delta; `append_output` replaces its snapshot accordingly. A
+            // `None` snapshot means the capture lock was busy; the next chunk or
+            // the final result covers it.
+            if let Some(progress) = get_progress() {
+                comp_chunk.append_output(&progress.output);
+                tui_chunk.request_render(false);
+            }
         });
         let options = rpi_tools::shell_output::ShellCaptureOptions {
             cwd: Some(cwd),

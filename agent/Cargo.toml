@@ -52,7 +52,7 @@ schemars = { version = "0.8", features = ["preserve_order"] }
 jsonschema = "0.18"
 
 # HTTP / SSE (used by anthropic provider, M3)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "http2", "gzip"] }
 bytes = "1"
 eventsource-stream = "0.2"
 

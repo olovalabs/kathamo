@@ -109,6 +109,11 @@ pub struct ShellExecOptions<'a> {
     pub cancel: Option<&'a CancellationToken>,
     pub on_stdout: Option<Box<dyn FnMut(&str) + Send + 'a>>,
     pub on_stderr: Option<Box<dyn FnMut(&str) + Send + 'a>>,
+    /// Default `true`. Callers that already consume the stream through
+    /// `on_stdout`/`on_stderr` (for example the bash capture layer, which keeps
+    /// its own bounded tail) can set this to `false` to avoid retaining a second
+    /// unbounded copy of the output.
+    pub capture_output: bool,
 }
 
 impl<'a> Default for ShellExecOptions<'a> {
@@ -122,6 +127,7 @@ impl<'a> Default for ShellExecOptions<'a> {
             cancel: None,
             on_stdout: None,
             on_stderr: None,
+            capture_output: true,
         }
     }
 }

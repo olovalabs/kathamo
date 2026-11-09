@@ -169,12 +169,36 @@ enum Command {
     Shutdown,
 }
 
+/// Host wakeup callback shared with the worker and forwarder.
+///
+/// The host uses this to be notified the moment an event is queued instead of
+/// discovering it on the next polling tick. Signals are coalesced by the host,
+/// so a burst of events only needs one wakeup.
+#[derive(Clone, Default)]
+pub struct Wake(Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>);
+
+impl Wake {
+    pub fn set(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(callback);
+        }
+    }
+
+    pub fn signal(&self) {
+        let callback = self.0.lock().ok().and_then(|slot| slot.clone());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+}
+
 /// One in-process agent conversation.
 pub struct EmbeddedSession {
     events: mpsc::Receiver<SessionEvent>,
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
     session_id: Arc<Mutex<Option<String>>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    wake: Wake,
     closed: bool,
 }
 
@@ -187,10 +211,18 @@ impl EmbeddedSession {
         let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let session_id = Arc::new(Mutex::new(None));
         let worker_session_id = Arc::clone(&session_id);
+        let wake = Wake::default();
+        let worker_wake = wake.clone();
         let worker = std::thread::Builder::new()
             .name("rpi-embedded".into())
             .spawn(move || {
-                run_worker(options, command_rx, event_tx, worker_session_id);
+                run_worker(
+                    options,
+                    command_rx,
+                    event_tx,
+                    worker_session_id,
+                    worker_wake,
+                );
             })
             .map_err(|error| format!("Could not start the embedded agent: {error}"))?;
         Ok(Self {
@@ -198,8 +230,15 @@ impl EmbeddedSession {
             commands: command_tx,
             session_id,
             worker: Some(worker),
+            wake,
             closed: false,
         })
+    }
+
+    /// Install the host's wakeup callback. It fires after each event (or
+    /// terminal status) reaches the session's event channel.
+    pub fn set_wake(&mut self, callback: Arc<dyn Fn() + Send + Sync>) {
+        self.wake.set(callback);
     }
 
     /// The durable session id, once the harness has opened or created one.
@@ -265,6 +304,7 @@ fn run_worker(
     commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     events: mpsc::Sender<SessionEvent>,
     session_id: Arc<Mutex<Option<String>>>,
+    wake: Wake,
 ) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -275,12 +315,13 @@ fn run_worker(
         Err(error) => {
             send_fatal(
                 &events,
+                &wake,
                 format!("Could not start the embedded agent runtime: {error}"),
             );
             return;
         }
     };
-    runtime.block_on(run_session(options, commands, events, session_id));
+    runtime.block_on(run_session(options, commands, events, session_id, wake));
 }
 
 async fn run_session(
@@ -288,6 +329,7 @@ async fn run_session(
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Command>,
     events: mpsc::Sender<SessionEvent>,
     session_id: Arc<Mutex<Option<String>>>,
+    wake: Wake,
 ) {
     let SessionOptions {
         cwd,
@@ -317,12 +359,13 @@ async fn run_session(
     {
         Ok(Ok(resolved)) => resolved,
         Ok(Err(error)) => {
-            send_fatal(&events, error.to_string());
+            send_fatal(&events, &wake, error.to_string());
             return;
         }
         Err(error) => {
             send_fatal(
                 &events,
+                &wake,
                 format!("Could not resolve the agent model: {error}"),
             );
             return;
@@ -355,7 +398,7 @@ async fn run_session(
     let (harness, event_rx, reload) = match built {
         Ok(built) => built,
         Err(error) => {
-            send_fatal(&events, describe_build_error(error));
+            send_fatal(&events, &wake, describe_build_error(error));
             return;
         }
     };
@@ -367,16 +410,23 @@ async fn run_session(
     // Forward the harness event bus into the host's polling loop. `reload` keeps
     // extension/resource leases and routers alive for the session lifetime.
     let forward_tx = events.clone();
+    let forward_wake = wake.clone();
     let forwarder = tokio::spawn(async move {
         let _reload = reload;
         let mut event_rx = event_rx;
         loop {
             match event_rx.recv().await {
-                Ok(event) => forward_event(event, &forward_tx),
+                Ok(event) => {
+                    forward_event(event, &forward_tx);
+                    // Wake the host as soon as the event is queued rather than
+                    // waiting for its next polling tick.
+                    forward_wake.signal();
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(dropped)) => {
                     let _ = forward_tx.send(SessionEvent::Status(format!(
                         "The agent dropped {dropped} intermediate updates."
                     )));
+                    forward_wake.signal();
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
@@ -396,12 +446,14 @@ async fn run_session(
                 let lane: Arc<dyn AgentLane> = harness.clone();
                 let event_sink = events.clone();
                 let run_flag = Arc::clone(&running);
+                let prompt_wake = wake.clone();
                 tokio::spawn(async move {
                     if let Err(error) = lane.prompt_text(&text, Vec::new()).await {
                         let _ = event_sink.send(SessionEvent::Error(error.to_string()));
                     }
                     run_flag.store(false, Ordering::SeqCst);
                     let _ = event_sink.send(SessionEvent::Done);
+                    prompt_wake.signal();
                 });
             }
             Command::Abort => {
@@ -410,6 +462,7 @@ async fn run_session(
                     let _ = events.send(SessionEvent::Error(error.to_string()));
                 }
                 let _ = events.send(SessionEvent::Done);
+                wake.signal();
             }
             Command::Shutdown => {
                 harness.request_stop_round();
@@ -439,10 +492,11 @@ fn describe_build_error(error: BuildError) -> String {
     }
 }
 
-fn send_fatal(events: &mpsc::Sender<SessionEvent>, message: String) {
+fn send_fatal(events: &mpsc::Sender<SessionEvent>, wake: &Wake, message: String) {
     let _ = events.send(SessionEvent::Error(message));
     let _ = events.send(SessionEvent::Done);
     let _ = events.send(SessionEvent::Closed);
+    wake.signal();
 }
 
 fn forward_event(event: RpiEvent, events: &mpsc::Sender<SessionEvent>) {

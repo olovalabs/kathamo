@@ -1,13 +1,14 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{ChatMessage, ChatRole, is_agent_tool};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Worker {
     pub id: String,
     pub title: String,
@@ -55,9 +56,22 @@ impl Worker {
         }
     }
 
+    fn finished(&self) -> bool {
+        matches!(self.status_label(), "Completed" | "Failed" | "Cancelled")
+    }
+
     fn update(&mut self, next: &Self) {
-        self.title.clone_from(&next.title);
-        self.status.clone_from(&next.status);
+        if next.title != next.id || self.title.is_empty() {
+            self.title.clone_from(&next.title);
+        }
+        let new_transcript = self
+            .transcript
+            .as_ref()
+            .zip(next.transcript.as_ref())
+            .is_some_and(|(previous, next)| previous != next);
+        if new_transcript || !self.finished() || next.finished() {
+            self.status.clone_from(&next.status);
+        }
         if next.transcript.is_some() {
             self.transcript.clone_from(&next.transcript);
         }
@@ -260,100 +274,192 @@ fn parent_has_call(path: &Path, tool_id: &str) -> bool {
     })
 }
 
-pub struct TranscriptMessage {
-    pub timestamp: Option<u64>,
-    pub message: ChatMessage,
-}
-
-fn message_text(message: &Value) -> Option<String> {
-    if let Some(text) = message["content"].as_str() {
-        return Some(text.to_owned());
+fn message_text(message: &Value, role: ChatRole) -> String {
+    if role != ChatRole::Thinking {
+        if let Some(text) = message["content"].as_str() {
+            return text.to_owned();
+        }
     }
-    Some(
-        message["content"]
-            .as_array()?
-            .iter()
-            .filter(|block| block["type"] == "text")
-            .filter_map(|block| block["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    )
+    let block_type = if role == ChatRole::Thinking {
+        "thinking"
+    } else {
+        "text"
+    };
+    message["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == block_type)
+        .filter_map(|block| block[block_type].as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[derive(Default)]
 pub struct LiveWorker {
     pub tool_id: Option<String>,
     pub transcript: Option<PathBuf>,
-    replies: Vec<TranscriptMessage>,
+    pub active: bool,
+    pub reported: Option<Worker>,
+    messages: Vec<Arc<ChatMessage>>,
+    active_timestamp: Option<u64>,
+    active_start: usize,
 }
 
 impl LiveWorker {
-    pub fn apply(&mut self, event: &Value) -> bool {
-        let message = &event["message"];
-        let Some(timestamp) = message["timestamp"].as_u64() else {
-            return false;
-        };
-        let (text, settled) = match event["type"].as_str() {
-            Some("message_update") if event["assistantMessageEvent"]["type"] == "text_delta" => (
-                event["assistantMessageEvent"]["delta"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_owned(),
-                false,
-            ),
-            Some("message_end") if message["role"] == "assistant" => {
-                (message_text(message).unwrap_or_default(), true)
-            }
-            _ => return false,
-        };
-        if text.is_empty() {
-            return false;
-        }
-        let reply = if let Some(reply) = self
-            .replies
-            .last_mut()
-            .filter(|reply| reply.timestamp == Some(timestamp))
-        {
-            reply
-        } else {
-            if self.replies.len() == 8 {
-                self.replies.remove(0);
-            }
-            self.replies.push(TranscriptMessage {
-                timestamp: Some(timestamp),
-                message: ChatMessage::new(ChatRole::Assistant, String::new()),
-            });
-            self.replies.last_mut().expect("reply was just pushed")
-        };
-        if settled {
-            reply.message.text = text;
-            reply.message.streaming = false;
-            reply.message.stream = None;
-        } else {
-            let scan = !reply.message.streaming || text.contains('\n');
-            reply.message.text.push_str(&text);
-            reply.message.streaming = true;
-            crate::refresh_stream_view(&mut reply.message, scan);
-        }
-        true
+    pub fn report_error(&mut self, error: &str) {
+        crate::push_chat_event(
+            &mut self.messages,
+            crate::agent_bridge::AgentEvent::Error(error.into()),
+        );
     }
 
-    pub fn unsaved_replies<'a>(
+    pub fn finish(&mut self) {
+        crate::finish_chat_streaming(&mut self.messages);
+        crate::finish_chat_tools(&mut self.messages);
+    }
+
+    pub fn apply(&mut self, event: &Value) -> bool {
+        let message = &event["message"];
+        let timestamp = message["timestamp"].as_u64();
+        match event["type"].as_str() {
+            Some("message_start") if message["role"] == "assistant" => {
+                crate::finish_chat_streaming(&mut self.messages);
+                self.active_timestamp = timestamp;
+                self.active_start = self.messages.len();
+                false
+            }
+            Some("message_start" | "message_end") if message["role"] == "user" => {
+                let text = message_text(message, ChatRole::User);
+                if text.is_empty()
+                    || self.messages.last().is_some_and(|last| {
+                        last.role == ChatRole::User
+                            && last.text == text
+                            && last.source_timestamp == timestamp
+                    })
+                {
+                    return false;
+                }
+                let mut row = ChatMessage::new(ChatRole::User, text);
+                row.source_timestamp = timestamp;
+                self.messages.push(Arc::new(row));
+                self.active_start = self.messages.len();
+                self.active_timestamp = None;
+                true
+            }
+            Some("message_update") => {
+                let delta = &event["assistantMessageEvent"];
+                let (role, text) = match delta["type"].as_str() {
+                    Some("text_delta") => (ChatRole::Assistant, delta["delta"].as_str()),
+                    Some("thinking_delta") => (ChatRole::Thinking, delta["delta"].as_str()),
+                    _ => return false,
+                };
+                let Some(text) = text.filter(|text| !text.is_empty()) else {
+                    return false;
+                };
+                let timestamp = timestamp.or(self.active_timestamp);
+                if let Some(last) = self.messages.last_mut().filter(|last| {
+                    last.role == role && last.streaming && last.source_timestamp == timestamp
+                }) {
+                    let last = Arc::make_mut(last);
+                    last.text.push_str(text);
+                    crate::refresh_stream_view(last, text.contains('\n'));
+                } else {
+                    crate::finish_chat_streaming(&mut self.messages);
+                    let mut row = ChatMessage::new(role, text.to_owned());
+                    row.source_timestamp = timestamp;
+                    row.streaming = true;
+                    crate::refresh_stream_view(&mut row, true);
+                    self.messages.push(Arc::new(row));
+                }
+                true
+            }
+            Some("message_end") if message["role"] == "assistant" => {
+                let mut changed = false;
+                for role in [ChatRole::Thinking, ChatRole::Assistant] {
+                    let text = message_text(message, role);
+                    let current = &mut self.messages[self.active_start..];
+                    let mut rows = current.iter_mut().filter(|row| row.role == role);
+                    if let Some(row) = rows.next() {
+                        let has_multiple = rows.next().is_some();
+                        let row = Arc::make_mut(row);
+                        if !has_multiple && !text.is_empty() {
+                            row.text = text;
+                        }
+                        changed = true;
+                    } else if !text.is_empty() {
+                        let mut row = ChatMessage::new(role, text);
+                        row.source_timestamp = timestamp;
+                        self.messages.push(Arc::new(row));
+                        changed = true;
+                    }
+                }
+                for row in &mut self.messages[self.active_start..] {
+                    if matches!(row.role, ChatRole::Assistant | ChatRole::Thinking) {
+                        let row = Arc::make_mut(row);
+                        row.source_timestamp = timestamp.or(row.source_timestamp);
+                        row.streaming = false;
+                        row.stream = None;
+                        if row.role == ChatRole::Thinking {
+                            row.expanded = false;
+                        }
+                    }
+                }
+                self.active_start = self.messages.len();
+                self.active_timestamp = None;
+                changed
+            }
+            Some("tool_execution_start" | "tool_execution_update" | "tool_execution_end") => {
+                let Some(event) = crate::agent_bridge::decode_tool_event(event) else {
+                    return false;
+                };
+                crate::push_chat_event(&mut self.messages, event);
+                true
+            }
+            Some("agent_end") => {
+                crate::finish_chat_streaming(&mut self.messages);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn messages_with_history<'a>(
         &'a self,
-        saved: &'a [TranscriptMessage],
-    ) -> impl Iterator<Item = &'a ChatMessage> {
-        self.replies
-            .iter()
-            .filter(move |reply| {
-                !saved.iter().any(|entry| {
-                    entry.message.role == ChatRole::Assistant && entry.timestamp == reply.timestamp
-                })
+        saved: &'a [Arc<ChatMessage>],
+    ) -> std::iter::Chain<
+        std::slice::Iter<'a, Arc<ChatMessage>>,
+        std::slice::Iter<'a, Arc<ChatMessage>>,
+    > {
+        // Disk can catch up while the view is open. Keep the ordered live
+        // sequence for overlapping messages so tool rows stay in place.
+        let first_live = self.messages.iter().find(|row| {
+            row.tool.is_some()
+                || matches!(
+                    row.role,
+                    ChatRole::User | ChatRole::Thinking | ChatRole::Assistant
+                )
+        });
+        let overlap = first_live.and_then(|live| {
+            saved.iter().position(|entry| {
+                if let Some(id) = live.tool.as_ref().and_then(|tool| tool.id.as_deref()) {
+                    return entry.tool.as_ref().and_then(|tool| tool.id.as_deref()) == Some(id);
+                }
+                match (entry.source_timestamp, live.source_timestamp) {
+                    (Some(saved), Some(live)) => saved >= live,
+                    _ => {
+                        entry.role == live.role && !entry.text.is_empty() && entry.text == live.text
+                    }
+                }
             })
-            .map(|reply| &reply.message)
+        });
+        saved[..overlap.unwrap_or(saved.len())]
+            .iter()
+            .chain(&self.messages)
     }
 }
 
-pub fn read_transcript(path: &Path) -> Option<Vec<TranscriptMessage>> {
+pub fn read_transcript(path: &Path) -> Option<Vec<Arc<ChatMessage>>> {
     let directory = path.parent()?.canonicalize().ok()?;
     let path = path.canonicalize().ok()?;
     if path.parent()? != directory || !path.is_file() {
@@ -361,24 +467,57 @@ pub fn read_transcript(path: &Path) -> Option<Vec<TranscriptMessage>> {
     }
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file.take(16 * 1024 * 1024));
-    let messages = reader
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| {
-            let record: Value = serde_json::from_str(&line).ok()?;
-            let message = &record["message"];
-            let role = match message["role"].as_str()? {
-                "user" => ChatRole::User,
-                "assistant" => ChatRole::Assistant,
-                _ => return None,
-            };
-            let text = message_text(message)?;
-            (!text.trim().is_empty()).then(|| TranscriptMessage {
-                timestamp: message["timestamp"].as_u64(),
-                message: ChatMessage::new(role, text),
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let message = &record["message"];
+        if message["role"] == "toolResult" {
+            if let (Some(id), Some(name)) =
+                (message["toolCallId"].as_str(), message["toolName"].as_str())
+            {
+                crate::push_chat_event(
+                    &mut messages,
+                    crate::agent_bridge::AgentEvent::ToolEnd {
+                        id: Some(id.to_owned()),
+                        name: name.to_owned(),
+                        output: message_text(message, ChatRole::Tool),
+                        failed: message["isError"] == true,
+                    },
+                );
+            }
+            continue;
+        }
+        let roles: &[ChatRole] = match message["role"].as_str() {
+            Some("user") => &[ChatRole::User],
+            Some("assistant") => &[ChatRole::Thinking, ChatRole::Assistant],
+            _ => continue,
+        };
+        for &role in roles {
+            let text = message_text(message, role);
+            if !text.trim().is_empty() {
+                let mut row = ChatMessage::new(role, text);
+                row.source_timestamp = message["timestamp"].as_u64();
+                row.expanded = role != ChatRole::Thinking;
+                messages.push(Arc::new(row));
+            }
+        }
+        for block in message["content"].as_array().into_iter().flatten() {
+            if block["type"] == "toolCall"
+                && let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str())
+            {
+                crate::push_chat_event(
+                    &mut messages,
+                    crate::agent_bridge::AgentEvent::ToolStart {
+                        id: Some(id.to_owned()),
+                        name: name.to_owned(),
+                        input: block["arguments"].to_string(),
+                    },
+                );
+            }
+        }
+    }
     (!messages.is_empty()).then_some(messages)
 }
 
@@ -422,7 +561,9 @@ pub fn rows<M: std::ops::Deref<Target = ChatMessage>>(messages: &[M]) -> Vec<Row
             let key = (scope, worker.id.as_str());
             let slot = *indices.entry(key).or_insert(rows.len());
             if let Some(row) = rows.get_mut(slot) {
-                row.worker = worker;
+                if !row.worker.finished() || worker.finished() {
+                    row.worker = worker;
+                }
                 row.result = worker.result.as_deref().or(row.result);
             } else {
                 rows.push(Row {
@@ -502,7 +643,7 @@ mod tests {
                 "message":{"role":"assistant","timestamp":42},
                 "assistantMessageEvent":{"type":"text_delta","delta":delta}
             })));
-            let reply = worker.unsaved_replies(&[]).next().unwrap();
+            let reply = worker.messages_with_history(&[]).next().unwrap();
             assert_eq!(reply.text, expected);
             assert!(reply.streaming);
         }
@@ -510,14 +651,41 @@ mod tests {
             "type":"message_end",
             "message":{"role":"assistant","timestamp":42,"content":[{"type":"text","text":"First words."}]}
         })));
-        let reply = worker.unsaved_replies(&[]).next().unwrap();
+        let reply = worker.messages_with_history(&[]).next().unwrap();
         assert_eq!(reply.text, "First words.");
         assert!(!reply.streaming);
-        let saved = TranscriptMessage {
-            timestamp: Some(42),
-            message: reply.clone(),
-        };
-        assert_eq!(worker.unsaved_replies(&[saved]).count(), 0);
+        let saved = Arc::clone(reply);
+        assert_eq!(worker.messages_with_history(&[saved]).count(), 1);
+    }
+
+    #[test]
+    fn compact_worker_deltas_and_tools_keep_their_order() {
+        let mut worker = LiveWorker::default();
+        assert!(worker.apply(&json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "thinking_delta", "delta": "Checking"}
+        })));
+        assert!(worker.apply(&json!({
+            "type": "tool_execution_start",
+            "toolCallId": "read-one", "toolName": "read", "args": {"path": "Cargo.toml"}
+        })));
+        assert!(worker.apply(&json!({
+            "type": "tool_execution_update",
+            "toolCallId": "read-one", "toolName": "read",
+            "partialResult": {"content": [{"type": "text", "text": "partial file"}]}
+        })));
+        assert!(worker.apply(&json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": "Answer so far"}
+        })));
+        let messages = worker.messages_with_history(&[]).collect::<Vec<_>>();
+        assert_eq!(messages[0].role, ChatRole::Thinking);
+        assert_eq!(
+            messages[1].tool.as_ref().unwrap().output.as_ref(),
+            "partial file"
+        );
+        assert_eq!(messages[2].text, "Answer so far");
+        assert!(messages[2].streaming);
     }
 
     #[test]
@@ -534,8 +702,9 @@ mod tests {
         )).unwrap();
         let messages = read_transcript(&path).unwrap();
         fs::remove_dir_all(dir).unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].message.text, "Inspect files");
-        assert_eq!(messages[1].message.text, "### Report");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].text, "Inspect files");
+        assert_eq!(messages[1].role, ChatRole::Thinking);
+        assert_eq!(messages[2].text, "### Report");
     }
 }

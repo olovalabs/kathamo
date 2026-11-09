@@ -179,6 +179,7 @@ struct ChatMessage {
     stream: Option<StreamView>,
     /// Metadata-only turn identity for opt-in paint timings.
     turn: Option<u64>,
+    source_timestamp: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -226,6 +227,7 @@ impl ChatMessage {
             streaming: false,
             stream: None,
             turn: None,
+            source_timestamp: None,
         }
     }
 }
@@ -1433,6 +1435,7 @@ fn update_chat_tool(
             streaming: false,
             stream: None,
             turn: None,
+            source_timestamp: None,
         }));
     }
 }
@@ -1575,6 +1578,19 @@ fn push_chat_event(messages: &mut Vec<Arc<ChatMessage>>, event: agent_bridge::Ag
             // Finalize the streaming block before the tool card becomes the
             // newest message; finalization only looks at the tail.
             finish_chat_streaming(messages);
+            if let Some(id) = id.as_deref()
+                && let Some(tool) = messages.iter_mut().rev().find_map(|message| {
+                    let tool = message.tool.as_ref()?;
+                    if tool.id.as_deref() != Some(id) || tool.workers.is_empty() {
+                        return None;
+                    }
+                    Arc::make_mut(message).tool.as_mut()
+                })
+            {
+                tool.display = ToolDisplay::new(&name, &input);
+                tool.name = name;
+                return;
+            }
             let display = ToolDisplay::new(&name, &input);
             messages.push(Arc::new(ChatMessage {
                 role: ChatRole::Tool,
@@ -1595,6 +1611,7 @@ fn push_chat_event(messages: &mut Vec<Arc<ChatMessage>>, event: agent_bridge::Ag
                 streaming: false,
                 stream: None,
                 turn: None,
+                source_timestamp: None,
             }));
             return;
         }
@@ -1624,21 +1641,28 @@ fn push_chat_event(messages: &mut Vec<Arc<ChatMessage>>, event: agent_bridge::Ag
             return;
         }
         agent_bridge::AgentEvent::Subagents { tool_id, workers } => {
-            let index = messages
-                .iter()
-                .rev()
-                .take_while(|message| message.role != ChatRole::User)
-                .enumerate()
-                .find(|(_, message)| {
-                    message
-                        .tool
-                        .as_ref()
-                        .is_some_and(|tool| tool.id.as_deref() == Some(tool_id.as_str()))
-                })
-                .map(|(offset, _)| messages.len() - 1 - offset);
-            if let Some(index) = index {
-                let message = Arc::make_mut(&mut messages[index]);
-                if let Some(tool) = message.tool.as_mut() {
+            if let Some(message) = messages.iter_mut().rev().find(|message| {
+                message
+                    .tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.id.as_deref() == Some(tool_id.as_str()))
+            }) {
+                if let Some(tool) = Arc::make_mut(message).tool.as_mut() {
+                    subagent_chat::update_workers(&mut tool.workers, workers);
+                }
+            } else {
+                push_chat_event(
+                    messages,
+                    agent_bridge::AgentEvent::ToolStart {
+                        id: Some(tool_id),
+                        name: "task".into(),
+                        input: String::new(),
+                    },
+                );
+                if let Some(tool) = messages
+                    .last_mut()
+                    .and_then(|message| Arc::make_mut(message).tool.as_mut())
+                {
                     subagent_chat::update_workers(&mut tool.workers, workers);
                 }
             }
@@ -1786,7 +1810,12 @@ struct WorkerView {
     index: usize,
     id: String,
     scroll: gpui::ScrollHandle,
-    messages: Vec<subagent_chat::TranscriptMessage>,
+    messages: Vec<Arc<ChatMessage>>,
+    input: Entity<InputState>,
+    _input_subscription: gpui::Subscription,
+    expanded: HashSet<usize>,
+    full_output: HashSet<usize>,
+    error: Option<String>,
     _load: Option<gpui::Task<()>>,
 }
 
@@ -5005,7 +5034,9 @@ impl AppState {
                         pane.terminal.update(cx, |term, _| {
                             term.set_read_only(should_show);
                         });
-                        if should_show {
+                        if let Some(view) = &pane.chat.worker_view {
+                            view.input.update(cx, |state, cx| state.focus(window, cx));
+                        } else if should_show {
                             if let Some(input_state) = &pane.input_state {
                                 input_state.update(cx, |state, cx| {
                                     state.focus(window, cx);
@@ -5049,7 +5080,13 @@ impl AppState {
                 .and_then(|p| p.sessions.get_mut(s_idx))
                 .and_then(|s| s.panes.get_mut(pane_idx))
             {
-                if let Some(input_state) = &pane.input_state {
+                let input = pane
+                    .chat
+                    .worker_view
+                    .as_ref()
+                    .map(|view| &view.input)
+                    .or(pane.input_state.as_ref());
+                if let Some(input_state) = input {
                     input_state.update(cx, |state, cx| {
                         state.focus(window, cx);
                     });
@@ -5604,6 +5641,13 @@ impl AppState {
     }
     fn toggle_chat_tool_expanded(&mut self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
         if let Some(pane) = self.pane_mut(pane_id) {
+            if let Some(view) = &mut pane.chat.worker_view {
+                if !view.expanded.remove(&index) {
+                    view.expanded.insert(index);
+                }
+                cx.notify();
+                return;
+            }
             let messages = pane.chat.visible_messages_mut();
             if let Some(msg) = messages.get_mut(index) {
                 if msg.tool.is_some() || msg.role == ChatRole::Thinking {
@@ -5622,6 +5666,13 @@ impl AppState {
 
     fn toggle_chat_tool_show_full(&mut self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
         if let Some(pane) = self.pane_mut(pane_id) {
+            if let Some(view) = &mut pane.chat.worker_view {
+                if !view.full_output.remove(&index) {
+                    view.full_output.insert(index);
+                }
+                cx.notify();
+                return;
+            }
             let messages = pane.chat.visible_messages_mut();
             if let Some(message) = messages.get_mut(index)
                 && message.tool.is_some()
@@ -6395,6 +6446,15 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(input) = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.chat.worker_view.as_ref())
+            .map(|view| view.input.clone())
+        {
+            input.update(cx, |state, cx| state.set_value(action, window, cx));
+            self.send_worker_message(pane_id, window, cx);
+            return;
+        }
         let Some(input) = self
             .pane_ref(pane_id)
             .and_then(|pane| pane.input_state.clone())
@@ -6710,6 +6770,13 @@ impl AppState {
     }
 
     fn handle_pane_ctrl_c(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .pane_ref(pane_id)
+            .is_some_and(|pane| pane.chat.worker_view.is_some())
+        {
+            self.stop_worker(pane_id, cx);
+            return;
+        }
         let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
             return;
         };
@@ -10609,13 +10676,20 @@ impl AppState {
                     .text_color(tokens.text_muted)
                     .child(row.status),
             )
-            .on_click(host.listener(move |this, _, _, cx| {
-                this.open_worker_view(pane_id, index, &id, cx);
+            .on_click(host.listener(move |this, _, window, cx| {
+                this.open_worker_view(pane_id, index, &id, window, cx);
             }))
             .into_any_element()
     }
 
-    fn open_worker_view(&mut self, pane_id: usize, index: usize, id: &str, cx: &mut Context<Self>) {
+    fn open_worker_view(
+        &mut self,
+        pane_id: usize,
+        index: usize,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(pane) = self.pane_mut(pane_id) else {
             return;
         };
@@ -10633,6 +10707,21 @@ impl AppState {
             .and_then(|tool| tool.id.clone());
         let id = id.to_owned();
         let worker_id = id.clone();
+        let load_id = id.clone();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Message this subagent…")
+                .auto_grow(1, 6)
+        });
+        let input_subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { secondary: false }) {
+                    this.send_worker_message(pane_id, window, cx);
+                }
+            },
+        );
         let load = cx.spawn(async move |this, cx| {
             let path = match path {
                 Some(path) => Some(path),
@@ -10666,6 +10755,7 @@ impl AppState {
                             if let Some(view) = this
                                 .pane_mut(pane_id)
                                 .and_then(|pane| pane.chat.worker_view.as_mut())
+                                .filter(|view| view.id == load_id && view.index == index)
                             {
                                 view.messages = messages;
                                 cx.notify();
@@ -10677,7 +10767,7 @@ impl AppState {
                     }
                 }
                 cx.background_executor()
-                    .timer(std::time::Duration::from_secs(1))
+                    .timer(std::time::Duration::from_millis(250))
                     .await;
             }
         });
@@ -10686,8 +10776,54 @@ impl AppState {
             id,
             scroll: gpui::ScrollHandle::new(),
             messages: Vec::new(),
+            input: input.clone(),
+            _input_subscription: input_subscription,
+            expanded: HashSet::new(),
+            full_output: HashSet::new(),
+            error: None,
             _load: Some(load),
         });
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    fn send_worker_message(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let Some(view) = &mut pane.chat.worker_view else {
+            return;
+        };
+        let input = view.input.clone();
+        let prompt = input.read(cx).value().trim().to_owned();
+        if prompt.is_empty() {
+            return;
+        }
+        let Some(ModelBridge::Omp(bridge)) = &mut pane.chat.bridge else {
+            return;
+        };
+        match bridge.steer_worker(&view.id, &prompt) {
+            Ok(()) => {
+                view.error = None;
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+                view.scroll.scroll_to_bottom();
+            }
+            Err(error) => view.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    fn stop_worker(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let Some(view) = &mut pane.chat.worker_view else {
+            return;
+        };
+        let Some(ModelBridge::Omp(bridge)) = &mut pane.chat.bridge else {
+            return;
+        };
+        view.error = bridge.cancel_worker(&view.id).err();
         cx.notify();
     }
 
@@ -10736,10 +10872,10 @@ impl AppState {
                     .text_color(tokens.text_secondary),
             )
             .child("Back to parent chat")
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(pane) = this.pane_mut(pane_id) {
                     pane.chat.worker_view = None;
-                    cx.notify();
+                    this.focus_pane_input(pane_id, window, cx);
                 }
             }));
 
@@ -10756,15 +10892,31 @@ impl AppState {
             .flex_col()
             .gap(px(14.0));
         let conversation = format!("worker-{}-{}", view.index, view.id);
-        let messages = view.messages.iter().map(|entry| &entry.message).chain(
-            live.into_iter()
-                .flat_map(|worker| worker.unsaved_replies(&view.messages)),
+        let can_message = live.is_some_and(|worker| worker.active);
+        let messages = live.map_or_else(
+            || view.messages.iter().chain([].iter()),
+            |worker| worker.messages_with_history(&view.messages),
         );
         let host = UiHost::new(cx.weak_entity());
         let ui_state = Some(&pane.chat.ui_state);
         let mut has_reply = false;
         for (index, message) in messages.enumerate() {
-            has_reply |= message.role == ChatRole::Assistant;
+            has_reply |= matches!(
+                message.role,
+                ChatRole::Assistant | ChatRole::Thinking | ChatRole::Tool
+            );
+            let mut adjusted = None;
+            if view.expanded.contains(&index) || view.full_output.contains(&index) {
+                let mut row = (**message).clone();
+                if let Some(tool) = &mut row.tool {
+                    tool.expanded ^= view.expanded.contains(&index);
+                    tool.show_full ^= view.full_output.contains(&index);
+                } else {
+                    row.expanded ^= view.expanded.contains(&index);
+                }
+                adjusted = Some(row);
+            }
+            let message = adjusted.as_ref().unwrap_or(message);
             body = body.child(Self::render_chat_message(
                 pane_id,
                 &conversation,
@@ -10845,6 +10997,52 @@ impl AppState {
                     ),
             )
             .child(body)
+            .when_some(view.error.as_ref(), |this, error| {
+                this.child(
+                    div()
+                        .px(px(16.0))
+                        .text_size(px(12.0))
+                        .text_color(tokens.block_failure)
+                        .child(error.clone()),
+                )
+            })
+            .when(can_message, |this| {
+                this.child(
+                    div()
+                        .id(("subagent-composer", pane_id))
+                        .debug_selector(|| "subagent-composer".to_string())
+                        .px(px(16.0))
+                        .py(px(8.0))
+                        .border_t_1()
+                        .border_color(tokens.pane_border)
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(div().flex_1().min_w_0().child(Input::new(&view.input)))
+                        .child(
+                            div()
+                                .id(("subagent-send", pane_id))
+                                .px(px(8.0))
+                                .cursor(CursorStyle::PointingHand)
+                                .child("Send")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.send_worker_message(pane_id, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(("subagent-stop", pane_id))
+                                .px(px(8.0))
+                                .cursor(CursorStyle::PointingHand)
+                                .child("Stop")
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.stop_worker(pane_id, cx)
+                                    }),
+                                ),
+                        ),
+                )
+            })
             .into_any_element()
     }
 

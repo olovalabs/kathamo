@@ -10,6 +10,14 @@ use serde_json::{Value, json};
 use crate::agent_bridge::{AgentEvent, coalesce_events, decode_message_update, decode_tool_event};
 use crate::agent_writer::AgentWriter;
 
+const WORKER_PROMPT: &str = r#"## Parallel subagents
+When delegation is useful, start independent assignments together in one task batch
+using the tasks array when available. Use background tasks when supported. Start all
+independent workers before waiting for any result. Wait early only when a later
+assignment actually depends on an earlier result. Give each worker its own goal
+and keep concurrent edits in separate files or isolated workspaces.
+"#;
+
 enum Incoming {
     /// Assistant deltas need no other fields from the RPC record.
     Delta(AgentEvent),
@@ -51,6 +59,7 @@ pub struct OmpBridge {
     title_read_in_flight: bool,
     live_workers: HashMap<String, crate::subagent_chat::LiveWorker>,
     worker_changed: bool,
+    worker_requests: HashMap<String, String>,
 }
 
 impl OmpBridge {
@@ -64,10 +73,11 @@ impl OmpBridge {
         } else {
             format!("google-antigravity/{model}")
         };
+        let system_prompt = format!("{}\n\n{WORKER_PROMPT}", crate::agent_ui::CATALOG_PROMPT);
         let mut command = Command::new("omp");
         command
             .args(["--mode", "rpc", "--model", &selector])
-            .args(["--append-system-prompt", crate::agent_ui::CATALOG_PROMPT])
+            .args(["--append-system-prompt", &system_prompt])
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -258,6 +268,7 @@ impl OmpBridge {
             title_read_in_flight: false,
             live_workers: HashMap::new(),
             worker_changed: false,
+            worker_requests: HashMap::new(),
         })
     }
 
@@ -328,7 +339,11 @@ impl OmpBridge {
 
     pub fn poll(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
-        while let Ok(incoming) = self.events.try_recv() {
+        // Leave a frame opportunity when several workers produce a burst.
+        for _ in 0..256 {
+            let Ok(incoming) = self.events.try_recv() else {
+                return coalesce_events(events);
+            };
             match incoming {
                 Incoming::Error(error) => events.push(AgentEvent::Error(error)),
                 Incoming::Delta(event) => events.push(event),
@@ -366,7 +381,35 @@ impl OmpBridge {
                 } => self.handle_record(&record, event, approval_error, &mut events),
             }
         }
+        crate::agent_bridge::signal_wake();
         coalesce_events(events)
+    }
+
+    pub fn steer_worker(&mut self, id: &str, prompt: &str) -> Result<(), String> {
+        if !self
+            .live_workers
+            .get(id)
+            .is_some_and(|worker| worker.active)
+        {
+            return Err("The subagent is no longer active.".into());
+        }
+        let request =
+            self.send(json!({"type": "steer_subagent", "subagentId": id, "message": prompt}))?;
+        self.worker_requests.insert(request, id.to_owned());
+        Ok(())
+    }
+
+    pub fn cancel_worker(&mut self, id: &str) -> Result<(), String> {
+        if !self
+            .live_workers
+            .get(id)
+            .is_some_and(|worker| worker.active)
+        {
+            return Err("The subagent is no longer active.".into());
+        }
+        let request = self.send(json!({"type": "cancel_subagent", "subagentId": id}))?;
+        self.worker_requests.insert(request, id.to_owned());
+        Ok(())
     }
 
     pub fn take_worker_changes(&mut self) -> bool {
@@ -399,6 +442,21 @@ impl OmpBridge {
         approval_error: bool,
         events: &mut Vec<AgentEvent>,
     ) {
+        if record["type"] == "response"
+            && let Some(worker) = record["id"]
+                .as_str()
+                .and_then(|id| self.worker_requests.remove(id))
+                .and_then(|id| self.live_workers.get_mut(&id))
+        {
+            if record["success"] == false || record["data"]["cancelled"] == false {
+                let error = record["error"]
+                    .as_str()
+                    .unwrap_or("The subagent is no longer active.");
+                worker.report_error(error);
+                self.worker_changed = true;
+            }
+            return;
+        }
         let matching_prompt = self
             .pending_prompt
             .as_deref()
@@ -484,27 +542,8 @@ impl OmpBridge {
                 self.publish_session_title();
                 events.push(AgentEvent::Done);
             }
-            "subagent_lifecycle" if record["payload"]["status"] == "started" => {
-                let payload = &record["payload"];
-                if let Some(id) = payload["id"].as_str() {
-                    let transcript = payload["sessionFile"].as_str().map(PathBuf::from);
-                    let tool_id = payload["parentToolCallId"].as_str().map(str::to_owned);
-                    let worker = self.live_workers.entry(id.to_owned()).or_default();
-                    if transcript != worker.transcript {
-                        *worker = Default::default();
-                    }
-                    worker.transcript = transcript;
-                    worker.tool_id = tool_id;
-                }
-            }
-            "subagent_event" => {
-                let payload = &record["payload"];
-                if let Some(worker) = payload["id"]
-                    .as_str()
-                    .and_then(|id| self.live_workers.get_mut(id))
-                {
-                    self.worker_changed |= worker.apply(&payload["event"]);
-                }
+            "subagent_lifecycle" | "subagent_progress" | "subagent_event" => {
+                self.worker_changed |= apply_worker_frame(&mut self.live_workers, record, events);
             }
             "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
                 if let Some(event) = event {
@@ -608,6 +647,72 @@ impl Drop for OmpBridge {
     }
 }
 
+fn apply_worker_frame(
+    workers: &mut HashMap<String, crate::subagent_chat::LiveWorker>,
+    record: &Value,
+    events: &mut Vec<AgentEvent>,
+) -> bool {
+    let payload = &record["payload"];
+    let progress = &payload["progress"];
+    let Some(id) = payload["id"].as_str().or_else(|| progress["id"].as_str()) else {
+        return false;
+    };
+    let worker = workers.entry(id.to_owned()).or_default();
+    if record["type"] == "subagent_event" {
+        return worker.apply(&payload["event"]);
+    }
+    if let Some(transcript) = payload["sessionFile"].as_str() {
+        let transcript = PathBuf::from(transcript);
+        if worker
+            .transcript
+            .as_ref()
+            .is_some_and(|old| old != &transcript)
+        {
+            *worker = Default::default();
+        }
+        worker.transcript = Some(transcript);
+    }
+    if let Some(tool_id) = payload["parentToolCallId"].as_str() {
+        worker.tool_id = Some(tool_id.to_owned());
+    }
+    let status = match payload["status"]
+        .as_str()
+        .or_else(|| progress["status"].as_str())
+    {
+        Some("started") => "running",
+        Some(status) => status,
+        None => return false,
+    };
+    if record["type"] == "subagent_lifecycle" {
+        worker.active = status == "running";
+        if !worker.active {
+            worker.finish();
+        }
+    }
+    if record["type"] == "subagent_lifecycle" && status == "running" && worker.tool_id.is_none() {
+        worker.tool_id = Some(format!("subagent:{id}"));
+    }
+    let Some(tool_id) = &worker.tool_id else {
+        return false;
+    };
+    let snapshot = crate::subagent_chat::Worker {
+        id: id.to_owned(),
+        title: progress["label"].as_str().unwrap_or(id).to_owned(),
+        status: status.to_owned(),
+        transcript: worker.transcript.clone(),
+        result: None,
+    };
+    if worker.reported.as_ref() == Some(&snapshot) {
+        return false;
+    }
+    worker.reported = Some(snapshot.clone());
+    events.push(AgentEvent::Subagents {
+        tool_id: tool_id.clone(),
+        workers: vec![snapshot],
+    });
+    true
+}
+
 /// OMP records the generated conversation title in the first line of its
 /// session file as `{"type":"title","title":"..."}`. It is not part of the RPC
 /// event stream, so the file is the only way to learn it.
@@ -639,6 +744,80 @@ fn is_busy_rejection(detail: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_workers_publish_rows_and_stream_before_either_finishes() {
+        use crate::subagent_chat::{LiveWorker, rows};
+        let mut workers = HashMap::<String, LiveWorker>::new();
+        let mut events = Vec::new();
+        for id in ["Alpha", "Bravo"] {
+            assert!(apply_worker_frame(
+                &mut workers,
+                &json!({
+                    "type": "subagent_lifecycle",
+                    "payload": {"id": id, "parentToolCallId": "task-batch", "status": "started"}
+                }),
+                &mut events
+            ));
+            assert!(apply_worker_frame(
+                &mut workers,
+                &json!({
+                    "type": "subagent_event",
+                    "payload": {"id": id, "event": {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": id}
+                    }}
+                }),
+                &mut events
+            ));
+        }
+        let mut messages = Vec::new();
+        for event in events.drain(..) {
+            crate::push_chat_event(&mut messages, event);
+        }
+        crate::push_chat_event(
+            &mut messages,
+            AgentEvent::ToolStart {
+                id: Some("task-batch".into()),
+                name: "task".into(),
+                input: "{}".into(),
+            },
+        );
+        assert_eq!(
+            messages.len(),
+            1,
+            "the actual tool start reuses its worker row"
+        );
+        assert_eq!(
+            rows(&messages)
+                .iter()
+                .map(|row| row.worker.status_label())
+                .collect::<Vec<_>>(),
+            ["Running", "Running"]
+        );
+        for id in ["Alpha", "Bravo"] {
+            let message = workers[id].messages_with_history(&[]).next().unwrap();
+            assert_eq!(message.text, id);
+            assert!(message.streaming);
+        }
+
+        assert!(apply_worker_frame(
+            &mut workers,
+            &json!({
+                "type": "subagent_lifecycle",
+                "payload": {"id": "Alpha", "parentToolCallId": "task-batch", "status": "completed"}
+            }),
+            &mut events
+        ));
+        for event in events {
+            crate::push_chat_event(&mut messages, event);
+        }
+        let rows = rows(&messages);
+        assert_eq!(rows[0].worker.status_label(), "Completed");
+        assert_eq!(rows[1].worker.status_label(), "Running");
+        assert!(!workers["Alpha"].active);
+        assert!(workers["Bravo"].active);
+    }
 
     #[test]
     fn session_title_is_read_from_the_header_line() {

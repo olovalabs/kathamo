@@ -1422,6 +1422,9 @@ async fn dispatch(
 ///
 /// The whole body is `catch_unwind`-wrapped — a panic across FFI ⇒ abort (same
 /// policy as the tool partial callback, `tool.rs:206`).
+// The host ABI passes `out` as a raw pointer; the trampoline writes through it
+// under the same external-ABI contract as the surrounding plugin API.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn trampoline_runtime_action(
     action_id: u32,
     args_json: StbStringRef,

@@ -6,11 +6,22 @@ use std::thread;
 
 use serde_json::{Value, json};
 
-use crate::agent_bridge::{AgentEvent, decode_message_update, decode_tool_event};
+use crate::agent_bridge::{AgentEvent, coalesce_events, decode_message_update, decode_tool_event};
 
 enum Incoming {
-    Record(Value),
+    /// A decoded record. `event` is the projected assistant delta or tool
+    /// lifecycle event, computed on the reader thread so the UI thread only
+    /// has to apply it.
+    Record {
+        record: Value,
+        event: Option<AgentEvent>,
+        /// Precomputed on the reader thread: this failed tool result is an
+        /// approval request that this view could not answer.
+        approval_error: bool,
+    },
     Error(String),
+    /// A background read of OMP's session-file title finished.
+    TitleRead(Option<String>),
     Closed,
 }
 
@@ -19,6 +30,7 @@ pub struct OmpBridge {
     child: Child,
     stdin: Arc<Mutex<ChildStdin>>,
     events: mpsc::Receiver<Incoming>,
+    sender: mpsc::Sender<Incoming>,
     next_id: u64,
     pending_prompt: Option<String>,
     closed: bool,
@@ -32,6 +44,8 @@ pub struct OmpBridge {
     /// A title request is running as background work. A prompt that arrives
     /// meanwhile cancels it rather than failing as "already processing".
     title_in_flight: bool,
+    /// The session file is being read on a background thread.
+    title_read_in_flight: bool,
 }
 
 impl OmpBridge {
@@ -58,19 +72,24 @@ impl OmpBridge {
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
+        let spawn_start = std::time::Instant::now();
         let mut child = command.spawn().map_err(|error| {
             format!(
                 "Could not start omp in {}: {error}. Install omp and ensure it is on PATH.",
                 cwd.display()
             )
         })?;
+        crate::stream_timing::record_since("engine.omp.spawn", spawn_start);
         let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
         let stdout = child.stdout.take().expect("piped stdout");
         let (sender, events) = mpsc::channel();
+        let bridge_sender = sender.clone();
         let reply_stdin = Arc::clone(&stdin);
+        let reader_start = std::time::Instant::now();
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
+            let mut first_record = true;
             loop {
                 line.clear();
                 match reader.read_line(&mut line) {
@@ -83,6 +102,7 @@ impl OmpBridge {
                     }
                     Ok(_) => {}
                 }
+                let parse_start = std::time::Instant::now();
                 let record: Value = match serde_json::from_str(&line) {
                     Ok(record) => record,
                     Err(_) => {
@@ -90,6 +110,11 @@ impl OmpBridge {
                         continue;
                     }
                 };
+                crate::stream_timing::record_since("bridge.omp.decode", parse_start);
+                if first_record {
+                    first_record = false;
+                    crate::stream_timing::record_since("engine.omp.first_record", reader_start);
+                }
                 if record["type"] == "extension_ui_request" {
                     match record["method"].as_str().unwrap_or("") {
                         "select" | "confirm" | "input" | "editor" | "ask" => {
@@ -111,15 +136,55 @@ impl OmpBridge {
                                 let event = if record["notifyType"] == "error" {
                                     Incoming::Error(message.to_owned())
                                 } else {
-                                    Incoming::Record(record.clone())
+                                    Incoming::Record {
+                                        record: record.clone(),
+                                        event: None,
+                                        approval_error: false,
+                                    }
                                 };
                                 let _ = sender.send(event);
                             }
                         }
                         _ => {}
                     }
-                } else if sender.send(Incoming::Record(record)).is_err() {
-                    return;
+                } else {
+                    // Project the two hot record kinds here rather than on the
+                    // UI thread. Tool payloads can be large, and this commonly
+                    // runs many times per frame during a burst.
+                    let project_start = std::time::Instant::now();
+                    let event = match record["type"].as_str().unwrap_or("") {
+                        "message_update" => decode_message_update(&record),
+                        "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
+                            decode_tool_event(&record)
+                        }
+                        _ => None,
+                    };
+                    // Approval failures are detected by scanning the tool
+                    // result, which can be large. Do it here, not on the UI
+                    // thread.
+                    let approval_error = record["type"] == "tool_execution_end"
+                        && record["isError"] == true
+                        && record["result"]["content"]
+                            .as_array()
+                            .is_some_and(|blocks| {
+                                blocks.iter().any(|block| {
+                                    block["text"].as_str().is_some_and(|text| {
+                                        text.contains("requires approval")
+                                            || text.contains("no interactive UI")
+                                    })
+                                })
+                            });
+                    crate::stream_timing::record_since("bridge.omp.project", project_start);
+                    if sender
+                        .send(Incoming::Record {
+                            record,
+                            event,
+                            approval_error,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
             let _ = sender.send(Incoming::Closed);
@@ -152,6 +217,7 @@ impl OmpBridge {
             child,
             stdin,
             events,
+            sender: bridge_sender,
             next_id: 0,
             pending_prompt: None,
             closed: false,
@@ -159,6 +225,7 @@ impl OmpBridge {
             title: None,
             title_requested: false,
             title_in_flight: false,
+            title_read_in_flight: false,
         })
     }
 
@@ -198,25 +265,23 @@ impl OmpBridge {
     }
 
     /// Read the session file header and publish the title if it is new. Used
-    /// when OMP has already named the session itself.
-    fn publish_session_title(&mut self, events: &mut Vec<AgentEvent>) {
-        if self.title.is_some() {
+    /// when OMP has already named the session itself. The read runs on a
+    /// background thread; its result arrives as `Incoming::TitleRead`.
+    fn publish_session_title(&mut self) {
+        if self.title.is_some() || self.title_read_in_flight {
             return;
         }
-        if let Some(title) = self.read_session_title() {
-            self.title = Some(title.clone());
-            events.push(AgentEvent::Title(title));
-        }
-    }
-
-    /// OMP records the generated conversation title in the first line of its
-    /// session file as `{"type":"title","title":"..."}`. It is not part of the
-    /// RPC event stream, so the file is the only way to learn it.
-    fn read_session_title(&self) -> Option<String> {
-        let file = std::fs::File::open(self.session_file.as_ref()?).ok()?;
-        let mut first = String::new();
-        BufReader::new(file).read_line(&mut first).ok()?;
-        parse_title_line(&first)
+        let Some(path) = self.session_file.clone() else {
+            return;
+        };
+        self.title_read_in_flight = true;
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let start = std::time::Instant::now();
+            let title = read_session_title(&path);
+            crate::stream_timing::record_since("omp.title_read", start);
+            let _ = sender.send(Incoming::TitleRead(title));
+        });
     }
 
     pub fn poll(&mut self) -> Vec<AgentEvent> {
@@ -224,6 +289,15 @@ impl OmpBridge {
         while let Ok(incoming) = self.events.try_recv() {
             match incoming {
                 Incoming::Error(error) => events.push(AgentEvent::Error(error)),
+                Incoming::TitleRead(title) => {
+                    self.title_read_in_flight = false;
+                    if let Some(title) = title
+                        && self.title.as_deref() != Some(title.as_str())
+                    {
+                        self.title = Some(title.clone());
+                        events.push(AgentEvent::Title(title));
+                    }
+                }
                 Incoming::Closed => {
                     if !self.closed {
                         self.closed = true;
@@ -241,13 +315,23 @@ impl OmpBridge {
                         events.push(AgentEvent::Closed);
                     }
                 }
-                Incoming::Record(record) => self.handle_record(&record, &mut events),
+                Incoming::Record {
+                    record,
+                    event,
+                    approval_error,
+                } => self.handle_record(&record, event, approval_error, &mut events),
             }
         }
-        events
+        coalesce_events(events)
     }
 
-    fn handle_record(&mut self, record: &Value, events: &mut Vec<AgentEvent>) {
+    fn handle_record(
+        &mut self,
+        record: &Value,
+        event: Option<AgentEvent>,
+        approval_error: bool,
+        events: &mut Vec<AgentEvent>,
+    ) {
         let matching_prompt = self
             .pending_prompt
             .as_deref()
@@ -330,32 +414,19 @@ impl OmpBridge {
                     let _ = self.send(json!({"type": "prompt", "message": "/rename"}));
                 }
                 // The file header is the fallback when OMP already named it.
-                self.publish_session_title(events);
+                self.publish_session_title();
                 events.push(AgentEvent::Done);
             }
             "message_update" => {
-                if let Some(event) = decode_message_update(record) {
+                if let Some(event) = event {
                     events.push(event);
                 }
             }
             "tool_execution_start" | "tool_execution_update" | "tool_execution_end" => {
-                if let Some(event) = decode_tool_event(record) {
+                if let Some(event) = event {
                     events.push(event);
                 }
-                let failed = record["isError"] == true;
-                if record["type"] == "tool_execution_end"
-                    && failed
-                    && record["result"]["content"]
-                        .as_array()
-                        .is_some_and(|blocks| {
-                            blocks.iter().any(|block| {
-                                block["text"].as_str().is_some_and(|text| {
-                                    text.contains("requires approval")
-                                        || text.contains("no interactive UI")
-                                })
-                            })
-                        })
-                {
+                if approval_error {
                     events.push(AgentEvent::Error("OMP could not obtain tool approval in this view. Use an interactive OMP session or adjust your OMP approval settings.".into()));
                 }
             }
@@ -431,6 +502,16 @@ impl Drop for OmpBridge {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// OMP records the generated conversation title in the first line of its
+/// session file as `{"type":"title","title":"..."}`. It is not part of the RPC
+/// event stream, so the file is the only way to learn it.
+fn read_session_title(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    BufReader::new(file).read_line(&mut first).ok()?;
+    parse_title_line(&first)
 }
 
 /// Parse the `{"type":"title","title":"..."}` header OMP writes as the first

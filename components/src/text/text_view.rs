@@ -1,8 +1,9 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -28,6 +29,76 @@ use crate::{
 };
 
 const CONTEXT: &'static str = "TextView";
+
+// Opt-in parse timings for the streaming chat pipeline. The app enables these
+// with `KATHAMO_STREAM_TIMINGS=1`; with the variable unset every hook is one
+// atomic load and no samples are retained. Only durations are recorded.
+static TIMING_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("KATHAMO_STREAM_TIMINGS").is_some_and(|value| value != "0")
+});
+static PARSE_SAMPLES: LazyLock<Mutex<Vec<(&'static str, u64)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static PARSE_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+static PARSE_NEXT_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn record_parse(label: &'static str, start: Instant) {
+    if !*TIMING_ENABLED {
+        return;
+    }
+    let micros = start.elapsed().as_micros().min(u128::from(u32::MAX)) as u64;
+    {
+        let mut samples = PARSE_SAMPLES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        samples.push((label, micros));
+    }
+    maybe_report_parses();
+}
+
+fn maybe_report_parses() {
+    let elapsed = PARSE_ORIGIN.elapsed().as_millis() as u64;
+    let next = PARSE_NEXT_REPORT_MS.load(Ordering::Relaxed);
+    if next == 0 {
+        PARSE_NEXT_REPORT_MS.store(elapsed + 5_000, Ordering::Relaxed);
+        return;
+    }
+    if elapsed < next {
+        return;
+    }
+    PARSE_NEXT_REPORT_MS.store(elapsed + 5_000, Ordering::Relaxed);
+    let samples = {
+        let mut samples = PARSE_SAMPLES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        std::mem::take(&mut *samples)
+    };
+    if samples.is_empty() {
+        return;
+    }
+    eprintln!("kathamo markdown parse timings (us, per report window):");
+    for label in ["markdown.initial_parse", "markdown.update_parse"] {
+        let mut values: Vec<u64> = samples
+            .iter()
+            .filter(|(sample, _)| *sample == label)
+            .map(|(_, value)| *value)
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        values.sort_unstable();
+        let percentile = |fraction: f64| {
+            let index = ((values.len() as f64 * fraction) as usize).min(values.len() - 1);
+            values[index]
+        };
+        eprintln!(
+            "  {label:<24} n={:<6} p50={:<8} p95={:<8} max={}",
+            values.len(),
+            percentile(0.50),
+            percentile(0.95),
+            values.last().copied().unwrap_or(0),
+        );
+    }
+}
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys(vec![
@@ -194,6 +265,7 @@ impl Future for UpdateFuture {
             match self.timer.poll_next(cx) {
                 Poll::Ready(Some(_)) => {
                     self.update_scheduled = false;
+                    let parse_start = Instant::now();
                     let res = parse_content(
                         self.type_,
                         &self.current_text,
@@ -201,6 +273,7 @@ impl Future for UpdateFuture {
                         &self.highlight_theme,
                         &self.code_block_actions.clone(),
                     );
+                    record_parse("markdown.update_parse", parse_start);
                     _ = self.tx_result.try_send(res);
                     continue;
                 }
@@ -563,6 +636,7 @@ impl Element for TextView {
             let (tx, rx) = smol::channel::unbounded::<Update>();
             let (tx_result, rx_result) =
                 smol::channel::unbounded::<Result<ParsedContent, SharedString>>();
+            let parse_start = Instant::now();
             let parsed_result = parse_content(
                 type_,
                 &text,
@@ -570,6 +644,7 @@ impl Element for TextView {
                 &highlight_theme,
                 &code_block_actions,
             );
+            record_parse("markdown.initial_parse", parse_start);
 
             self.state.update(cx, {
                 let tx = tx.clone();

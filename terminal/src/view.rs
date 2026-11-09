@@ -1720,6 +1720,10 @@ impl TerminalView {
         self.title.as_deref()
     }
 
+    pub fn set_title(&mut self, title: Option<String>) {
+        self.title = title;
+    }
+
     /// Highest-priority status explicitly reported by a process in this pane.
     pub fn agent_status_report(&self) -> Option<AgentStatusReport> {
         self.state.agent_status_report()

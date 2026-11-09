@@ -51,6 +51,7 @@ mod sound;
 mod status;
 #[cfg(unix)]
 mod status_bus;
+mod stream_timing;
 mod theme;
 mod workspace_state;
 
@@ -146,16 +147,37 @@ struct ChatMessage {
     /// settled markdown blocks eagerly and the live tail as plain text so each
     /// token does not re-parse and re-shape the whole message.
     streaming: bool,
+    /// Cached split of a streaming assistant message. It is refreshed when a
+    /// delta arrives, never while rendering, so a frame walks only the short
+    /// live tail instead of rescanning the whole message.
+    stream: Option<StreamView>,
+}
+
+#[derive(Clone)]
+struct StreamView {
+    settled: SharedString,
+    tail: SharedString,
 }
 
 #[derive(Clone)]
 struct ChatTool {
     id: Option<String>,
     name: String,
-    input: String,
-    output: String,
+    /// Shared so a frame can hand it to a card or a copy closure without
+    /// copying a potentially megabyte-sized tool result.
+    output: SharedString,
+    /// Bounded view of `output`, computed when the output arrives. Rendering
+    /// never scans or copies the full result unless the reader expands it.
+    preview: SharedString,
+    preview_truncated: bool,
     state: ToolState,
     expanded: bool,
+    /// Argument and output derivatives computed once when the tool starts.
+    /// Rendering must not re-parse JSON or re-serialize arguments per frame.
+    display: ToolDisplay,
+    /// Oversized output is shown as a bounded preview until the reader expands
+    /// it. Copy actions always use the complete received output.
+    show_full: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -173,6 +195,7 @@ impl ChatMessage {
             tool: None,
             expanded: true,
             streaming: false,
+            stream: None,
         }
     }
 }
@@ -490,10 +513,49 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+#[derive(Clone)]
 struct ToolView {
     title: String,
     subtitle: String,
     args: Vec<String>,
+}
+
+/// Parsed, render-ready tool fields. Built once per tool call so a stream of
+/// renders does not re-parse the same JSON arguments or output.
+#[derive(Clone)]
+struct ToolDisplay {
+    view: ToolView,
+    shell_command: Option<SharedString>,
+    content_body: Option<SharedString>,
+    content_preview: Option<SharedString>,
+    content_truncated: bool,
+}
+
+impl ToolDisplay {
+    fn new(name: &str, input: &str) -> Self {
+        let content_body = tool_content_body(name, input).map(SharedString::from);
+        let (content_preview, content_truncated) = match content_body.as_ref() {
+            Some(body) => {
+                let (end, truncated) = output_preview_len(body);
+                (
+                    Some(if truncated {
+                        SharedString::from(&body[..end])
+                    } else {
+                        body.clone()
+                    }),
+                    truncated,
+                )
+            }
+            None => (None, false),
+        };
+        Self {
+            view: tool_view(name, input),
+            shell_command: is_shell_tool(name).then(|| SharedString::from(shell_command(input))),
+            content_body,
+            content_preview,
+            content_truncated,
+        }
+    }
 }
 
 /// The opencode-style header for a tool: title, subtitle and quarantined args.
@@ -613,7 +675,7 @@ fn tool_group_label(parts: &[(usize, &ChatMessage)]) -> (String, String) {
 
 fn chat_copy_button(
     id: SharedString,
-    text: String,
+    text: SharedString,
     tip: SharedString,
     tokens: ThemeTokens,
 ) -> impl IntoElement {
@@ -635,7 +697,7 @@ fn chat_copy_button(
             gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
         })
         .on_click(move |_, _, cx| {
-            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.clone()));
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
         })
         .child(
             svg()
@@ -645,9 +707,83 @@ fn chat_copy_button(
         )
 }
 
+const TOOL_OUTPUT_PREVIEW_BYTES: usize = 16 * 1024;
+const TOOL_OUTPUT_PREVIEW_LINES: usize = 400;
+
+/// Byte length of the bounded view of oversized tool output, and whether
+/// content was omitted. Computed when output changes, never during a render.
+fn output_preview_len(text: &str) -> (usize, bool) {
+    if text.len() <= TOOL_OUTPUT_PREVIEW_BYTES
+        && text.bytes().filter(|byte| *byte == b'\n').count() <= TOOL_OUTPUT_PREVIEW_LINES
+    {
+        return (text.len(), false);
+    }
+    let mut end = text.len().min(TOOL_OUTPUT_PREVIEW_BYTES);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut lines = 0;
+    let mut line_end = 0;
+    for (index, byte) in text.as_bytes().iter().enumerate().take(end) {
+        if *byte == b'\n' {
+            lines += 1;
+            if lines >= TOOL_OUTPUT_PREVIEW_LINES {
+                line_end = index + 1;
+                break;
+            }
+        }
+    }
+    if line_end > 0 && line_end < end {
+        end = line_end;
+    }
+    (end, true)
+}
+
+/// Full and bounded shared views of one tool result, built when it arrives.
+fn tool_output_fields(output: String) -> (SharedString, SharedString, bool) {
+    let (end, truncated) = output_preview_len(&output);
+    let full = SharedString::from(output);
+    let preview = if truncated {
+        SharedString::from(&full[..end])
+    } else {
+        full.clone()
+    };
+    (full, preview, truncated)
+}
+
+fn chat_output_expander(
+    id: SharedString,
+    hidden_bytes: usize,
+    show_full: bool,
+    tokens: ThemeTokens,
+    on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let label = if show_full {
+        "Show less".to_string()
+    } else {
+        format!(
+            "Show all output ({} KiB hidden)",
+            hidden_bytes.div_ceil(1024).max(1)
+        )
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .px(px(12.0))
+        .py(px(5.0))
+        .cursor(CursorStyle::PointingHand)
+        .text_size(px(11.0))
+        .text_color(tokens.text_secondary)
+        .hover(move |style| style.text_color(tokens.text_primary))
+        .on_mouse_down(MouseButton::Left, on_toggle)
+        .child(label)
+}
+
 fn chat_console_section(
     copy_id: SharedString,
-    text: &str,
+    display: SharedString,
+    copy_text: SharedString,
     command: bool,
     tokens: ThemeTokens,
 ) -> Div {
@@ -673,18 +809,27 @@ fn chat_console_section(
         } else {
             tokens.text_secondary
         })
-        .child(div().flex_1().min_w_0().child(text.to_string()))
-        .child(chat_copy_button(copy_id, text.to_string(), tip, tokens))
+        .child(div().flex_1().min_w_0().child(display))
+        .child(chat_copy_button(copy_id, copy_text, tip, tokens))
+}
+
+#[derive(Clone)]
+struct ToolOutputView {
+    full: SharedString,
+    preview: SharedString,
+    truncated: bool,
+    show_full: bool,
 }
 
 fn chat_console_output(
     pane_id: usize,
     index: usize,
-    command: &str,
-    output: &str,
+    command: SharedString,
+    output: ToolOutputView,
     tokens: ThemeTokens,
+    on_show_more: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    div()
+    let mut card = div()
         .w_full()
         .min_w_0()
         .rounded(px(6.0))
@@ -693,33 +838,50 @@ fn chat_console_output(
         .bg(tokens.window_bg)
         .overflow_hidden()
         .flex()
-        .flex_col()
-        .when(!command.trim().is_empty(), |card| {
-            card.child(chat_console_section(
-                SharedString::from(format!("copy-tool-cmd-{pane_id}-{index}")),
-                command,
-                true,
+        .flex_col();
+    if !command.trim().is_empty() {
+        card = card.child(chat_console_section(
+            SharedString::from(format!("copy-tool-cmd-{pane_id}-{index}")),
+            command.clone(),
+            command,
+            true,
+            tokens,
+        ));
+    }
+    if !output.full.trim().is_empty() {
+        let display = if output.show_full {
+            output.full.clone()
+        } else {
+            output.preview.clone()
+        };
+        let hidden = output.full.len().saturating_sub(display.len());
+        let mut output_card = div()
+            .w_full()
+            .min_w_0()
+            .border_t_1()
+            .border_color(tokens.border_subtle)
+            .child(chat_console_section(
+                SharedString::from(format!("copy-tool-output-{pane_id}-{index}")),
+                display,
+                output.full.clone(),
+                false,
                 tokens,
-            ))
-        })
-        .when(!output.trim().is_empty(), |card| {
-            card.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .border_t_1()
-                    .border_color(tokens.border_subtle)
-                    .child(chat_console_section(
-                        SharedString::from(format!("copy-tool-output-{pane_id}-{index}")),
-                        output,
-                        false,
-                        tokens,
-                    )),
-            )
-        })
+            ));
+        if output.truncated {
+            output_card = output_card.child(chat_output_expander(
+                SharedString::from(format!("tool-output-more-{pane_id}-{index}")),
+                hidden,
+                output.show_full,
+                tokens,
+                on_show_more,
+            ));
+        }
+        card = card.child(output_card);
+    }
+    card
 }
 
-fn chat_tool_output_block(text: &str, is_error: bool, tokens: ThemeTokens) -> Div {
+fn chat_tool_output_block(text: SharedString, is_error: bool, tokens: ThemeTokens) -> Div {
     div()
         .w_full()
         .min_w_0()
@@ -746,11 +908,11 @@ fn chat_tool_output_block(text: &str, is_error: bool, tokens: ThemeTokens) -> Di
         } else {
             tokens.text_secondary
         })
-        .child(text.to_string())
+        .child(text)
 }
 
-fn shell_command(tool: &ChatTool) -> String {
-    serde_json::from_str::<serde_json::Value>(&tool.input)
+fn shell_command(input: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(input)
         .ok()
         .and_then(|value| {
             value
@@ -760,16 +922,16 @@ fn shell_command(tool: &ChatTool) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| {
-            if tool.input.trim_start().starts_with('{') {
+            if input.trim_start().starts_with('{') {
                 String::new()
             } else {
-                tool.input.trim().to_string()
+                input.trim().to_string()
             }
         })
 }
 
-fn tool_content_body(tool: &ChatTool) -> Option<String> {
-    let lower = tool.name.to_ascii_lowercase();
+fn tool_content_body(name: &str, input: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
     if !matches!(
         lower.as_str(),
         "write"
@@ -783,7 +945,7 @@ fn tool_content_body(tool: &ChatTool) -> Option<String> {
     ) {
         return None;
     }
-    let value = serde_json::from_str::<serde_json::Value>(&tool.input).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
     let object = value.as_object()?;
     object
         .get("content")
@@ -793,7 +955,18 @@ fn tool_content_body(tool: &ChatTool) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn chat_tool_content(pane_id: usize, index: usize, tool: &ChatTool, tokens: ThemeTokens) -> Div {
+fn chat_tool_content(
+    pane_id: usize,
+    index: usize,
+    tool: &ChatTool,
+    tokens: ThemeTokens,
+    on_show_more: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    if !tool.output.is_empty()
+        && let Some(id) = tool.id.as_deref()
+    {
+        crate::stream_timing::tool_output_painted(id);
+    }
     let mut body = div()
         .w_full()
         .min_w_0()
@@ -806,20 +979,58 @@ fn chat_tool_content(pane_id: usize, index: usize, tool: &ChatTool, tokens: Them
         .flex_col()
         .gap(px(8.0));
 
-    if is_shell_tool(&tool.name) {
-        let command = shell_command(tool);
+    if let Some(command) = tool.display.shell_command.as_ref() {
         body = body.child(chat_console_output(
             pane_id,
             index,
-            &command,
-            &tool.output,
+            command.clone(),
+            ToolOutputView {
+                full: tool.output.clone(),
+                preview: tool.preview.clone(),
+                truncated: tool.preview_truncated,
+                show_full: tool.show_full,
+            },
             tokens,
+            on_show_more,
         ));
     } else if !tool.output.trim().is_empty() {
         let is_error = tool.state == ToolState::Failed;
-        body = body.child(chat_tool_output_block(&tool.output, is_error, tokens));
-    } else if let Some(content) = tool_content_body(tool) {
-        body = body.child(chat_tool_output_block(&content, false, tokens));
+        let display = if tool.show_full {
+            tool.output.clone()
+        } else {
+            tool.preview.clone()
+        };
+        let hidden = tool.output.len().saturating_sub(display.len());
+        body = body.child(chat_tool_output_block(display, is_error, tokens));
+        if tool.preview_truncated {
+            body = body.child(chat_output_expander(
+                SharedString::from(format!("tool-body-more-{pane_id}-{index}")),
+                hidden,
+                tool.show_full,
+                tokens,
+                on_show_more,
+            ));
+        }
+    } else if let Some(content) = tool.display.content_body.as_ref() {
+        let display = if tool.show_full {
+            content.clone()
+        } else {
+            tool.display
+                .content_preview
+                .clone()
+                .unwrap_or_else(|| content.clone())
+        };
+        let hidden = content.len().saturating_sub(display.len());
+        body = body.child(chat_tool_output_block(display, false, tokens));
+        if tool.display.content_truncated {
+            body = body.child(chat_output_expander(
+                SharedString::from(format!("tool-content-more-{pane_id}-{index}")),
+                hidden,
+                tool.show_full,
+                tokens,
+                on_show_more,
+            ));
+        }
     } else if tool.state == ToolState::Running {
         body = body.child(
             div()
@@ -924,12 +1135,13 @@ fn chat_tool_header(
 fn chat_tool_error_card(
     pane_id: usize,
     index: usize,
-    view: &ToolView,
     tool: &ChatTool,
     expanded: bool,
     tokens: ThemeTokens,
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_show_more: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
+    let view = &tool.display.view;
     let header = div()
         .id(SharedString::from(format!(
             "tool-error-row-{pane_id}-{index}"
@@ -992,6 +1204,12 @@ fn chat_tool_error_card(
         .child(header);
 
     if expanded {
+        let display = if tool.show_full {
+            tool.output.clone()
+        } else {
+            tool.preview.clone()
+        };
+        let hidden = tool.output.len().saturating_sub(display.len());
         card = card.child(
             div()
                 .w_full()
@@ -1003,8 +1221,17 @@ fn chat_tool_error_card(
                 .text_size(px(12.0))
                 .line_height(relative(1.6))
                 .text_color(tokens.block_failure)
-                .child(tool.output.clone()),
+                .child(display),
         );
+        if tool.preview_truncated {
+            card = card.child(chat_output_expander(
+                SharedString::from(format!("tool-error-more-{pane_id}-{index}")),
+                hidden,
+                tool.show_full,
+                tokens,
+                on_show_more,
+            ));
+        }
     }
     card
 }
@@ -1015,19 +1242,31 @@ fn chat_tool_card(
     tool: &ChatTool,
     tokens: ThemeTokens,
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_show_more: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let expanded = tool.expanded;
     let running = tool.state == ToolState::Running;
     let failed = tool.state == ToolState::Failed;
-    let view = tool_view(&tool.name, &tool.input);
+    let view = &tool.display.view;
     let agent = is_agent_tool(&tool.name);
+    if let Some(id) = tool.id.as_deref() {
+        crate::stream_timing::tool_card_painted(id);
+    }
 
     if failed {
-        return chat_tool_error_card(pane_id, index, &view, tool, expanded, tokens, on_toggle);
+        return chat_tool_error_card(
+            pane_id,
+            index,
+            tool,
+            expanded,
+            tokens,
+            on_toggle,
+            on_show_more,
+        );
     }
 
     let header = chat_tool_header(
-        pane_id, index, &view, running, expanded, agent, tokens, on_toggle,
+        pane_id, index, view, running, expanded, agent, tokens, on_toggle,
     );
 
     let mut card = div().w_full().min_w_0().flex().flex_col();
@@ -1047,7 +1286,13 @@ fn chat_tool_card(
     }
 
     if expanded {
-        card = card.child(chat_tool_content(pane_id, index, tool, tokens));
+        card = card.child(chat_tool_content(
+            pane_id,
+            index,
+            tool,
+            tokens,
+            on_show_more,
+        ));
     }
     card
 }
@@ -1179,22 +1424,31 @@ fn update_chat_tool(
         })
         .last();
     if let Some(tool) = existing {
-        tool.output = output;
+        let (full, preview, truncated) = tool_output_fields(output);
+        tool.output = full;
+        tool.preview = preview;
+        tool.preview_truncated = truncated;
         tool.state = state;
     } else {
+        let (full, preview, truncated) = tool_output_fields(output);
+        let display = ToolDisplay::new(&name, "");
         messages.push(ChatMessage {
             role: ChatRole::Tool,
             text: String::new(),
             tool: Some(ChatTool {
                 id,
                 name,
-                input: String::new(),
-                output,
+                output: full,
+                preview,
+                preview_truncated: truncated,
                 state,
                 expanded: false,
+                display,
+                show_full: false,
             }),
             expanded: false,
             streaming: false,
+            stream: None,
         });
     }
 }
@@ -1286,10 +1540,47 @@ fn agent_startup_notice(error: &str) -> (String, String) {
 /// event starts a fresh streaming message, so completed text gets the full
 /// markdown render again.
 fn finish_chat_streaming(messages: &mut [ChatMessage]) {
-    for message in messages.iter_mut() {
-        if message.streaming {
-            message.streaming = false;
-        }
+    // Only the newest message can be streaming: every other role calls this
+    // before pushing, so scanning the whole transcript here is wasted work.
+    if let Some(message) = messages.last_mut()
+        && message.streaming
+    {
+        message.streaming = false;
+        message.stream = None;
+    }
+}
+
+/// Refresh the cached settled/tail split for a streaming assistant message.
+///
+/// A delta without a newline can only extend the live tail; block boundaries
+/// change solely at line breaks. Rescanning the document on non-newline tokens
+/// is therefore unnecessary.
+fn refresh_stream_view(message: &mut ChatMessage, scan: bool) {
+    let split_at = if scan {
+        let (_, tail) = split_streaming_markdown(&message.text);
+        message.text.len() - tail.len()
+    } else {
+        message
+            .stream
+            .as_ref()
+            .map(|view| view.settled.len())
+            .unwrap_or(0)
+    };
+    let settled = message.text.get(..split_at).unwrap_or("");
+    let tail = message.text.get(split_at..).unwrap_or("");
+    let previous = message.stream.as_ref().map(|view| view.settled.len());
+    if previous != Some(split_at) {
+        message.stream = Some(StreamView {
+            settled: SharedString::from(settled),
+            tail: SharedString::from(tail),
+        });
+    } else if let Some(view) = message.stream.as_mut() {
+        view.tail = SharedString::from(tail);
+    } else {
+        message.stream = Some(StreamView {
+            settled: SharedString::from(""),
+            tail: SharedString::from(tail),
+        });
     }
 }
 
@@ -1308,26 +1599,36 @@ fn finish_chat_tools(messages: &mut [ChatMessage]) {
 fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEvent) {
     let (role, text) = match event {
         agent_bridge::AgentEvent::ToolStart { id, name, input } => {
+            if let Some(id) = id.as_deref() {
+                crate::stream_timing::tool_applied(id);
+            }
+            // Finalize the streaming block before the tool card becomes the
+            // newest message; finalization only looks at the tail.
+            finish_chat_streaming(messages);
+            let display = ToolDisplay::new(&name, &input);
             messages.push(ChatMessage {
                 role: ChatRole::Tool,
                 text: String::new(),
                 tool: Some(ChatTool {
                     id,
                     name,
-                    input,
-                    output: String::new(),
+                    output: SharedString::from(""),
+                    preview: SharedString::from(""),
+                    preview_truncated: false,
                     state: ToolState::Running,
                     expanded: false,
+                    display,
+                    show_full: false,
                 }),
                 expanded: false,
                 streaming: false,
+                stream: None,
             });
-            finish_chat_streaming(messages);
             return;
         }
         agent_bridge::AgentEvent::ToolUpdate { id, name, output } => {
-            update_chat_tool(messages, id, name, output, ToolState::Running);
             finish_chat_streaming(messages);
+            update_chat_tool(messages, id, name, output, ToolState::Running);
             return;
         }
         agent_bridge::AgentEvent::ToolEnd {
@@ -1336,6 +1637,7 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
             output,
             failed,
         } => {
+            finish_chat_streaming(messages);
             update_chat_tool(
                 messages,
                 id,
@@ -1347,7 +1649,6 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
                     ToolState::Completed
                 },
             );
-            finish_chat_streaming(messages);
             return;
         }
         agent_bridge::AgentEvent::Text(text) => (ChatRole::Assistant, text),
@@ -1360,31 +1661,37 @@ fn push_chat_event(messages: &mut Vec<ChatMessage>, event: agent_bridge::AgentEv
         | agent_bridge::AgentEvent::Done
         | agent_bridge::AgentEvent::Closed => return,
     };
-    if role == ChatRole::Assistant {
+    let starting_assistant =
+        role == ChatRole::Assistant && messages.last().is_none_or(|last| last.role != role);
+    if starting_assistant {
+        // Collapse the turn's reasoning once, when assistant text begins. Doing
+        // this for every token made a long turn quadratic.
         for message in messages
             .iter_mut()
             .rev()
-            .take_while(|m| m.role != ChatRole::User)
+            .take_while(|message| message.role != ChatRole::User)
         {
             if message.role == ChatRole::Thinking {
                 message.expanded = false;
             }
         }
-    } else {
+    } else if role != ChatRole::Assistant {
         finish_chat_streaming(messages);
     }
-    if matches!(role, ChatRole::Assistant | ChatRole::Thinking) {
-        if let Some(last) = messages.last_mut().filter(|message| message.role == role) {
-            last.text.push_str(&text);
-            if role == ChatRole::Assistant {
-                last.streaming = true;
-            }
-            return;
+    if matches!(role, ChatRole::Assistant | ChatRole::Thinking)
+        && let Some(last) = messages.last_mut().filter(|message| message.role == role)
+    {
+        last.text.push_str(&text);
+        if role == ChatRole::Assistant {
+            last.streaming = true;
+            refresh_stream_view(last, text.contains('\n'));
         }
+        return;
     }
     let mut message = ChatMessage::new(role, text);
     if role == ChatRole::Assistant {
         message.streaming = true;
+        refresh_stream_view(&mut message, true);
     }
     messages.push(message);
 }
@@ -5151,6 +5458,19 @@ impl AppState {
         }
     }
 
+    fn toggle_chat_tool_show_full(&mut self, pane_id: usize, index: usize, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane_mut(pane_id) {
+            let messages = pane.chat.visible_messages_mut();
+            if let Some(tool) = messages
+                .get_mut(index)
+                .and_then(|message| message.tool.as_mut())
+            {
+                tool.show_full = !tool.show_full;
+                cx.notify();
+            }
+        }
+    }
+
     fn toggle_chat_tool_group_expanded(
         &mut self,
         pane_id: usize,
@@ -5450,6 +5770,7 @@ impl AppState {
             login.cancel();
         }
         let spec = crate::provider::get_provider(&provider);
+        let rpi_only = spec.is_none();
         let primary_var = spec.and_then(|s| s.primary_env_var()).unwrap_or("API Key");
         let input_to_focus = auth.input.clone();
         auth.input.update(cx, |state, cx| {
@@ -5457,9 +5778,17 @@ impl AppState {
             state.set_placeholder(format!("Paste {primary_var} here..."), window, cx);
             state.focus(window, cx);
         });
-        auth.selected = Some(provider);
+        auth.selected = Some(provider.clone());
         auth.output.clear();
         auth.error = None;
+        // rpi-only providers are authenticated in-process through the embedded
+        // agent's auth store. OMP providers keep the OMP credential path.
+        if rpi_only {
+            match agent_auth::Login::start(&provider, &auth.cwd) {
+                Ok(login) => auth.login = Some(login),
+                Err(error) => auth.error = Some(error),
+            }
+        }
         cx.notify();
         window.defer(cx, move |window, cx| {
             input_to_focus.update(cx, |state, cx| {
@@ -5578,10 +5907,8 @@ impl AppState {
                         });
                     }
 
-                    // Refresh models catalog
-                    if let Ok(models) = agent_auth::available_models(&auth.cwd) {
-                        auth.models = models;
-                    }
+                    // Refresh the catalog off the UI thread.
+                    auth.discover();
                 }
                 Err(error) => {
                     auth.error = Some(format!("Could not save API key: {error}"));
@@ -5639,10 +5966,8 @@ impl AppState {
                     pane.chat.model_explicit = true;
                 }
 
-                // Refresh models
-                if let Ok(models) = agent_auth::available_models(&auth.cwd) {
-                    auth.models = models;
-                }
+                // Refresh providers and models off the UI thread.
+                auth.discover();
             }
             Err(error) => {
                 auth.error = Some(format!("Could not disconnect {provider}: {error}"));
@@ -5738,7 +6063,11 @@ impl AppState {
                     }
                     if let Some(mut bridge) = pane.chat.bridge.take() {
                         let mut closed = false;
-                        for event in bridge.poll() {
+                        let drain_start = std::time::Instant::now();
+                        let drained = bridge.poll();
+                        crate::stream_timing::record_since("ui.drain", drain_start);
+                        for event in drained {
+                            let apply_start = std::time::Instant::now();
                             changed = true;
                             let startup_error = pane.chat.messages.is_empty()
                                 && !pane.chat.running
@@ -5779,6 +6108,7 @@ impl AppState {
                                 }
                                 other => push_chat_event(&mut pane.chat.messages, other),
                             }
+                            crate::stream_timing::record_since("ui.apply", apply_start);
                         }
                         if let Some(id) = bridge.session_id() {
                             pane.chat.rpi_session_id = Some(id);
@@ -5800,7 +6130,11 @@ impl AppState {
                         }
                         if let Some(mut bridge) = chat.bridge.take() {
                             let mut closed = false;
-                            for event in bridge.poll() {
+                            let drain_start = std::time::Instant::now();
+                            let drained = bridge.poll();
+                            crate::stream_timing::record_since("ui.drain", drain_start);
+                            for event in drained {
+                                let apply_start = std::time::Instant::now();
                                 changed = true;
                                 let startup_error = chat.messages.is_empty()
                                     && !chat.running
@@ -5843,6 +6177,7 @@ impl AppState {
                                     }
                                     other => push_chat_event(&mut chat.messages, other),
                                 }
+                                crate::stream_timing::record_since("ui.apply", apply_start);
                             }
                             if let ModelBridge::Rpi(bridge) = &bridge {
                                 if let Some(id) = bridge.session_id() {
@@ -5865,13 +6200,22 @@ impl AppState {
                         pane.chat.auth_refresh_pending = true;
                     }
                     if pane.chat.auth_refresh_pending && !pane.chat.running {
-                        pane.chat.auth_refresh_pending = false;
+                        let mut retry = false;
                         if let Some(bridge) = pane.chat.bridge.as_mut() {
-                            if let Err(error) = bridge.restart_after_auth() {
-                                pane.chat
+                            match bridge.restart_after_auth() {
+                                Ok(()) => {}
+                                // The embedded harness is still opening its
+                                // session; retry on the next tick instead of
+                                // surfacing a spurious error.
+                                Err(error) if error.contains("still starting") => retry = true,
+                                Err(error) => pane
+                                    .chat
                                     .messages
-                                    .push(ChatMessage::new(ChatRole::Error, error));
+                                    .push(ChatMessage::new(ChatRole::Error, error)),
                             }
+                        }
+                        if !retry {
+                            pane.chat.auth_refresh_pending = false;
                         }
                         changed = true;
                     }
@@ -5880,11 +6224,18 @@ impl AppState {
                             chat.auth_refresh_pending = true;
                         }
                         if chat.auth_refresh_pending && !chat.running {
-                            chat.auth_refresh_pending = false;
+                            let mut retry = false;
                             if let Some(ModelBridge::Rpi(bridge)) = chat.bridge.as_mut() {
-                                if let Err(error) = bridge.restart_after_auth() {
-                                    chat.messages.push(ChatMessage::new(ChatRole::Error, error));
+                                match bridge.restart_after_auth() {
+                                    Ok(()) => {}
+                                    Err(error) if error.contains("still starting") => retry = true,
+                                    Err(error) => {
+                                        chat.messages.push(ChatMessage::new(ChatRole::Error, error))
+                                    }
                                 }
+                            }
+                            if !retry {
+                                chat.auth_refresh_pending = false;
                             }
                             changed = true;
                         }
@@ -9890,13 +10241,23 @@ impl AppState {
                     .text_color(tokens.text_primary);
 
                 if message.streaming {
-                    // Re-parse only settled blocks while text is arriving; the live tail
-                    // stays plain so every token does not re-shape the whole message.
-                    let (settled, tail) = split_streaming_markdown(&message.text);
+                    // The split was computed when the delta arrived, so a frame
+                    // only clones the two cached slices. Only the live tail is
+                    // re-parsed per token; settled blocks stay cached.
+                    let settled = message
+                        .stream
+                        .as_ref()
+                        .map(|view| view.settled.clone())
+                        .unwrap_or_else(|| SharedString::from(""));
+                    let tail = message
+                        .stream
+                        .as_ref()
+                        .map(|view| view.tail.clone())
+                        .unwrap_or_else(|| SharedString::from(message.text.as_str()));
                     if !settled.trim().is_empty() {
                         body = body.child(chat_markdown(
                             id.clone(),
-                            settled.to_string(),
+                            settled,
                             px(13.0),
                             rems(0.6),
                             tokens.text_primary,
@@ -9906,13 +10267,11 @@ impl AppState {
                         ));
                     }
                     if !tail.is_empty() {
-                        // The live block gets its own TextView: only this block is
-                        // re-parsed per token, while settled blocks stay cached.
                         body = body.child(chat_markdown(
                             SharedString::from(format!(
                                 "agent-markdown-{pane_id}-{conversation}-{index}-live"
                             )),
-                            tail.to_string(),
+                            tail,
                             px(13.0),
                             rems(0.6),
                             tokens.text_primary,
@@ -9969,7 +10328,12 @@ impl AppState {
                         cx.stop_propagation();
                         this.toggle_chat_tool_expanded(pane_id, index, cx);
                     });
-                    chat_tool_card(pane_id, index, tool, tokens, on_toggle).into_any_element()
+                    let on_show_more = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_chat_tool_show_full(pane_id, index, cx);
+                    });
+                    chat_tool_card(pane_id, index, tool, tokens, on_toggle, on_show_more)
+                        .into_any_element()
                 } else {
                     div()
                         .w_full()
@@ -10032,6 +10396,13 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // A collapsed group is the first visible representation of its tools,
+        // so record that paint even though the individual cards stay hidden.
+        for (_, part) in parts {
+            if let Some(id) = part.tool.as_ref().and_then(|tool| tool.id.as_deref()) {
+                crate::stream_timing::tool_card_painted(id);
+            }
+        }
         let (prefix, label) = tool_group_label(parts);
         let on_toggle = cx.listener(move |this, _: &MouseDownEvent, _, cx| {
             cx.stop_propagation();
@@ -10134,6 +10505,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let render_start = std::time::Instant::now();
         let tokens = self.tokens(cx);
         let conversation = format!("{:?}", pane.chat.selected_model);
         let pane_id = pane.id;
@@ -10149,6 +10521,7 @@ impl AppState {
         let visible = pane.chat.visible_messages();
         let running = pane.chat.visible_running();
         let mut messages: Vec<AnyElement> = Vec::new();
+        let row_start = std::time::Instant::now();
         let mut cursor = 0usize;
         while cursor < visible.len() {
             let message = &visible[cursor];
@@ -10193,6 +10566,7 @@ impl AppState {
             ));
             cursor += 1;
         }
+        crate::stream_timing::record_since("ui.render_rows", row_start);
         let default_screen: Option<AnyElement> = if pane.chat.visible_messages().is_empty() {
             let effective = pane.chat.selected_model.as_ref();
             let inherited =
@@ -10458,6 +10832,7 @@ impl AppState {
                     .id(("agent-chat-scrollbar", pane_id)),
             );
 
+        crate::stream_timing::record_since("ui.render_chat", render_start);
         div()
             .relative()
             .size_full()
@@ -13172,6 +13547,7 @@ fn main() -> Result<()> {
         Some(command) => anyhow::bail!("unsupported Kathamo command: {command}"),
         None => {}
     }
+    rpi_embedded::set_tool_arrival_hook(crate::stream_timing::tool_arrived);
     gpui_platform::application()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
@@ -13388,6 +13764,7 @@ fn main() -> Result<()> {
                                 Ok(active) => streaming = active,
                                 Err(_) => break,
                             }
+                            crate::stream_timing::maybe_report();
                         }
                     }).detach();
 
@@ -13802,6 +14179,11 @@ mod resize_tests {
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         cx.update_window_entity(&state, |s, _, cx| {
+            s.projects[0].sessions[0].panes[0]
+                .terminal
+                .update(cx, |term, _| {
+                    term.set_title(Some("~/project - fish".into()));
+                });
             s.projects[0].sessions[0].panes[0].title = "~/project - fish".into();
             s.projects[0].sessions[0].panes[0].display_title = "~/project - fish".into();
             let foregrounds: HashMap<u32, Arc<[String]>> = HashMap::new();
@@ -15137,6 +15519,153 @@ mod kathamo_bottom_input_tests {
     }
 
     #[test]
+    fn starting_a_tool_finalizes_the_streaming_assistant_message() {
+        use agent_bridge::AgentEvent;
+        let mut messages = Vec::new();
+        push_chat_event(&mut messages, AgentEvent::Text("answer".into()));
+        assert!(messages[0].streaming);
+        push_chat_event(
+            &mut messages,
+            AgentEvent::ToolStart {
+                id: Some("t1".into()),
+                name: "read".into(),
+                input: "{}".into(),
+            },
+        );
+        assert!(
+            !messages[0].streaming,
+            "the prior assistant text stops streaming when a tool starts"
+        );
+        assert!(messages[0].stream.is_none());
+    }
+
+    #[test]
+    fn streaming_split_is_cached_after_each_delta() {
+        use agent_bridge::AgentEvent;
+        let mut messages = Vec::new();
+        push_chat_event(&mut messages, AgentEvent::Text("hello".into()));
+        let stream = messages[0].stream.as_ref().expect("stream view");
+        assert_eq!(stream.settled.as_ref(), "");
+        assert_eq!(stream.tail.as_ref(), "hello");
+
+        push_chat_event(&mut messages, AgentEvent::Text(" world\n\nnext".into()));
+        let stream = messages[0].stream.as_ref().expect("stream view");
+        assert!(stream.settled.contains("hello world"));
+        assert_eq!(stream.tail.as_ref(), "next");
+
+        finish_chat_streaming(&mut messages);
+        assert!(
+            messages[0].stream.is_none(),
+            "completion releases the split"
+        );
+    }
+
+    #[test]
+    fn deterministic_replay_matches_the_live_transcript() {
+        use agent_bridge::AgentEvent;
+        let batch = vec![
+            AgentEvent::Thinking("plan ".into()),
+            AgentEvent::Thinking("carefully".into()),
+            AgentEvent::Text("hello ".into()),
+            AgentEvent::Text("world".into()),
+            AgentEvent::ToolStart {
+                id: Some("t1".into()),
+                name: "bash".into(),
+                input: r#"{"command":"printf hi"}"#.into(),
+            },
+            AgentEvent::ToolUpdate {
+                id: Some("t1".into()),
+                name: "bash".into(),
+                output: "h".into(),
+            },
+            AgentEvent::ToolUpdate {
+                id: Some("t1".into()),
+                name: "bash".into(),
+                output: "hi".into(),
+            },
+            AgentEvent::ToolEnd {
+                id: Some("t1".into()),
+                name: "bash".into(),
+                output: "hi\n".into(),
+                failed: false,
+            },
+            AgentEvent::Text("done".into()),
+            AgentEvent::Done,
+            AgentEvent::Closed,
+        ];
+
+        let mut live = Vec::new();
+        for event in batch.iter().cloned() {
+            match event {
+                AgentEvent::Done | AgentEvent::Closed => {
+                    finish_chat_tools(&mut live);
+                    finish_chat_streaming(&mut live);
+                }
+                other => push_chat_event(&mut live, other),
+            }
+        }
+
+        let mut replay = Vec::new();
+        for event in agent_bridge::coalesce_events(batch) {
+            match event {
+                AgentEvent::Done | AgentEvent::Closed => {
+                    finish_chat_tools(&mut replay);
+                    finish_chat_streaming(&mut replay);
+                }
+                other => push_chat_event(&mut replay, other),
+            }
+        }
+
+        assert_eq!(live.len(), replay.len());
+        for (live_message, replay_message) in live.iter().zip(&replay) {
+            assert_eq!(live_message.role, replay_message.role);
+            assert_eq!(live_message.text, replay_message.text);
+            assert_eq!(live_message.streaming, replay_message.streaming);
+            match (&live_message.tool, &replay_message.tool) {
+                (Some(live_tool), Some(replay_tool)) => {
+                    assert_eq!(live_tool.name, replay_tool.name);
+                    assert_eq!(live_tool.output, replay_tool.output);
+                    assert_eq!(live_tool.state, replay_tool.state);
+                    assert_eq!(live_tool.display.view.title, replay_tool.display.view.title);
+                }
+                (None, None) => {}
+                _ => panic!("tool shape differs between live and replayed transcript"),
+            }
+        }
+
+        let tool = replay
+            .iter()
+            .find_map(|message| message.tool.as_ref())
+            .expect("the tool card replays");
+        assert_eq!(tool.output.as_ref(), "hi\n");
+        assert_eq!(tool.state, ToolState::Completed);
+        assert!(
+            replay
+                .iter()
+                .any(|message| message.role == ChatRole::Assistant && message.text == "done"),
+            "text after a tool call starts a new message"
+        );
+    }
+
+    #[test]
+    fn oversized_tool_output_is_previewed_without_losing_the_full_text() {
+        let text = "line\n".repeat(1_000);
+        let (preview_len, truncated) = output_preview_len(&text);
+        assert!(truncated);
+        assert!(preview_len <= TOOL_OUTPUT_PREVIEW_BYTES);
+        assert!(preview_len < text.len());
+
+        let (full, preview, truncated) = tool_output_fields(text.clone());
+        assert!(truncated);
+        assert_eq!(full.len(), text.len());
+        assert_eq!(preview.len(), preview_len);
+
+        let (_, preview, truncated) = tool_output_fields("ok".to_string());
+        assert!(!truncated);
+        assert_eq!(preview.as_ref(), "ok");
+    }
+
+    #[test]
     fn concurrent_tool_snapshots_stay_with_their_original_calls() {
         use agent_bridge::AgentEvent;
         let mut messages = Vec::new();
@@ -15180,8 +15709,8 @@ mod kathamo_bottom_input_tests {
         assert_eq!(messages.len(), 3);
         let a = messages[0].tool.as_ref().unwrap();
         let b = messages[1].tool.as_ref().unwrap();
-        assert!(a.input == "input a" && a.output == "result a" && a.state == ToolState::Completed);
-        assert!(b.input == "input b" && b.output == "result b" && b.state == ToolState::Failed);
+        assert!(a.output.as_ref() == "result a" && a.state == ToolState::Completed);
+        assert!(b.output.as_ref() == "result b" && b.state == ToolState::Failed);
         assert!(messages[2].role == ChatRole::Thinking);
     }
 
@@ -17093,5 +17622,123 @@ mod kathamo_bottom_input_tests {
                 .unwrap();
             assert_eq!(input.read(cx).value().as_str(), "git push");
         });
+    }
+
+    #[test]
+    #[ignore = "prints microbenchmark timings; run with --ignored --nocapture"]
+    fn streaming_hot_path_microbench() {
+        use agent_bridge::AgentEvent;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        // 1. Streaming split: the old render path rescanned and copied the
+        // whole message for every delta; the new path caches the split and
+        // only rescans on newlines.
+        let base = "The quick brown fox jumps over the lazy dog.\n".repeat(4_000);
+        let tokens = (0..2_000)
+            .map(|index| format!("tok{index} "))
+            .collect::<Vec<_>>();
+
+        let start = Instant::now();
+        let mut old_text = base.clone();
+        for token in &tokens {
+            old_text.push_str(token);
+            let (settled, tail) = split_streaming_markdown(&old_text);
+            black_box((settled.to_string(), tail.to_string()));
+        }
+        let old_split = start.elapsed();
+
+        let start = Instant::now();
+        let mut new_message = ChatMessage::new(ChatRole::Assistant, base);
+        new_message.streaming = true;
+        refresh_stream_view(&mut new_message, true);
+        for token in &tokens {
+            new_message.text.push_str(token);
+            refresh_stream_view(&mut new_message, token.contains('\n'));
+            if let Some(view) = &new_message.stream {
+                black_box((view.settled.clone(), view.tail.clone()));
+            }
+        }
+        let new_split = start.elapsed();
+
+        // 2. Tool header: three JSON parses per frame before, a cached struct
+        // borrow after.
+        let big_input = format!(
+            r#"{{"command":"echo hi","content":"{}"}}"#,
+            "x".repeat(64 * 1024)
+        );
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            black_box(tool_view("write", &big_input));
+            black_box(shell_command(&big_input));
+            black_box(tool_content_body("write", &big_input));
+        }
+        let old_tool = start.elapsed();
+
+        let cached = ToolDisplay::new("write", &big_input);
+        let start = Instant::now();
+        for _ in 0..10_000 {
+            black_box(&cached.view);
+            black_box(cached.shell_command.as_ref());
+            black_box(cached.content_body.as_ref());
+        }
+        let new_tool = start.elapsed();
+
+        // 3. Transcript history: serialize + write + flush on the UI thread
+        // before, serialize + enqueue after.
+        let path = std::env::temp_dir().join(format!(
+            "kathamo-stream-bench-{}-{}.jsonl",
+            std::process::id(),
+            paths::uid("b")
+        ));
+        let entry = conversations::Entry::Event {
+            event: AgentEvent::Text("x".repeat(120)),
+        };
+        let encoded = serde_json::to_vec(&entry).unwrap();
+        let start = Instant::now();
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            for _ in 0..2_000 {
+                file.write_all(&encoded).unwrap();
+                file.write_all(b"\n").unwrap();
+                file.flush().unwrap();
+            }
+        }
+        let old_history = start.elapsed();
+        let _ = std::fs::remove_file(&path);
+
+        let mut log = conversations::Log::at_path(path.clone(), u64::MAX);
+        let start = Instant::now();
+        for _ in 0..2_000 {
+            log.append(&entry);
+        }
+        let new_history_enqueue = start.elapsed();
+        log.flush();
+        let _ = std::fs::remove_file(&path);
+
+        // 4. Burst coalescing.
+        let burst = (0..10_000)
+            .map(|index| AgentEvent::Text(format!("t{index} ")))
+            .collect::<Vec<_>>();
+        let burst_len = burst.len();
+        let start = Instant::now();
+        let coalesced = agent_bridge::coalesce_events(burst);
+        let coalesce_time = start.elapsed();
+
+        eprintln!("stream microbenchmark (2,000 deltas, ~180 KiB document)");
+        eprintln!("  split + settled/tail copy: old={old_split:?} new={new_split:?}");
+        eprintln!("  tool header (10,000 renders): old={old_tool:?} new={new_tool:?}");
+        eprintln!(
+            "  history foreground (2,000 appends): old={old_history:?} new={new_history_enqueue:?}"
+        );
+        eprintln!(
+            "  coalesce 10,000 deltas: {burst_len} -> {} events in {coalesce_time:?}",
+            coalesced.len()
+        );
     }
 }

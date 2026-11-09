@@ -35,6 +35,17 @@ use crate::truncate::{format_size, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_
 /// Throttle window for bash `on_update` flushes. Mirrors `BASH_UPDATE_THROTTLE_MS`.
 const BASH_UPDATE_THROTTLE_MS: u64 = 2_000;
 
+/// The active checkpoint window. The default is unchanged; hosts measuring the
+/// first-byte-to-visible-output contribution can override it separately from
+/// the embedding change with `RPI_BASH_UPDATE_THROTTLE_MS`.
+fn update_throttle() -> Duration {
+    std::env::var("RPI_BASH_UPDATE_THROTTLE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(BASH_UPDATE_THROTTLE_MS))
+}
+
 /// Default Bash deadline when neither the caller nor the host specifies one.
 pub const DEFAULT_BASH_TIMEOUT_SECONDS: f64 = 120.0;
 
@@ -238,7 +249,7 @@ impl AgentTool for BashTool {
                 st.latest_full_path = new_full_path;
                 st.dirty = true;
                 let elapsed = st.last_flush.elapsed();
-                let throttle_duration = Duration::from_millis(BASH_UPDATE_THROTTLE_MS);
+                let throttle_duration = update_throttle();
                 if elapsed >= throttle_duration {
                     flush_now(&mut st, &on_update_for_cb);
                 } else {

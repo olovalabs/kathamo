@@ -5,7 +5,6 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
@@ -32,58 +31,26 @@ pub struct AgentModel {
     pub backend: ModelBackend,
 }
 
-/// Read the rpi model catalog. This performs blocking IO.
-fn rpi_models(cwd: &Path) -> Result<Vec<(String, String)>, String> {
-    let output = Command::new("rpi")
-        .args(["--offline", "--list-models"])
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("Could not run rpi: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Could not load the rpi model catalog: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let warnings = String::from_utf8_lossy(&output.stderr);
-    if warnings.contains("could not load models.json") {
-        return Err(format!(
-            "Could not load the rpi model catalog: {}",
-            warnings.trim()
-        ));
-    }
-    let text = String::from_utf8(output.stdout)
-        .map_err(|_| "The rpi model catalog was not UTF-8".to_string())?;
-    let mut lines = text.lines();
-    let header = lines.next().unwrap_or_default();
-    if !header.split_whitespace().take(2).eq(["provider", "model"]) {
-        return Err(format!(
-            "Could not read the rpi model catalog: {}",
-            header.trim()
-        ));
-    }
-    lines
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let mut fields = line.split_whitespace();
-            let provider = fields
-                .next()
-                .ok_or_else(|| "Missing provider in rpi model catalog".to_string())?;
-            let model = fields.next().ok_or_else(|| {
-                format!("Missing model in rpi model catalog row: {}", line.trim())
-            })?;
-            Ok((provider.to_owned(), model.to_owned()))
+/// Read the rpi model catalog in-process. This performs blocking IO through the
+/// same `models.json`/built-in catalog the embedded session uses.
+fn rpi_models() -> Result<Vec<(String, String)>, String> {
+    rpi_embedded::catalog()
+        .map(|models| {
+            models
+                .into_iter()
+                .map(|model| (model.provider, model.id))
+                .collect()
         })
-        .collect()
+        .map_err(|error| format!("Could not load the rpi model catalog: {error}"))
 }
 
 /// Discover models from rpi and omp, keeping Antigravity on its omp backend.
 /// This performs blocking IO; a missing omp omits its catalog.
-pub fn available_models(cwd: &Path) -> Result<Vec<AgentModel>, String> {
+pub fn available_models(_cwd: &Path) -> Result<Vec<AgentModel>, String> {
     let mut models: Vec<AgentModel> = Vec::new();
 
-    // 1. Models from rpi (if rpi is installed and succeeds)
-    if let Ok(rpi_list) = rpi_models(cwd) {
+    // 1. Models from the in-process rpi catalog
+    if let Ok(rpi_list) = rpi_models() {
         for (provider, id) in rpi_list {
             if crate::provider::get_provider(&provider).is_none() {
                 models.push(AgentModel {
@@ -195,7 +162,7 @@ fn strip_thinking_suffix(model: &str) -> &str {
 
 /// Discover catalog and configured provider IDs, then ask rpi for their local
 /// authentication status. This performs blocking IO.
-pub fn providers(cwd: &Path) -> Result<Vec<Provider>, String> {
+pub fn providers(_cwd: &Path) -> Result<Vec<Provider>, String> {
     crate::provider::restore_stored_credentials();
 
     let mut result = Vec::new();
@@ -236,14 +203,20 @@ pub fn providers(cwd: &Path) -> Result<Vec<Provider>, String> {
         }
     }
 
-    // Also include any extra custom providers from rpi if present
-    if let Ok(rpi_ids) = rpi_models(cwd) {
-        for (id, _) in rpi_ids {
-            if !result.iter().any(|p| p.id == id) {
+    // Merge the in-process rpi provider readiness. This replaces the old
+    // `rpi --list-models` probe and reports real local auth state.
+    if let Ok(rpi_providers) = rpi_embedded::providers() {
+        for provider in rpi_providers {
+            if let Some(existing) = result.iter_mut().find(|p| p.id == provider.id) {
+                existing.ready |= provider.ready;
+                if existing.source.is_none() {
+                    existing.source = provider.source;
+                }
+            } else {
                 result.push(Provider {
-                    id,
-                    ready: true,
-                    source: Some("rpi".to_string()),
+                    id: provider.id,
+                    ready: provider.ready,
+                    source: provider.source,
                 });
             }
         }
@@ -259,8 +232,63 @@ pub enum LoginEvent {
     Finished(Result<(), String>),
 }
 
-/// Owns an interactive login. Dropping it cancels and reaps the child.
+/// Owns one interactive login. rpi providers are authenticated in-process;
+/// OMP providers keep the existing device-login PTY.
 pub struct Login {
+    backend: LoginBackend,
+}
+
+enum LoginBackend {
+    Embedded(rpi_embedded::Login),
+    Pty(PtyLogin),
+}
+
+impl Login {
+    pub fn start(provider: &str, cwd: &Path) -> Result<Self, String> {
+        if crate::provider::get_provider(provider).is_some() {
+            Ok(Self {
+                backend: LoginBackend::Pty(PtyLogin::start(provider, cwd)?),
+            })
+        } else {
+            Ok(Self {
+                backend: LoginBackend::Embedded(rpi_embedded::Login::start(provider, cwd)?),
+            })
+        }
+    }
+
+    pub fn try_event(&mut self) -> Option<LoginEvent> {
+        match &mut self.backend {
+            LoginBackend::Embedded(login) => match login.try_event()? {
+                rpi_embedded::LoginEvent::Output(text) => Some(LoginEvent::Output(text)),
+                rpi_embedded::LoginEvent::Finished(result) => Some(LoginEvent::Finished(result)),
+            },
+            LoginBackend::Pty(login) => login.try_event(),
+        }
+    }
+
+    pub fn submit(&mut self, input: &str) -> Result<(), String> {
+        match &mut self.backend {
+            LoginBackend::Embedded(login) => login.submit(input),
+            LoginBackend::Pty(login) => login.submit(input),
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        match &mut self.backend {
+            LoginBackend::Embedded(login) => login.cancel(),
+            LoginBackend::Pty(login) => login.cancel(),
+        }
+    }
+}
+
+impl Drop for Login {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// The OMP device-login PTY. Dropping it cancels and reaps the child.
+struct PtyLogin {
     writer: Box<dyn Write + Send>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     events: mpsc::Receiver<LoginEvent>,
@@ -268,8 +296,8 @@ pub struct Login {
     finished: bool,
 }
 
-impl Login {
-    pub fn start(provider: &str, cwd: &Path) -> Result<Self, String> {
+impl PtyLogin {
+    fn start(provider: &str, cwd: &Path) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -287,14 +315,9 @@ impl Login {
             .master
             .take_writer()
             .map_err(|e| format!("Could not write to the authentication terminal: {e}"))?;
-        let is_omp_provider = crate::provider::get_provider(provider).is_some();
-        let backend = if is_omp_provider { "omp" } else { "rpi" };
+        let backend = "omp";
         let mut command = CommandBuilder::new(backend);
-        if backend == "omp" {
-            command.args(["login", provider]);
-        } else {
-            command.args(["auth", "login", "--provider", provider]);
-        }
+        command.args(["login", provider]);
         command.cwd(cwd);
         let mut child = pair
             .slave
@@ -328,7 +351,7 @@ impl Login {
         })
     }
 
-    pub fn try_event(&mut self) -> Option<LoginEvent> {
+    fn try_event(&mut self) -> Option<LoginEvent> {
         let event = self.events.try_recv().ok()?;
         if matches!(event, LoginEvent::Finished(_)) {
             self.finished = true;
@@ -337,7 +360,7 @@ impl Login {
     }
 
     /// Send a response to the terminal, never via command line or environment.
-    pub fn submit(&mut self, input: &str) -> Result<(), String> {
+    fn submit(&mut self, input: &str) -> Result<(), String> {
         if self.finished {
             return Err("Authentication has already finished".into());
         }
@@ -357,7 +380,7 @@ impl Login {
             .map_err(|e| format!("Could not send authentication input: {e}"))
     }
 
-    pub fn cancel(&mut self) {
+    fn cancel(&mut self) {
         if !self.finished {
             let _ = self.killer.kill();
             self.finished = true;
@@ -365,7 +388,7 @@ impl Login {
     }
 }
 
-impl Drop for Login {
+impl Drop for PtyLogin {
     fn drop(&mut self) {
         self.cancel();
     }

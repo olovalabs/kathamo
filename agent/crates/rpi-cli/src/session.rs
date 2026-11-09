@@ -1141,7 +1141,10 @@ pub async fn build_prepared(
     // Install a BroadcastEmitter so the caller (the interactive TUI) can drain
     // AgentEvents live as a run unfolds. The corresponding broadcast::Receiver
     // is returned alongside the harness; non-interactive modes simply drop it.
-    let (broadcast, event_rx) = rpi_agent::events::BroadcastEmitter::new(256);
+    // Embedded hosts drain this bus from their own task. A deep buffer keeps a
+    // burst of token/tool deltas from lagging the forwarder while still bounding
+    // memory if the host stops polling.
+    let (broadcast, event_rx) = rpi_agent::events::BroadcastEmitter::new(8192);
     let broadcast_emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(broadcast);
     // The broadcast half stays live for the whole session (the TUI's drain task
     // holds the receiver); reload re-wraps it in a fresh `TeeEmitter`, so keep

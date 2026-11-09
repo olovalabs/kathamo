@@ -1,4 +1,6 @@
-# rpi — a Rust agent runtime + CLI. See README.md and docs/architecture/overview.md.
+# rpi — embedded upstream runtime + CLI source vendored for Kathamo.
+# Upstream docs, website, scripts, packaging and examples were removed; the
+# library crates remain complete.
 [workspace]
 members = [
     "crates/rpi-telemetry",
@@ -12,9 +14,8 @@ members = [
     "crates/rpi-tui",
     "crates/rpi-plugin-sdk",
     "crates/rpi-extensions",
-    "examples/minimal",
-    "examples/tools",
-    "examples/tui",
+    "crates/rpi-embedded",
+    # Required by the upstream resource-selection integration tests.
     "examples/plugin-stub",
 ]
 default-members = [

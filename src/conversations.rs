@@ -11,12 +11,134 @@ use crate::agent_bridge::AgentEvent;
 use crate::paths;
 use crate::{ChatMessage, ChatRole, ToolState, push_chat_event};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, mpsc};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 64 * 1024;
+
+/// A conversation write, applied in send order by one writer thread.
+///
+/// Keeping a single global queue gives every conversation a total order: an
+/// append is visible to the next append for the same file, `flush` is a real
+/// barrier, and `clear_all` cannot be overtaken by appends that were queued
+/// before it.
+enum WriteJob {
+    Append {
+        path: PathBuf,
+        max_bytes: u64,
+        line: Vec<u8>,
+    },
+    Flush {
+        ack: mpsc::Sender<()>,
+    },
+    Clear {
+        ack: mpsc::Sender<io::Result<()>>,
+    },
+    /// Release one file handle when its `Log` is dropped. The file is reopened
+    /// lazily if another `Log` for the same conversation appends again.
+    Close {
+        path: PathBuf,
+    },
+}
+
+static WRITER: OnceLock<mpsc::Sender<WriteJob>> = OnceLock::new();
+
+fn writer() -> &'static mpsc::Sender<WriteJob> {
+    WRITER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<WriteJob>();
+        let _ = std::thread::Builder::new()
+            .name("kathamo-conversation-writer".into())
+            .spawn(move || writer_loop(receiver));
+        sender
+    })
+}
+
+struct OpenFile {
+    file: Option<File>,
+    written: u64,
+}
+
+fn writer_loop(receiver: mpsc::Receiver<WriteJob>) {
+    let mut files: HashMap<PathBuf, OpenFile> = HashMap::new();
+    while let Ok(job) = receiver.recv() {
+        match job {
+            WriteJob::Append {
+                path,
+                max_bytes,
+                line,
+            } => {
+                let write_start = std::time::Instant::now();
+                let result = write_line(&mut files, &path, max_bytes, &line);
+                crate::stream_timing::record_since("transcript.write", write_start);
+                if let Err(error) = result {
+                    eprintln!("failed to append conversation {}: {error}", path.display());
+                }
+            }
+            WriteJob::Flush { ack } => {
+                for open in files.values_mut() {
+                    if let Some(file) = open.file.as_mut() {
+                        let _ = file.flush();
+                    }
+                }
+                let _ = ack.send(());
+            }
+            WriteJob::Clear { ack } => {
+                // Drop open handles first so the next append recreates the
+                // directory instead of writing through a stale descriptor.
+                files.clear();
+                let result = (|| {
+                    let dir = paths::conversations_dir();
+                    if dir.exists() {
+                        fs::remove_dir_all(&dir)?;
+                    }
+                    fs::create_dir_all(dir)
+                })();
+                let _ = ack.send(result);
+            }
+            WriteJob::Close { path } => {
+                files.remove(&path);
+            }
+        }
+    }
+}
+
+fn write_line(
+    files: &mut HashMap<PathBuf, OpenFile>,
+    path: &Path,
+    max_bytes: u64,
+    line: &[u8],
+) -> io::Result<()> {
+    let open = files.entry(path.to_path_buf()).or_insert_with(|| OpenFile {
+        file: None,
+        written: fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+    });
+    if open.written > 0 && open.written + line.len() as u64 > max_bytes {
+        open.file = None;
+        let rotated = path.with_extension("jsonl.1");
+        match paths::atomic_replace(path, &rotated) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        open.written = 0;
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if open.file.is_none() {
+        open.file = Some(OpenOptions::new().create(true).append(true).open(path)?);
+    }
+    if let Some(file) = open.file.as_mut() {
+        file.write_all(line)?;
+        file.flush()?;
+    }
+    open.written += line.len() as u64;
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -27,11 +149,14 @@ pub enum Entry {
 }
 
 /// One append-only conversation file.
+///
+/// Appending only serializes the entry and enqueues it; the writer thread owns
+/// directory creation, rotation and the file handle. The format and rotation
+/// policy are unchanged, so replay reads exactly what earlier versions wrote.
 pub struct Log {
     path: PathBuf,
-    file: Option<File>,
-    written: u64,
     max_bytes: u64,
+    sender: mpsc::Sender<WriteJob>,
 }
 
 impl Log {
@@ -43,12 +168,10 @@ impl Log {
     }
 
     pub fn at_path(path: PathBuf, max_bytes: u64) -> Self {
-        let written = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
         Self {
             path,
-            file: None,
-            written,
             max_bytes,
+            sender: writer().clone(),
         }
     }
 
@@ -77,61 +200,55 @@ impl Log {
     }
 
     pub fn append(&mut self, entry: &Entry) {
-        if let Err(error) = self.try_append(entry) {
+        let enqueue_start = std::time::Instant::now();
+        let mut line = match serde_json::to_vec(entry) {
+            Ok(line) => line,
+            Err(error) => {
+                eprintln!(
+                    "failed to encode conversation {}: {error}",
+                    self.path.display()
+                );
+                return;
+            }
+        };
+        line.push(b'\n');
+        if self
+            .sender
+            .send(WriteJob::Append {
+                path: self.path.clone(),
+                max_bytes: self.max_bytes,
+                line,
+            })
+            .is_err()
+        {
             eprintln!(
-                "failed to append conversation {}: {error}",
+                "conversation writer stopped; dropped an entry for {}",
                 self.path.display()
             );
         }
+        crate::stream_timing::record_since("transcript.enqueue", enqueue_start);
     }
 
-    fn try_append(&mut self, entry: &Entry) -> io::Result<()> {
-        let mut line = serde_json::to_vec(entry).map_err(io::Error::other)?;
-        line.push(b'\n');
-        if self.written > 0 && self.written + line.len() as u64 > self.max_bytes {
-            self.rotate()?;
-        }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if self.file.is_none() {
-            self.file = Some(
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)?,
-            );
-        }
-        if let Some(file) = self.file.as_mut() {
-            file.write_all(&line)?;
-            file.flush()?;
-        }
-        self.written += line.len() as u64;
-        Ok(())
-    }
-
-    fn rotate(&mut self) -> io::Result<()> {
-        self.file = None;
-        let rotated = self.path.with_extension("jsonl.1");
-        match paths::atomic_replace(&self.path, &rotated) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        self.written = 0;
-        Ok(())
-    }
-
+    /// Block until every write queued before this call has reached the file.
+    /// Used by shutdown and by tests that immediately replay the transcript.
     pub fn flush(&mut self) {
-        if let Some(file) = self.file.as_mut() {
-            let _ = file.flush();
+        let (ack, receiver) = mpsc::channel();
+        if self.sender.send(WriteJob::Flush { ack }).is_ok() {
+            let _ = receiver.recv();
         }
     }
 }
 
 impl Drop for Log {
     fn drop(&mut self) {
-        self.flush();
+        // Order a flush and handle release behind this log's appends without
+        // blocking the caller. Shutdown uses `flush` explicitly when it must
+        // wait for the write to reach the file.
+        let (ack, _receiver) = mpsc::channel();
+        let _ = self.sender.send(WriteJob::Flush { ack });
+        let _ = self.sender.send(WriteJob::Close {
+            path: self.path.clone(),
+        });
     }
 }
 
@@ -271,12 +388,17 @@ fn normalize_replay(messages: &mut [ChatMessage]) {
     }
 }
 
+/// Delete every conversation, ordered behind all writes already queued. New
+/// appends sent after this barrier are new history and are allowed to recreate
+/// the directory.
 pub fn clear_all() -> io::Result<()> {
-    let dir = paths::conversations_dir();
-    if dir.exists() {
-        fs::remove_dir_all(&dir)?;
-    }
-    fs::create_dir_all(dir)
+    let (ack, receiver) = mpsc::channel();
+    writer()
+        .send(WriteJob::Clear { ack })
+        .map_err(|_| io::Error::other("conversation writer stopped"))?;
+    receiver
+        .recv()
+        .map_err(|_| io::Error::other("conversation writer did not acknowledge clear"))?
 }
 
 #[cfg(test)]
@@ -336,6 +458,7 @@ mod tests {
             failed: false,
         });
         log.append_local(ChatRole::Status, "/fast on");
+        log.flush();
         let messages = load(log.path());
 
         assert_eq!(messages.len(), 4);
@@ -352,7 +475,33 @@ mod tests {
         assert_eq!(messages[3].role, ChatRole::Status);
         assert_eq!(messages[3].text, "/fast on");
 
-        let _ = fs::remove_file(log.path());
+        let path = log.path().to_path_buf();
+        drop(log);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn queued_writes_keep_per_conversation_order() {
+        let mut first = temp_log("order-first", MAX_FILE_BYTES);
+        let mut second = temp_log("order-second", MAX_FILE_BYTES);
+        first.append_event(&AgentEvent::Text("one".into()));
+        second.append_event(&AgentEvent::Text("other".into()));
+        first.append_event(&AgentEvent::Text(" two".into()));
+        first.flush();
+
+        let first_messages = load(first.path());
+        assert_eq!(first_messages.len(), 1);
+        assert_eq!(first_messages[0].text, "one two");
+        let second_messages = load(second.path());
+        assert_eq!(second_messages.len(), 1);
+        assert_eq!(second_messages[0].text, "other");
+
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        drop(first);
+        drop(second);
+        let _ = fs::remove_file(first_path);
+        let _ = fs::remove_file(second_path);
     }
 
     #[test]
@@ -363,9 +512,12 @@ mod tests {
             name: "read".into(),
             input: "".into(),
         });
+        log.flush();
         let messages = load(log.path());
         assert_eq!(messages[0].tool.as_ref().unwrap().state, ToolState::Unknown);
-        let _ = fs::remove_file(log.path());
+        let path = log.path().to_path_buf();
+        drop(log);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -374,12 +526,15 @@ mod tests {
         for index in 0..20 {
             log.append_event(&AgentEvent::Text(format!("line {index}")));
         }
+        log.flush();
         let rotated = log.path().with_extension("jsonl.1");
         assert!(rotated.exists(), "expected the first generation to rotate");
         let current = load(log.path());
         assert!(!current.is_empty());
         assert!(fs::metadata(log.path()).unwrap().len() <= 300);
-        let _ = fs::remove_file(log.path());
+        let path = log.path().to_path_buf();
+        drop(log);
+        let _ = fs::remove_file(path);
         let _ = fs::remove_file(rotated);
     }
 

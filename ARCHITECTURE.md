@@ -131,11 +131,46 @@ Kathamo follows Zed's per-platform directory convention (`src/paths.rs`):
 - `settings.json` is user-editable and parsed as JSONC (comments allowed). It stores app appearance, window bounds/state, and the `restore` toggles.
 - `workspace.json` is auto-managed and debounced (300 ms) with an atomic temp+rename write and a generation guard. It records project paths, tab titles/logos, the split tree, per-pane cwd, input drafts, command history, and selected agent models/session ids.
 - Scrollback is written separately (on close, quit, and every 30 s while dirty) so the debounced hot path stays small. Restored panes spawn a fresh shell in the saved cwd and seed the previous buffer above the new prompt.
-- Agent transcripts are appended as raw events and replayed through `push_chat_event`, so the restored UI matches the previous session exactly. rpi conversations resume with `rpi --session <id>`; OMP restores the transcript only.
+- Agent transcripts are appended as raw events and replayed through `push_chat_event`, so the restored UI matches the previous session exactly. rpi conversations resume by reopening the durable session id through the embedded agent (below); OMP restores the transcript only.
 - Window geometry is loaded synchronously before `open_window`, validated against the current displays, and saved on close/quit.
 - Legacy v1 `workspace.json` files (including the old `com.Markup.Markup` location) are backed up to `<data>/backups/` and migrated automatically.
 
 Environment overrides: `KATHAMO_DATA_DIR=/absolute/path` (derives config/state/logs from it) and `KATHAMO_DISABLE_RESTORE=1` (clean launch without reading saved state).
+
+### 2.6 Embedded rpi agent (`agent/`)
+
+The pi-rust v0.21.0 library crates and CLI sources are vendored as a Git subtree
+under `agent/` and kept as its own Cargo workspace. Non-build upstream assets
+(website, docs, scripts, packaging, deploy/demo, CI metadata and most examples)
+were removed after import; `examples/plugin-stub` remains as a test fixture.
+Kathamo path-depends on `agent/crates/rpi-embedded`, a host-facing library built
+from the upstream library crates.
+
+- **Default backend.** `src/agent_bridge.rs` opens one `EmbeddedSession` per rpi
+  conversation. The session owns a dedicated multi-thread Tokio runtime and
+  reuses upstream's `rpi_cli::session::build`: model/credential resolution,
+  built-in `read`/`bash`/`edit`/`write`/`docs` tools, the coding system prompt,
+  durable JSONL session storage and `AgentHarness`.
+- **Typed transport.** A forwarding task maps `rpi_agent::AgentEvent` into the
+  existing `AgentEvent` contract, so the UI reducer, coalescing, tool grouping,
+  markdown, scrolling and transcript persistence are unchanged. No `rpi`
+  subprocess, stdio pipe or RPC JSONL transport is used.
+- **Lifecycle.** Prompts run on the session runtime. Stop and pane close call
+  `request_stop_round` + `abort_reclaiming`, which cancels active tools. A
+  stale resumed session id falls back to a fresh durable session.
+- **Discovery and login.** Model catalogs and provider readiness are read
+  in-process through `rpi_embedded::catalog`/`providers`. rpi-only API-key and
+  OAuth logins are driven in-process; OMP keeps its existing PTY login.
+- **Baseline.** The old subprocess bridge is retained behind
+  `KATHAMO_RPI_BACKEND=rpc` for before/after measurements. The default is the
+  embedded backend. `KATHAMO_STREAM_TIMINGS=1` reports startup, UI drain/apply,
+  render, markdown parse and tool arrival→card/output percentiles for both.
+- **Isolation.** Embedded sessions build with `no_extensions` because upstream
+  extension identity is process-global. Built-in tools/providers, `models.json`,
+  `auth.json`, environment credentials and session storage are reused.
+
+See `EMBEDDED_AGENT.md` for the upstream commit, integration details, verification
+and remaining limitations.
 
 ---
 

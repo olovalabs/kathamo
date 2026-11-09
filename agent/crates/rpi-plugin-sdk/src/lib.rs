@@ -2043,6 +2043,9 @@ pub fn guard_or<R>(fallback: R, body: impl FnOnce() -> R) -> R {
 macro_rules! export_plugin {
     ($body:expr) => {
         #[no_mangle]
+        // The host ABI supplies this pointer; the shim forwards it to the
+        // documented `register_entrypoint` contract.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         pub extern "C" fn rpi_plugin_register(api: *const $crate::PluginApi) -> i32 {
             // SAFETY: host guarantees `api` is valid for this call.
             unsafe { $crate::register_entrypoint(api, $body) }

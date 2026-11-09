@@ -1,13 +1,14 @@
-use std::io::{BufRead, BufReader, Write};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
-use std::thread;
 
+use rpi_embedded::{EmbeddedSession, SessionEvent, SessionOptions};
+
+#[path = "agent_bridge_rpc.rs"]
+mod agent_bridge_rpc;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-/// Events from one persistent rpi RPC session.
+/// Events from one persistent embedded rpi session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
     Text(String),
@@ -38,22 +39,28 @@ pub enum AgentEvent {
     Closed,
 }
 
-enum Incoming {
-    Event(AgentEvent),
-    Closed(Option<String>),
+/// One rpi conversation. The default backend is the in-process harness; set
+/// `KATHAMO_RPI_BACKEND=rpc` to use the old subprocess bridge for a baseline.
+pub struct AgentBridge {
+    backend: Backend,
 }
 
-/// Owns an rpi process and its conversation. Dropping it terminates the process.
-pub struct AgentBridge {
-    child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
-    events: mpsc::Receiver<Incoming>,
-    stderr: Arc<Mutex<String>>,
-    closed: bool,
-    next_id: u64,
+enum Backend {
+    Embedded(EmbeddedBridge),
+    Rpc(agent_bridge_rpc::RpcAgentBridge),
+}
+
+/// Owns one in-process agent conversation. Dropping it cancels the active run
+/// and releases the harness, tools and session storage.
+struct EmbeddedBridge {
+    session: EmbeddedSession,
     cwd: PathBuf,
-    session_id: Arc<Mutex<Option<String>>>,
-    model: Arc<Mutex<Option<String>>>,
+    /// The `provider/model` selector this session was opened with, retained so
+    /// a credential refresh can rebuild the same conversation.
+    model: Option<String>,
+    closed: bool,
+    spawn_start: std::time::Instant,
+    ready_seen: std::cell::Cell<bool>,
 }
 
 impl AgentBridge {
@@ -74,278 +81,208 @@ impl AgentBridge {
         Self::spawn_session(cwd, session, model)
     }
 
-    /// The durable conversation id reported by `get_state`, once the process
-    /// has started. Persist this to resume the conversation after a restart.
-    pub fn session_id(&self) -> Option<String> {
-        self.session_id.lock().ok().and_then(|id| id.clone())
-    }
-
     fn spawn_session(
         cwd: &Path,
         session: Option<&str>,
         model: Option<&str>,
     ) -> Result<Self, String> {
-        let mut command = Command::new("rpi");
-        command
-            .args(["--mode", "rpc"])
-            .current_dir(cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(session) = session {
-            command.args(["--session", session]);
+        if rpc_backend_requested() {
+            agent_bridge_rpc::RpcAgentBridge::spawn_resumed(cwd, session, model).map(|backend| {
+                Self {
+                    backend: Backend::Rpc(backend),
+                }
+            })
+        } else {
+            EmbeddedBridge::spawn_session(cwd, session, model).map(|backend| Self {
+                backend: Backend::Embedded(backend),
+            })
         }
-        if let Some(model) = model {
-            command.args(["--model", model]);
+    }
+
+    /// The durable conversation id reported by the backend, once it starts.
+    /// Persist this to resume the conversation after a restart.
+    pub fn session_id(&self) -> Option<String> {
+        match &self.backend {
+            Backend::Embedded(bridge) => bridge.session_id(),
+            Backend::Rpc(bridge) => bridge.session_id(),
         }
-        // Isolate the agent and its tools so closing a pane cannot leave them running.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        let mut child = command.spawn().map_err(|e| {
-            format!(
-                "Could not start rpi in {}: {e}. Install rpi and ensure it is on PATH.",
-                cwd.display()
-            )
-        })?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("piped stdin")));
-        let stdout = child.stdout.take().expect("piped stdout");
-        let stderr_pipe = child.stderr.take().expect("piped stderr");
-        let stderr = Arc::new(Mutex::new(String::new()));
-        let stderr_sink = Arc::clone(&stderr);
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stderr_pipe);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        if let Ok(mut sink) = stderr_sink.lock() {
-                            // Retain a bounded diagnostic tail without splitting UTF-8.
-                            sink.push_str(&line);
-                            if sink.len() > 16_384 {
-                                let mut start = sink.len() - 16_384;
-                                while !sink.is_char_boundary(start) {
-                                    start += 1;
-                                }
-                                sink.drain(..start);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        let (sender, events) = mpsc::channel();
-        let reply_stdin = Arc::clone(&stdin);
-        let session_id = Arc::new(Mutex::new(session.map(str::to_owned)));
-        let session_sink = Arc::clone(&session_id);
-        let model_id = Arc::new(Mutex::new(model.map(str::to_owned)));
-        let model_sink = Arc::clone(&model_id);
-        thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
-                        let _ = sender.send(Incoming::Closed(None));
-                        break;
-                    }
-                    Err(e) => {
-                        let _ = sender.send(Incoming::Closed(Some(format!(
-                            "Failed reading rpi output: {e}"
-                        ))));
-                        break;
-                    }
-                    Ok(_) => {}
-                }
-                let record: Value = match serde_json::from_str(&line) {
-                    Ok(record) => record,
-                    Err(e) => {
-                        let _ = sender.send(Incoming::Event(AgentEvent::Error(format!(
-                            "Invalid rpi RPC output: {e}"
-                        ))));
-                        continue;
-                    }
-                };
-                if record["type"] == "response" && record["command"] == "get_state" {
-                    if let Some(id) = record["data"]["sessionId"].as_str() {
-                        if let Ok(mut session) = session_sink.lock() {
-                            *session = Some(id.to_owned());
-                        }
-                    }
-                    if let (Some(provider), Some(model)) = (
-                        record["data"]["provider"].as_str(),
-                        record["data"]["modelId"].as_str(),
-                    ) {
-                        if let Ok(mut selected) = model_sink.lock() {
-                            *selected = Some(format!("{provider}/{model}"));
-                        }
-                    }
-                }
-                if record["type"] == "extension_ui_request" {
-                    handle_extension_ui(&record, &reply_stdin, &sender);
-                } else {
-                    for event in decode_event(&record) {
-                        if sender.send(Incoming::Event(event)).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        write_command(
-            &stdin,
-            &json!({"type": "get_state", "id": "kathamo-session"}),
-        )?;
-        Ok(Self {
-            child,
-            stdin,
-            events,
-            stderr,
-            closed: false,
-            next_id: 0,
-            cwd: cwd.to_path_buf(),
-            session_id,
-            model: model_id,
-        })
     }
 
     /// Reload saved provider credentials while reopening the same durable session.
     pub fn restart_after_auth(&mut self) -> Result<(), String> {
-        let session = self
-            .session_id
-            .lock()
-            .map_err(|_| "rpi session lock was poisoned")?
-            .clone()
-            .ok_or("The agent session is still starting; try again shortly")?;
-        let model = self
-            .model
-            .lock()
-            .map_err(|_| "rpi model lock was poisoned")?
-            .clone()
-            .ok_or("The agent model is still starting; try again shortly")?;
-        let cwd = self.cwd.clone();
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+        match &mut self.backend {
+            Backend::Embedded(bridge) => bridge.restart_after_auth(),
+            Backend::Rpc(bridge) => bridge.restart_after_auth(),
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.closed = true;
-        let replacement = Self::spawn_session(&cwd, Some(&session), Some(&model))?;
+    }
+
+    pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
+        match &mut self.backend {
+            Backend::Embedded(bridge) => {
+                if bridge.closed {
+                    return Err("The agent session has closed".into());
+                }
+                bridge.session.send_prompt(prompt)
+            }
+            Backend::Rpc(bridge) => bridge.send_prompt(prompt),
+        }
+    }
+
+    pub fn cancel(&mut self) -> Result<(), String> {
+        match &mut self.backend {
+            Backend::Embedded(bridge) => {
+                if bridge.closed {
+                    return Err("The agent session has closed".into());
+                }
+                bridge.session.cancel()
+            }
+            Backend::Rpc(bridge) => bridge.cancel(),
+        }
+    }
+
+    pub fn poll(&mut self) -> Vec<AgentEvent> {
+        match &mut self.backend {
+            Backend::Embedded(bridge) => bridge.poll(),
+            Backend::Rpc(bridge) => bridge.poll(),
+        }
+    }
+}
+
+fn rpc_backend_requested() -> bool {
+    std::env::var("KATHAMO_RPI_BACKEND")
+        .map(|backend| backend.eq_ignore_ascii_case("rpc"))
+        .unwrap_or(false)
+}
+
+impl EmbeddedBridge {
+    fn spawn_session(
+        cwd: &Path,
+        session: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Self, String> {
+        let options = SessionOptions::new(cwd)
+            .with_selector(model)
+            .with_session(session);
+        let spawn_start = std::time::Instant::now();
+        let session = EmbeddedSession::spawn(options).map_err(|error| {
+            format!(
+                "Could not start the embedded rpi agent in {}: {error}",
+                cwd.display()
+            )
+        })?;
+        crate::stream_timing::record_since("engine.embedded.spawn", spawn_start);
+        Ok(Self {
+            session,
+            cwd: cwd.to_path_buf(),
+            model: model.map(str::to_owned),
+            closed: false,
+            spawn_start,
+            ready_seen: std::cell::Cell::new(false),
+        })
+    }
+
+    fn session_id(&self) -> Option<String> {
+        let id = self.session.session_id();
+        if id.is_some() && !self.ready_seen.replace(true) {
+            crate::stream_timing::record_since("engine.embedded.ready", self.spawn_start);
+        }
+        id
+    }
+
+    fn restart_after_auth(&mut self) -> Result<(), String> {
+        let session = self
+            .session
+            .session_id()
+            .ok_or("The agent session is still starting; try again shortly")?;
+        let replacement = Self::spawn_session(&self.cwd, Some(&session), self.model.as_deref())?;
         *self = replacement;
         Ok(())
     }
 
-    pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
-        self.send(json!({"type": "prompt", "message": prompt}))
-    }
-
-    pub fn cancel(&mut self) -> Result<(), String> {
-        self.send(json!({"type": "abort"}))
-    }
-
-    fn send(&mut self, mut command: Value) -> Result<(), String> {
-        if self.closed {
-            return Err("The rpi process has exited".into());
-        }
-        self.next_id = self.next_id.wrapping_add(1);
-        command["id"] = json!(format!("kathamo-{}", self.next_id));
-        write_command(&self.stdin, &command)
-    }
-
-    pub fn poll(&mut self) -> Vec<AgentEvent> {
+    fn poll(&mut self) -> Vec<AgentEvent> {
         let mut events = Vec::new();
-        while let Ok(incoming) = self.events.try_recv() {
-            match incoming {
-                Incoming::Event(event) => events.push(event),
-                Incoming::Closed(error) => {
-                    if !self.closed {
-                        self.closed = true;
-                        let status = self
-                            .child
-                            .try_wait()
-                            .ok()
-                            .flatten()
-                            .map(|status| format!(" ({status})"))
-                            .unwrap_or_default();
-                        let diagnostic = self
-                            .stderr
-                            .lock()
-                            .ok()
-                            .map(|s| s.trim().to_owned())
-                            .unwrap_or_default();
-                        let mut message =
-                            error.unwrap_or_else(|| format!("rpi process exited{status}"));
-                        if !diagnostic.is_empty() {
-                            message.push_str(&format!(": {diagnostic}"));
-                        }
-                        events.push(AgentEvent::Error(message));
-                        events.push(AgentEvent::Done);
-                        events.push(AgentEvent::Closed);
-                    }
+        for event in self.session.poll() {
+            match event {
+                SessionEvent::Text(text) => events.push(AgentEvent::Text(text)),
+                SessionEvent::Thinking(text) => events.push(AgentEvent::Thinking(text)),
+                SessionEvent::Status(text) => events.push(AgentEvent::Status(text)),
+                SessionEvent::ToolStart { id, name, input } => {
+                    events.push(AgentEvent::ToolStart { id, name, input })
+                }
+                SessionEvent::ToolUpdate { id, name, output } => {
+                    events.push(AgentEvent::ToolUpdate { id, name, output })
+                }
+                SessionEvent::ToolEnd {
+                    id,
+                    name,
+                    output,
+                    failed,
+                } => events.push(AgentEvent::ToolEnd {
+                    id,
+                    name,
+                    output,
+                    failed,
+                }),
+                SessionEvent::Error(text) => events.push(AgentEvent::Error(text)),
+                SessionEvent::Done => events.push(AgentEvent::Done),
+                SessionEvent::Closed => {
+                    self.closed = true;
+                    events.push(AgentEvent::Closed);
                 }
             }
         }
-        events
+        coalesce_events(events)
     }
 }
 
-impl Drop for AgentBridge {
-    fn drop(&mut self) {
-        // Kill the whole process group, including any active tool subprocesses.
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+/// Largest merged delta. Bounded so a coalesced append never crosses the
+/// transcript entry cap and silently drops text that separate entries carried.
+pub(crate) const COALESCE_TEXT_LIMIT: usize = 16 * 1024;
+
+/// Collapse one drained batch before it reaches the UI and the transcript.
+///
+/// Adjacent text or reasoning deltas become a single append, and earlier
+/// cumulative tool snapshots are dropped in favour of the newest snapshot for
+/// the same call. Tool starts, ends, statuses, errors and completion events are
+/// structural: they keep their order and are never merged away.
+pub(crate) fn coalesce_events(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
+    let mut last_update: HashMap<(Option<String>, String), usize> = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        if let AgentEvent::ToolUpdate { id, name, .. } = event {
+            last_update.insert((id.clone(), name.clone()), index);
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
-}
 
-fn write_command(stdin: &Mutex<ChildStdin>, command: &Value) -> Result<(), String> {
-    let mut input = stdin
-        .lock()
-        .map_err(|_| "rpi input lock was poisoned".to_string())?;
-    serde_json::to_writer(&mut *input, command)
-        .map_err(|e| format!("Failed to encode rpi command: {e}"))?;
-    input
-        .write_all(b"\n")
-        .and_then(|_| input.flush())
-        .map_err(|e| format!("Failed to send rpi command: {e}"))
-}
-
-fn handle_extension_ui(record: &Value, stdin: &Mutex<ChildStdin>, sender: &mpsc::Sender<Incoming>) {
-    let method = record["method"].as_str().unwrap_or("");
-    match method {
-        "select" | "confirm" | "input" | "editor" => {
-            let title = record["title"].as_str().unwrap_or("Extension interaction");
-            let _ = sender.send(Incoming::Event(AgentEvent::Error(format!("{title}: interactive extension dialogs are not supported in this view; request cancelled"))));
-            if let Err(error) = write_command(
-                stdin,
-                &json!({"type": "extension_ui_response", "id": record["id"], "cancelled": true}),
-            ) {
-                let _ = sender.send(Incoming::Event(AgentEvent::Error(error)));
+    let mut out: Vec<AgentEvent> = Vec::with_capacity(events.len());
+    for (index, event) in events.into_iter().enumerate() {
+        if let AgentEvent::ToolUpdate {
+            ref id, ref name, ..
+        } = event
+            && last_update
+                .get(&(id.clone(), name.clone()))
+                .is_some_and(|last| *last != index)
+        {
+            continue;
+        }
+        match (&mut out.last_mut(), event) {
+            (Some(AgentEvent::Text(previous)), AgentEvent::Text(next))
+                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT =>
+            {
+                previous.push_str(&next);
             }
-        }
-        "notify" => {
-            if let Some(message) = record["message"].as_str() {
-                let event = if record["notifyType"] == "error" {
-                    AgentEvent::Error(message.to_owned())
-                } else {
-                    AgentEvent::Tool(message.to_owned())
-                };
-                let _ = sender.send(Incoming::Event(event));
+            (Some(AgentEvent::Thinking(previous)), AgentEvent::Thinking(next))
+                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT =>
+            {
+                previous.push_str(&next);
             }
+            (_, event) => out.push(event),
         }
-        _ => {}
     }
+    out
 }
 
+/// Decode a shared RPC `message_update`. Kept for the OMP backend, which still
+/// speaks OMP's RPC JSONL transport.
 pub(crate) fn decode_message_update(record: &Value) -> Option<AgentEvent> {
     let update = &record["assistantMessageEvent"];
     let delta = update["delta"].as_str()?;
@@ -376,6 +313,7 @@ fn tool_output(result: &Value) -> String {
 }
 
 /// Decode the shared RPC tool lifecycle. Update and result payloads are snapshots.
+/// Kept for the OMP backend.
 pub(crate) fn decode_tool_event(record: &Value) -> Option<AgentEvent> {
     let id = record["toolCallId"]
         .as_str()
@@ -383,11 +321,16 @@ pub(crate) fn decode_tool_event(record: &Value) -> Option<AgentEvent> {
         .map(str::to_owned);
     let name = record["toolName"].as_str().unwrap_or("tool").to_owned();
     match record["type"].as_str()? {
-        "tool_execution_start" => Some(AgentEvent::ToolStart {
-            id,
-            name,
-            input: readable_value(&record["args"]),
-        }),
+        "tool_execution_start" => {
+            if let Some(id) = id.as_deref() {
+                crate::stream_timing::tool_arrived(id);
+            }
+            Some(AgentEvent::ToolStart {
+                id,
+                name,
+                input: readable_value(&record["args"]),
+            })
+        }
         "tool_execution_update" => Some(AgentEvent::ToolUpdate {
             id,
             name,
@@ -403,6 +346,9 @@ pub(crate) fn decode_tool_event(record: &Value) -> Option<AgentEvent> {
     }
 }
 
+/// Decode a legacy rpi RPC record. Retained for protocol fixtures; the embedded
+/// bridge maps [`rpi_embedded::SessionEvent`] directly.
+#[cfg(test)]
 fn decode_event(record: &Value) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     match record["type"].as_str().unwrap_or("") {
@@ -452,6 +398,7 @@ fn decode_event(record: &Value) -> Vec<AgentEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn only_settled_or_handled_prompts_complete() {
@@ -472,5 +419,100 @@ mod tests {
             )[..],
             [AgentEvent::Error(_), AgentEvent::Done]
         ));
+    }
+
+    #[test]
+    fn full_and_delta_message_updates_apply_only_the_increment() {
+        // Delta projection (`messageUpdates: "delta"`).
+        let delta = json!({
+            "type": "message_update",
+            "message": {"role": "assistant"},
+            "assistantMessageEvent": {"type": "text_delta", "delta": "abc"}
+        });
+        assert!(matches!(
+            decode_message_update(&delta),
+            Some(AgentEvent::Text(text)) if text == "abc"
+        ));
+
+        // Older/full projection: the accumulated message and partial are also
+        // present. Re-applying them would duplicate the stream, so only the
+        // increment is consumed.
+        let full = json!({
+            "type": "message_update",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "abcdef"}]},
+            "assistantMessageEvent": {
+                "type": "text_delta",
+                "delta": "def",
+                "partial": {"role": "assistant", "content": [{"type": "text", "text": "abcdef"}]}
+            }
+        });
+        assert!(matches!(
+            decode_message_update(&full),
+            Some(AgentEvent::Text(text)) if text == "def"
+        ));
+
+        let thinking = json!({
+            "type": "message_update",
+            "message": {"role": "assistant"},
+            "assistantMessageEvent": {"type": "thinking_delta", "delta": "hmm"}
+        });
+        assert!(matches!(
+            decode_message_update(&thinking),
+            Some(AgentEvent::Thinking(text)) if text == "hmm"
+        ));
+    }
+
+    #[test]
+    fn coalescing_merges_deltas_and_keeps_structural_events() {
+        let out = coalesce_events(vec![
+            AgentEvent::Text("a".into()),
+            AgentEvent::Text("b".into()),
+            AgentEvent::Thinking("c".into()),
+            AgentEvent::Thinking("d".into()),
+            AgentEvent::ToolStart {
+                id: Some("t".into()),
+                name: "bash".into(),
+                input: "{}".into(),
+            },
+            AgentEvent::ToolUpdate {
+                id: Some("t".into()),
+                name: "bash".into(),
+                output: "1".into(),
+            },
+            AgentEvent::ToolUpdate {
+                id: Some("t".into()),
+                name: "bash".into(),
+                output: "12".into(),
+            },
+            AgentEvent::ToolEnd {
+                id: Some("t".into()),
+                name: "bash".into(),
+                output: "12".into(),
+                failed: false,
+            },
+            AgentEvent::Done,
+        ]);
+        assert_eq!(out.len(), 6);
+        assert!(matches!(&out[0], AgentEvent::Text(text) if text == "ab"));
+        assert!(matches!(&out[1], AgentEvent::Thinking(text) if text == "cd"));
+        assert!(matches!(&out[2], AgentEvent::ToolStart { .. }));
+        // Only the newest cumulative snapshot survives.
+        assert!(matches!(&out[3], AgentEvent::ToolUpdate { output, .. } if output == "12"));
+        assert!(matches!(&out[4], AgentEvent::ToolEnd { .. }));
+        assert!(matches!(&out[5], AgentEvent::Done));
+    }
+
+    #[test]
+    fn coalescing_does_not_cross_structural_events_or_the_entry_cap() {
+        let out = coalesce_events(vec![
+            AgentEvent::Text("a".into()),
+            AgentEvent::Status("s".into()),
+            AgentEvent::Text("b".into()),
+        ]);
+        assert_eq!(out.len(), 3);
+
+        let half = "x".repeat(COALESCE_TEXT_LIMIT / 2 + 1);
+        let out = coalesce_events(vec![AgentEvent::Text(half.clone()), AgentEvent::Text(half)]);
+        assert_eq!(out.len(), 2, "merged text must stay under the entry cap");
     }
 }

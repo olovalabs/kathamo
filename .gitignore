@@ -5,6 +5,7 @@ target/
 # IDE and editor files
 .idea/
 .vscode/
+.commandcode/
 *.swp
 *.swo
 *~

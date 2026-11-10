@@ -53,6 +53,16 @@ struct Stats {
 static STATS: LazyLock<Mutex<HashMap<&'static str, Stats>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static REPORT_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+static OMP_WORKER_FRAMES: AtomicU64 = AtomicU64::new(0);
+static OMP_WORKER_BYTES: AtomicU64 = AtomicU64::new(0);
+
+pub fn omp_worker_frame(bytes: usize) {
+    if enabled() {
+        OMP_WORKER_FRAMES.fetch_add(1, Ordering::Relaxed);
+        OMP_WORKER_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
 static NEXT_REPORT_MS: AtomicU64 = AtomicU64::new(0);
 
 fn with_stats<R>(f: impl FnOnce(&mut HashMap<&'static str, Stats>) -> R) -> R {
@@ -112,11 +122,16 @@ pub fn report_now() {
 
 fn report() {
     let mut entries: Vec<(&'static str, Stats)> = with_stats(|stats| stats.drain().collect());
-    if entries.is_empty() {
+    let worker_frames = OMP_WORKER_FRAMES.swap(0, Ordering::Relaxed);
+    let worker_bytes = OMP_WORKER_BYTES.swap(0, Ordering::Relaxed);
+    if entries.is_empty() && worker_frames == 0 && worker_bytes == 0 {
         return;
     }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.1.count));
     eprintln!("kathamo stream timings (us, per report window):");
+    if worker_frames != 0 || worker_bytes != 0 {
+        eprintln!("  bridge.omp.worker_wire frames={worker_frames} bytes={worker_bytes}");
+    }
     for (label, mut stats) in entries {
         stats.samples.sort_unstable();
         let percentile = |fraction: f64| -> u64 {
@@ -335,6 +350,24 @@ pub fn turn_sent(trace: u64, warm: bool) {
             settled: false,
         },
     );
+}
+
+/// RPC acknowledged admission of the correlated OMP prompt.
+pub fn omp_prompt_admitted(trace: u64, received: Instant) {
+    if !enabled() {
+        return;
+    }
+    let phase = lock(&TURNS).get(&trace).map(|turn| {
+        let label = if turn.warm {
+            "turn.warm.omp.send_to_admission"
+        } else {
+            "turn.cold.omp.send_to_admission"
+        };
+        (label, turn.sent)
+    });
+    if let Some((label, sent)) = phase {
+        record(label, received.saturating_duration_since(sent));
+    }
 }
 
 /// The provider request was handed to the HTTP client. Fired from the

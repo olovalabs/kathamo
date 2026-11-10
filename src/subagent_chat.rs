@@ -352,25 +352,7 @@ impl LiveWorker {
                     Some("thinking_delta") => (ChatRole::Thinking, delta["delta"].as_str()),
                     _ => return false,
                 };
-                let Some(text) = text.filter(|text| !text.is_empty()) else {
-                    return false;
-                };
-                let timestamp = timestamp.or(self.active_timestamp);
-                if let Some(last) = self.messages.last_mut().filter(|last| {
-                    last.role == role && last.streaming && last.source_timestamp == timestamp
-                }) {
-                    let last = Arc::make_mut(last);
-                    last.text.push_str(text);
-                    crate::refresh_stream_view(last, text.contains('\n'));
-                } else {
-                    crate::finish_chat_streaming(&mut self.messages);
-                    let mut row = ChatMessage::new(role, text.to_owned());
-                    row.source_timestamp = timestamp;
-                    row.streaming = true;
-                    crate::refresh_stream_view(&mut row, true);
-                    self.messages.push(Arc::new(row));
-                }
-                true
+                self.apply_delta(role, text, timestamp)
             }
             Some("message_end") if message["role"] == "assistant" => {
                 let mut changed = false;
@@ -398,9 +380,6 @@ impl LiveWorker {
                         row.source_timestamp = timestamp.or(row.source_timestamp);
                         row.streaming = false;
                         row.stream = None;
-                        if row.role == ChatRole::Thinking {
-                            row.expanded = false;
-                        }
                     }
                 }
                 self.active_start = self.messages.len();
@@ -420,6 +399,33 @@ impl LiveWorker {
             }
             _ => false,
         }
+    }
+
+    pub(crate) fn apply_delta(
+        &mut self,
+        role: ChatRole,
+        text: Option<&str>,
+        timestamp: Option<u64>,
+    ) -> bool {
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
+            return false;
+        };
+        let timestamp = timestamp.or(self.active_timestamp);
+        if let Some(last) = self.messages.last_mut().filter(|last| {
+            last.role == role && last.streaming && last.source_timestamp == timestamp
+        }) {
+            let last = Arc::make_mut(last);
+            last.text.push_str(text);
+            crate::refresh_stream_view(last, text.contains('\n'));
+        } else {
+            crate::finish_chat_streaming(&mut self.messages);
+            let mut row = ChatMessage::new(role, text.to_owned());
+            row.source_timestamp = timestamp;
+            row.streaming = true;
+            crate::refresh_stream_view(&mut row, true);
+            self.messages.push(Arc::new(row));
+        }
+        true
     }
 
     pub fn messages_with_history<'a>(
@@ -497,7 +503,6 @@ pub fn read_transcript(path: &Path) -> Option<Vec<Arc<ChatMessage>>> {
             if !text.trim().is_empty() {
                 let mut row = ChatMessage::new(role, text);
                 row.source_timestamp = message["timestamp"].as_u64();
-                row.expanded = role != ChatRole::Thinking;
                 messages.push(Arc::new(row));
             }
         }
@@ -703,6 +708,7 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].text, "Inspect files");
         assert_eq!(messages[1].role, ChatRole::Thinking);
+        assert!(messages[1].expanded);
         assert_eq!(messages[2].text, "### Report");
     }
 }

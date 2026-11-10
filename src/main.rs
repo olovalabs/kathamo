@@ -1247,6 +1247,7 @@ fn chat_thinking_row(
     on_toggle: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let expanded = message.expanded;
+    let running = running && message.streaming;
     let heading = clip_tool_text(first_line(&message.text), 80).0;
     let label = if running { "Thinking" } else { "Thought" };
 
@@ -1678,26 +1679,7 @@ fn push_chat_event(messages: &mut Vec<Arc<ChatMessage>>, event: agent_bridge::Ag
         | agent_bridge::AgentEvent::Done
         | agent_bridge::AgentEvent::Closed => return,
     };
-    let starting_assistant =
-        role == ChatRole::Assistant && messages.last().is_none_or(|last| last.role != role);
-    if starting_assistant {
-        // Collapse the turn's reasoning once, when assistant text begins. Doing
-        // this for every token made a long turn quadratic.
-        for message in messages
-            .iter_mut()
-            .rev()
-            .take_while(|message| message.role != ChatRole::User)
-        {
-            if message.role == ChatRole::Thinking {
-                let message = Arc::make_mut(message);
-                message.expanded = false;
-                // The block is complete: fold the live tail back into the full
-                // text and drop the streaming split.
-                message.streaming = false;
-                message.stream = None;
-            }
-        }
-    } else if role != ChatRole::Assistant && messages.last().is_none_or(|last| last.role != role) {
+    if messages.last().is_some_and(|last| last.role != role) {
         finish_chat_streaming(messages);
     }
     if matches!(role, ChatRole::Assistant | ChatRole::Thinking)
@@ -1972,6 +1954,20 @@ impl Default for PaneChat {
 }
 
 impl PaneChat {
+    fn mode_thinking_level(&self) -> &'static str {
+        if !self.fast_mode {
+            return "high";
+        }
+        if self.selected_model.as_ref().is_some_and(|model| {
+            model.provider == "google-antigravity" && model.id == "gemini-3.8-flash"
+        }) {
+            // OMP routes both Minimal and Low to LOW, which can return only
+            // answer text. MEDIUM requests a visible summary below the HIGH tier.
+            return "medium";
+        }
+        "low"
+    }
+
     fn ensure_agent(&mut self, cwd: PathBuf) -> Result<(), String> {
         if self.running || (self.bridge.is_some() && self.bridge_model == self.selected_model) {
             return Ok(());
@@ -1981,17 +1977,15 @@ impl PaneChat {
         let selector = self.selected_model.as_ref().map(agent_model_selector);
         let bridge = match self.selected_model.as_ref().map(|model| &model.backend) {
             Some(agent_auth::ModelBackend::Kathamo) => {
-                let mut bridge = ModelBridge::Omp(omp_bridge::OmpBridge::spawn(
+                let bridge = omp_bridge::OmpBridge::spawn(
                     &cwd,
                     selector
                         .as_deref()
                         .expect("Kathamo provider model has a selector"),
-                )?);
-                if !self.fast_mode {
-                    let _ = bridge.set_thinking_level("high");
-                }
+                    self.mode_thinking_level(),
+                )?;
                 self.bridge_resume = None;
-                bridge
+                ModelBridge::Omp(bridge)
             }
             _ => {
                 self.bridge_resume = self.rpi_session_id.clone();
@@ -5735,8 +5729,7 @@ impl AppState {
             return;
         };
         pane.chat.fast_mode = !pane.chat.fast_mode;
-        let fast = pane.chat.fast_mode;
-        let level = if fast { "low" } else { "high" };
+        let level = pane.chat.mode_thinking_level();
         if let Some(bridge) = pane.chat.bridge.as_mut() {
             let _ = bridge.set_thinking_level(level);
         }
@@ -6533,7 +6526,7 @@ impl AppState {
                 .map(|p| p.chat.fast_mode)
                 .unwrap_or(true);
             let msg = if fast {
-                "⚡ Fast mode enabled (low reasoning for rapid responses)."
+                "⚡ Fast mode enabled (reduced reasoning for rapid responses)."
             } else {
                 "🧠 Deep mode enabled (full reasoning for complex logic)."
             };
@@ -6599,7 +6592,10 @@ impl AppState {
             return;
         }
         let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
-        let warm = pane.chat.completed_turns > 0;
+        let warm = match pane.chat.bridge {
+            Some(ModelBridge::Omp(_)) => !pane.chat.bridge_needs_context,
+            _ => pane.chat.completed_turns > 0,
+        };
         if let Some(trace) = trace {
             crate::stream_timing::turn_sent(trace, warm);
         }
@@ -16916,7 +16912,7 @@ mod kathamo_bottom_input_tests {
     }
 
     #[test]
-    fn live_reasoning_stays_expanded_until_the_answer_starts() {
+    fn live_reasoning_stays_expanded_when_the_answer_starts() {
         use agent_bridge::AgentEvent;
         let mut messages = Vec::new();
         push_chat_event(&mut messages, AgentEvent::Thinking("Looking ".into()));
@@ -16926,9 +16922,10 @@ mod kathamo_bottom_input_tests {
         assert_eq!(messages[0].text, "Looking closely");
         push_chat_event(&mut messages, AgentEvent::Text("Done".into()));
         assert!(
-            !messages[0].expanded,
-            "reasoning folds once the answer starts"
+            messages[0].expanded,
+            "the answer leaves the full reasoning visible"
         );
+        assert!(!messages[0].streaming);
     }
 
     #[test]
@@ -17105,7 +17102,7 @@ First report
     }
 
     #[test]
-    fn completed_reasoning_expands_on_click_to_show_the_full_body() {
+    fn completed_reasoning_shows_the_full_body_and_can_be_folded() {
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
@@ -17124,22 +17121,38 @@ First report
                 agent_bridge::AgentEvent::Text("Answer".into()),
             );
         });
-        cx.draw_frame().expect("draw folded reasoning");
-        assert!(
-            cx.debug_bounds("thinking-body-0").is_none(),
-            "completed reasoning starts folded"
-        );
-        let row = cx.debug_bounds("thinking-row-0").expect("thinking row");
-        cx.simulate_click(row.origin + point(px(20.0), px(10.0)), Modifiers::default());
         cx.draw_frame().expect("draw expanded reasoning");
         let body = cx
             .debug_bounds("thinking-body-0")
-            .expect("clicking the thought reveals the reasoning");
+            .expect("completed reasoning is visible");
         assert!(
             body.size.height > px(40.0),
-            "the revealed body contains every line: {:?}",
+            "the visible body contains multiple lines: {:?}",
             body.size.height
         );
+        let row = cx.debug_bounds("thinking-row-0").expect("thinking row");
+        cx.simulate_click(row.origin + point(px(20.0), px(10.0)), Modifiers::default());
+        cx.draw_frame().expect("draw folded reasoning");
+        assert!(cx.debug_bounds("thinking-body-0").is_none());
+    }
+
+    #[test]
+    fn antigravity_flash_uses_medium_reasoning_in_fast_mode() {
+        let mut chat = PaneChat {
+            selected_model: Some(agent_auth::AgentModel {
+                provider: "google-antigravity".into(),
+                id: "gemini-3.8-flash".into(),
+                backend: agent_auth::ModelBackend::Kathamo,
+            }),
+            ..PaneChat::default()
+        };
+        assert_eq!(chat.mode_thinking_level(), "medium");
+        chat.fast_mode = false;
+        assert_eq!(chat.mode_thinking_level(), "high");
+
+        chat.fast_mode = true;
+        chat.selected_model.as_mut().unwrap().provider = "google".into();
+        assert_eq!(chat.mode_thinking_level(), "low");
     }
 
     #[test]

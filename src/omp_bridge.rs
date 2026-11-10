@@ -5,6 +5,7 @@ use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::agent_bridge::{AgentEvent, coalesce_events, decode_message_update, decode_tool_event};
@@ -18,9 +19,49 @@ assignment actually depends on an earlier result. Give each worker its own goal
 and keep concurrent edits in separate files or isolated workspaces.
 "#;
 
+// OMP includes the accumulated worker message and partial snapshot in each
+// update. Deserialize just the fields the live transcript actually uses.
+#[derive(Deserialize)]
+struct WorkerFrame {
+    payload: WorkerPayload,
+}
+
+#[derive(Deserialize)]
+struct WorkerPayload {
+    id: String,
+    event: WorkerEvent,
+}
+
+#[derive(Deserialize)]
+struct WorkerEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    message: Option<WorkerMessage>,
+    #[serde(rename = "assistantMessageEvent")]
+    delta: Option<WorkerDelta>,
+}
+
+#[derive(Deserialize)]
+struct WorkerMessage {
+    timestamp: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct WorkerDelta {
+    #[serde(rename = "type")]
+    kind: String,
+    delta: Option<String>,
+}
+
 enum Incoming {
     /// Assistant deltas need no other fields from the RPC record.
     Delta(AgentEvent),
+    WorkerDelta {
+        id: String,
+        role: crate::ChatRole,
+        text: String,
+        timestamp: Option<u64>,
+    },
     /// A decoded record with its projected tool lifecycle event, if any.
     Record {
         record: Value,
@@ -28,11 +69,30 @@ enum Incoming {
         /// Precomputed on the reader thread: this failed tool result is an
         /// approval request that this view could not answer.
         approval_error: bool,
+        received: std::time::Instant,
     },
     Error(String),
     /// A background read of OMP's session-file title finished.
     TitleRead(Option<String>),
     Closed,
+}
+
+impl WorkerPayload {
+    fn into_delta(self) -> Option<Incoming> {
+        let delta = self.event.delta?;
+        let role = match delta.kind.as_str() {
+            "text_delta" => crate::ChatRole::Assistant,
+            "thinking_delta" => crate::ChatRole::Thinking,
+            _ => return None,
+        };
+        let text = delta.delta.filter(|text| !text.is_empty())?;
+        Some(Incoming::WorkerDelta {
+            id: self.id,
+            role,
+            text,
+            timestamp: self.event.message.and_then(|message| message.timestamp),
+        })
+    }
 }
 
 /// A separate, persistent OMP conversation for one Google Antigravity model.
@@ -49,8 +109,9 @@ pub struct OmpBridge {
     /// auto-generated conversation title into the first line of that file.
     session_file: Option<PathBuf>,
     title: Option<String>,
-    /// OMP only names a session when asked, so the first completed turn
-    /// triggers its title generator once.
+    /// Antigravity uses the local first-prompt title to avoid a model request.
+    auto_title: bool,
+    /// Other providers ask OMP to generate a title after the first turn.
     title_requested: bool,
     /// A title request is running as background work. A prompt that arrives
     /// meanwhile cancels it rather than failing as "already processing".
@@ -63,7 +124,7 @@ pub struct OmpBridge {
 }
 
 impl OmpBridge {
-    pub fn spawn(cwd: &Path, model: &str) -> Result<Self, String> {
+    pub fn spawn(cwd: &Path, model: &str, thinking_level: &str) -> Result<Self, String> {
         let model = model.trim();
         if model.is_empty() {
             return Err("No model was selected".into());
@@ -77,6 +138,7 @@ impl OmpBridge {
             .split_once('/')
             .expect("model selector includes provider");
         let system_prompt = format!("{}\n\n{WORKER_PROMPT}", crate::agent_ui::CATALOG_PROMPT);
+        let prepare_start = std::time::Instant::now();
         let mut command = crate::provider::runtime::command()?;
         crate::provider::auth::storage::sync_api_key(provider)?;
         command
@@ -93,6 +155,7 @@ impl OmpBridge {
             command.process_group(0);
         }
         let spawn_start = std::time::Instant::now();
+        crate::stream_timing::record("engine.omp.prepare", spawn_start - prepare_start);
         let mut child = command.spawn().map_err(|error| {
             format!(
                 "Could not start the Kathamo provider in {}: {error}.",
@@ -112,8 +175,10 @@ impl OmpBridge {
         let reply_writer = writer.clone();
         let trace_id = crate::stream_timing::new_trace();
         let reader_start = std::time::Instant::now();
+        let timing_enabled = crate::stream_timing::enabled();
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
+            let mut cache_warming = None;
             let mut line = String::new();
             let mut first_record = true;
             loop {
@@ -129,6 +194,26 @@ impl OmpBridge {
                     Ok(_) => {}
                 }
                 let parse_start = std::time::Instant::now();
+                // OMP serializes the frame's discriminator first. Other
+                // layouts still work through the generic decoder below.
+                if line.starts_with(r#"{"type":"subagent_event","#) {
+                    crate::stream_timing::omp_worker_frame(line.len());
+                    if let Ok(WorkerFrame { payload }) = serde_json::from_str(&line)
+                        && payload.event.kind == "message_update"
+                    {
+                        crate::stream_timing::record_since(
+                            "bridge.omp.worker_update_decode",
+                            parse_start,
+                        );
+                        if let Some(update) = payload.into_delta() {
+                            if sender.send(update).is_err() {
+                                return;
+                            }
+                            crate::agent_bridge::signal_wake();
+                        }
+                        continue;
+                    }
+                }
                 let record: Value = match serde_json::from_str(&line) {
                     Ok(record) => record,
                     Err(_) => {
@@ -143,6 +228,22 @@ impl OmpBridge {
                 if first_record {
                     first_record = false;
                     crate::stream_timing::record_since("engine.omp.first_record", reader_start);
+                }
+                match record["type"].as_str() {
+                    Some("cache_warming_start") => {
+                        cache_warming = Some(parse_start);
+                        continue;
+                    }
+                    Some("cache_warming_end") => {
+                        if let Some(start) = cache_warming.take() {
+                            crate::stream_timing::record(
+                                "engine.omp.cache_warming",
+                                parse_start.saturating_duration_since(start),
+                            );
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
                 if record["type"] == "message_update" {
                     if let Some(event) = decode_message_update(&record) {
@@ -192,6 +293,7 @@ impl OmpBridge {
                                         record: record.clone(),
                                         event: None,
                                         approval_error: false,
+                                        received: parse_start,
                                     }
                                 };
                                 let _ = sender.send(event);
@@ -230,6 +332,7 @@ impl OmpBridge {
                             record,
                             event,
                             approval_error,
+                            received: parse_start,
                         })
                         .is_err()
                     {
@@ -244,38 +347,72 @@ impl OmpBridge {
         // Request incremental updates rather than repeatedly transmitting the
         // entire growing message. Older OMP versions may reject this optional
         // projection; their ordinary full updates contain the same deltas.
+        let mut session_events = vec![
+            "message_update",
+            "tool_execution_start",
+            "tool_execution_update",
+            "tool_execution_end",
+            "auto_retry_start",
+            "auto_retry_end",
+            "auto_compaction_start",
+            "auto_compaction_end",
+            "session_info_update",
+            "command_output",
+        ];
+        if timing_enabled {
+            session_events.extend(["cache_warming_start", "cache_warming_end"]);
+        }
         writer.send_json(json!({
             "type": "set_event_filter", "id": "kathamo-event-filter",
-            "events": null, "messageUpdates": "delta"
+            "events": session_events, "messageUpdates": "delta"
         }))?;
         let _ = writer.send_json(json!({
             "type": "set_cache_warming", "id": "kathamo-cache-warming", "mode": "idle"
         }));
         let _ = writer.send_json(json!({
-            "type": "set_thinking_level", "id": "kathamo-thinking-level", "level": "low"
+            "type": "set_thinking_level", "id": "kathamo-thinking-level", "level": thinking_level
         }));
         // Worker messages are emitted separately from the parent transcript.
         let _ = writer.send_json(json!({"type": "set_subagent_subscription", "id": "kathamo-subagents", "level": "events"}));
         // Learn where this session is stored so its generated title can be read.
         let _ = writer.send_json(json!({"type": "get_state", "id": "kathamo-state"}));
-        Ok(Self {
+        Ok(Self::new(
             child,
             writer,
             events,
-            sender: bridge_sender,
+            bridge_sender,
+            trace_id,
+            provider,
+        ))
+    }
+
+    fn new(
+        child: Child,
+        writer: AgentWriter,
+        events: mpsc::Receiver<Incoming>,
+        sender: mpsc::Sender<Incoming>,
+        trace_id: u64,
+        provider: &str,
+    ) -> Self {
+        Self {
+            child,
+            writer,
+            events,
+            sender,
             next_id: 0,
             trace_id,
             pending_prompt: None,
             closed: false,
             session_file: None,
             title: None,
+            auto_title: provider != "google-antigravity",
             title_requested: false,
             title_in_flight: false,
             title_read_in_flight: false,
             live_workers: HashMap::new(),
             worker_changed: false,
             worker_requests: HashMap::new(),
-        })
+        }
     }
 
     pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
@@ -353,6 +490,18 @@ impl OmpBridge {
             match incoming {
                 Incoming::Error(error) => events.push(AgentEvent::Error(error)),
                 Incoming::Delta(event) => events.push(event),
+                Incoming::WorkerDelta {
+                    id,
+                    role,
+                    text,
+                    timestamp,
+                } => {
+                    self.worker_changed |= self.live_workers.entry(id).or_default().apply_delta(
+                        role,
+                        Some(&text),
+                        timestamp,
+                    );
+                }
                 Incoming::TitleRead(title) => {
                     self.title_read_in_flight = false;
                     if let Some(title) = title
@@ -384,7 +533,8 @@ impl OmpBridge {
                     record,
                     event,
                     approval_error,
-                } => self.handle_record(&record, event, approval_error, &mut events),
+                    received,
+                } => self.handle_record(&record, event, approval_error, received, &mut events),
             }
         }
         crate::agent_bridge::signal_wake();
@@ -446,6 +596,7 @@ impl OmpBridge {
         record: &Value,
         event: Option<AgentEvent>,
         approval_error: bool,
+        received: std::time::Instant,
         events: &mut Vec<AgentEvent>,
     ) {
         if record["type"] == "response"
@@ -467,6 +618,14 @@ impl OmpBridge {
             .pending_prompt
             .as_deref()
             .is_some_and(|id| record["id"].as_str() == Some(id));
+        if matching_prompt
+            && record["type"] == "response"
+            && record["command"] == "prompt"
+            && record["success"] == true
+            && record["data"]["agentInvoked"] != false
+        {
+            crate::stream_timing::omp_prompt_admitted(self.trace_id, received);
+        }
         match record["type"].as_str().unwrap_or("") {
             "response" if record["command"] == "get_state" => {
                 if let Some(path) = record["data"]["sessionFile"].as_str() {
@@ -541,7 +700,7 @@ impl OmpBridge {
                 // OMP only names a session when asked. Ask once, after the
                 // first completed turn, so the sidebar gets the agent's own
                 // title instead of a prompt excerpt.
-                if !self.title_requested {
+                if self.auto_title && !self.title_requested {
                     self.title_requested = true;
                     self.title_in_flight = true;
                     let _ = self.send(json!({"type": "prompt", "message": "/rename"}));
@@ -756,6 +915,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compact_worker_updates_preserve_delta_and_timestamp() {
+        let snapshot = "already streamed ".repeat(4_096);
+        let frame = json!({
+            "payload": {
+                "id": "worker",
+                "event": {
+                    "type": "message_update",
+                    "message": {"timestamp": 42, "content": [{"text": snapshot}]},
+                    "assistantMessageEvent": {
+                        "type": "thinking_delta",
+                        "delta": "next\nline",
+                        "partial": {"content": [{"thinking": snapshot}]}
+                    }
+                }
+            }
+        });
+        let frame: WorkerFrame = serde_json::from_str(&frame.to_string()).unwrap();
+        assert_eq!(frame.payload.event.kind, "message_update");
+        let Some(Incoming::WorkerDelta {
+            id,
+            role,
+            text,
+            timestamp,
+        }) = frame.payload.into_delta()
+        else {
+            panic!("worker delta missing");
+        };
+        let mut worker = crate::subagent_chat::LiveWorker::default();
+        assert!(worker.apply_delta(role, Some(&text), timestamp));
+        let message = worker.messages_with_history(&[]).next().unwrap();
+        assert_eq!(id, "worker");
+        assert_eq!(message.text, "next\nline");
+        assert_eq!(message.source_timestamp, Some(42));
+        assert!(message.streaming);
+    }
+
+    #[test]
     fn independent_workers_publish_rows_and_stream_before_either_finishes() {
         use crate::subagent_chat::{LiveWorker, rows};
         let mut workers = HashMap::<String, LiveWorker>::new();
@@ -827,6 +1023,72 @@ mod tests {
         assert_eq!(rows[1].worker.status_label(), "Running");
         assert!(!workers["Alpha"].active);
         assert!(workers["Bravo"].active);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_uses_the_prompt_title_and_allows_manual_rename() {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+
+        for provider in ["google-antigravity", "xai-oauth"] {
+            let mut child = std::process::Command::new("cat")
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let writer = AgentWriter::spawn(child.stdin.take().unwrap(), |_| {});
+            let (sender, receiver) = mpsc::channel();
+            let mut bridge = OmpBridge::new(child, writer, receiver, sender, 0, provider);
+            let mut chat = crate::PaneChat::default();
+            chat.set_prompt_title("First prompt".into());
+            bridge.send_prompt("First prompt").unwrap();
+            let mut events = Vec::new();
+            bridge.handle_record(
+                &json!({"type":"prompt_result","id":"kathamo-1","status":"completed"}),
+                None,
+                false,
+                std::time::Instant::now(),
+                &mut events,
+            );
+            assert!(matches!(events.as_slice(), [AgentEvent::Done]));
+            assert_eq!(chat.conversation_title(), Some("First prompt"));
+
+            if provider == "google-antigravity" {
+                bridge.send_prompt("/rename Explicit title").unwrap();
+                bridge.handle_record(
+                    &json!({"type":"session_info_update","title":"Explicit title"}),
+                    None,
+                    false,
+                    std::time::Instant::now(),
+                    &mut events,
+                );
+                let Some(AgentEvent::Title(title)) = events.pop() else {
+                    panic!("expected the explicit title");
+                };
+                chat.set_agent_title(title);
+                assert_eq!(chat.conversation_title(), Some("Explicit title"));
+            }
+
+            bridge.writer.shutdown();
+            let mut output = String::new();
+            stdout.read_to_string(&mut output).unwrap();
+            let commands: Vec<Value> = output
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(commands.len(), 2);
+            assert_eq!(
+                commands[1]["message"],
+                if provider == "google-antigravity" {
+                    "/rename Explicit title"
+                } else {
+                    "/rename"
+                }
+            );
+        }
     }
 
     #[test]

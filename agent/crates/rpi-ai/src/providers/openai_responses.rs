@@ -878,11 +878,32 @@ impl ResponsesStreamState {
                             .join("\n\n")
                     })
                     .unwrap_or_default();
-                if let Some(Content::Thinking(block)) = out.content.get_mut(slot.content_index) {
-                    if !summary_text.is_empty() {
-                        block.thinking = summary_text;
-                    } else if !content_text.is_empty() {
-                        block.thinking = content_text;
+                let final_thinking = if summary_text.is_empty() {
+                    content_text
+                } else {
+                    summary_text
+                };
+                if let Some(Content::Thinking(block)) = out
+                    .content
+                    .get_mut(slot.content_index)
+                    .filter(|_| !final_thinking.is_empty())
+                {
+                    // Some endpoints supply reasoning only in the completed item.
+                    // Forward that visible text through the same delta path.
+                    let unseen = if block.thinking.trim().is_empty() {
+                        Some(final_thinking.as_str())
+                    } else {
+                        final_thinking.strip_prefix(block.thinking.as_str())
+                    };
+                    let delta = unseen.filter(|text| !text.is_empty()).map(str::to_owned);
+                    block.thinking = final_thinking;
+                    if let Some(delta) = delta {
+                        p.push(AssistantMessageEvent::ThinkingDelta {
+                            content_index: slot.content_index,
+                            delta,
+                            partial: Arc::new(out.clone()),
+                        })
+                        .await;
                     }
                 }
                 if let Some(Content::Thinking(block)) = out.content.get_mut(slot.content_index) {
@@ -1883,6 +1904,9 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
     if model.reasoning {
         if let Some(e) = reasoning_effort(model, opts.reasoning_level()) {
             body["reasoning"] = json!({"effort":e});
+            if model.base_url.trim_end_matches('/') == "https://api.openai.com/v1" {
+                body["reasoning"]["summary"] = json!("auto");
+            }
         }
     }
     if !ctx.tools.is_empty() {
@@ -3808,9 +3832,23 @@ mod tests {
         assert_eq!(body["input"][0]["content"][0]["text"], "visible reasoning");
     }
 
+    #[test]
+    fn reasoning_summaries_are_requested_on_the_official_endpoint() {
+        let mut model = model();
+        model.reasoning = true;
+        let ctx = Context::new(Vec::new());
+        let opts = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::Low),
+            ..SimpleStreamOptions::default()
+        };
+        assert!(build_request(&model, &ctx, &opts)["reasoning"]["summary"].is_null());
+        model.base_url = "https://api.openai.com/v1".into();
+        assert_eq!(build_request(&model, &ctx, &opts)["reasoning"]["summary"], "auto");
+    }
+
     #[tokio::test]
     async fn reasoning_content_fills_when_summary_is_absent() {
-        let (mut producer, _stream) = create_assistant_message_event_stream();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
         state
@@ -3833,6 +3871,14 @@ mod tests {
                 &mut producer,
             )
             .await;
+        assert!(matches!(
+            stream.next().await,
+            Some(AssistantMessageEvent::ThinkingStart { .. })
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(AssistantMessageEvent::ThinkingDelta { delta, .. }) if delta == "from content"
+        ));
         assert!(matches!(
             &output.content[0],
             Content::Thinking(thinking) if thinking.thinking == "from content"

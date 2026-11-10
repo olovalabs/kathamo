@@ -173,6 +173,41 @@ from the upstream library crates.
 See `EMBEDDED_AGENT.md` for the upstream commit, integration details, verification
 and remaining limitations.
 
+### 2.7 Bundled OMP backend (`src/omp_bridge.rs`)
+
+The Kathamo provider uses a pinned OMP executable over RPC JSONL, not an
+in-process Rust embedding. The GPUI presentation and persisted `AgentEvent`
+contract remain shared with rpi.
+
+- **Execution.** Startup passes the chosen reasoning level and explicit
+  approval policy. System instructions favor independent read/search batches
+  and deterministic multi-step local scripts while retaining upstream's
+  shared/exclusive tool barriers, tools, extensions and context discovery.
+- **Backpressure.** `src/omp_bridge_queue.rs` holds at most 1,024 records.
+  Adjacent same-channel text/reasoning (including compatible worker deltas)
+  merges up to 16 KiB. New cumulative snapshots supersede the same call's old
+  snapshot only within an uninterrupted snapshot run. Structural boundaries
+  and full terminal results are never discarded. Producers wait for capacity;
+  UI drains use a nonblocking lock and retain the per-frame record budget.
+- **Interactions.** `src/omp_bridge_ui.rs` owns transient request IDs and
+  deadlines independently of transcript events. GPUI dialogs answer the pinned
+  select/confirm/input/editor/ask protocol. Stale, cancelled, expired and
+  mismatched responses cannot grant permission. Pane/backend replacement binds
+  callbacks to the originating bridge rather than a reusable dialog ID.
+- **Trust.** Canonical project paths are explicitly trusted in user settings,
+  never inferred from workspace content. Protected sessions use `write`;
+  confirmed trusted sessions use `yolo`. Working directories must remain
+  canonically inside the trusted project. This selects approval policy, not OS
+  confinement; active turns keep their authority until completion/cancellation.
+- **Timing.** Only `KATHAMO_STREAM_TIMINGS=1` installs the managed
+  `assets/integrations/omp-timing.mjs` extension. Native before-request and
+  after-response hooks emit elapsed time/status, never payload/header/secret
+  data. Reader observations distinguish argument completion from tool start,
+  and correlate completion with the next provider request/model delta. UI
+  markers retain arrival→apply/card/output measurements. Missing observations
+  are not replaced with inferred durations.
+
+
 ---
 
 ## 3. Data Flow: Agent Event to UI Update

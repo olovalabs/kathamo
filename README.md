@@ -130,10 +130,14 @@ Chat autoscrolling dynamically stays pinned to the bottom during live streaming 
 asynchronous Markdown layout changes; scrolling up pauses autoscroll so you can read
 earlier history without being yanked down, showing a floating "Scroll to bottom" button.
 Agent processes are pre-warmed when entering Agent mode or choosing a model, and
-idle cache warming is enabled so prompts do not wait for cold starts. A **⚡ Fast**
-toggle in the bottom bar (or `/fast`, `/thinking <level>`) configures low reasoning
-effort for fast responses, with a single click to switch to **🧠 Deep** reasoning.
-Interactive rpi extension dialogs are not supported and are cancelled.
+idle cache warming reduces cold-request overhead. For OMP-backed Kathamo models,
+the **Fast / Deep** control changes reasoning without changing the model.
+`/thinking off|minimal|low|medium|high|xhigh|max|auto` selects an explicit effort;
+`/thinking inherit` defers to OMP's inherited reasoning selector. The Fast / Deep
+control clears the override and restores the preset. Effort is saved per pane;
+available reasoning levels still depend on the provider/model.
+Fast mode retains the Antigravity Flash medium-level exception for visible
+reasoning. Embedded rpi does not currently expose these live controls.
 
 Type `/auth` in agent mode to open the provider authentication dialog. Select an
 unauthenticated provider to start login, then follow its instructions; input is
@@ -162,6 +166,57 @@ The Kathamo provider works without a system `omp` command. Its runtime, provider
 login database, and sessions live under the Kathamo data directory's
 `provider/` folder. Sign in through Kathamo to create credentials for this
 store. API keys previously saved through Kathamo remain available.
+
+#### Tool execution and workspace trust
+
+OMP keeps its full tool and extension discovery. Independent reads/searches
+are requested together and use its existing shared/exclusive scheduler.
+Conflicting edits and dependent work stay ordered. Deterministic local steps
+can run in one shell/Python invocation instead of adding a model round trip
+for every step. These are execution instructions, not a guarantee that a model
+will always choose the optimal batch.
+
+OMP tool approvals, selections, confirmations, text/editor inputs and structured
+questions appear in native dialogs. Cancel/Escape denies or cancels; merely
+opening a dialog does not grant permission. Responses are transient and are not
+saved in conversation history. Embedded rpi extension dialogs remain unavailable.
+
+New OMP workspaces use protected `write` approval mode. The workspace trust
+control requires explicit confirmation before enabling `yolo` mode for that
+canonical project path. **Trusted mode is not a sandbox:** tools and extensions
+run with your OS account's authority, including access outside the project.
+Trust/revocation during an active turn takes effect when that turn finishes;
+Stop cancels active work. Trust never silently applies to a different project
+or an escaped/symlinked working directory.
+
+#### Measuring tool latency
+
+Launch with `KATHAMO_STREAM_TIMINGS=1` to print metadata-only timing percentiles.
+OMP instrumentation measures request-hook → response headers, tool-argument
+completion, tool-start/end records, subsequent requests/deltas and UI apply/paint.
+Tool start/end includes approval and preparation, not just the command's CPU time.
+Receive-side timings include transport delay; HTTP-hook timing includes
+preparation/retries and is not server-only latency. Unsupported/missing hooks
+remain unavailable. Prompts, arguments, credentials and response headers are
+never included in these timing reports.
+
+An isolated local fixture verifies real OMP reads, a two-step shell command,
+one-shot approvals and provider timing without using your accounts:
+
+```bash
+python3 scripts/bench-omp-tools.py /absolute/path/to/kathamo-provider --samples 3
+```
+
+`--approval-mode yolo` exercises explicitly trusted execution inside that
+disposable fixture. `--bridge-test` additionally accepts the test executable
+printed by `cargo test --locked --bin kathamo --no-run` to exercise Kathamo's
+actual adapter. `scripts/bench_antigravity.py` remains the opt-in comparison
+against the real Antigravity provider and uses your account.
+
+The reader queue coalesces deltas and cumulative tool snapshots before UI
+enqueue, retains full results and preserves lifecycle boundaries. This reduces
+local overhead; it cannot guarantee faster remote inference or a fixed speedup.
+
 
 ---
 

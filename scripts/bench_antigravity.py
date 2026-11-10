@@ -24,42 +24,24 @@ import time
 
 
 MODEL = "google-antigravity/gemini-3.8-flash"
-PROBE_PREFIX = "kathamo-benchmark-http:"
+PROBE_PREFIX = "kathamo-timing:"
+TIMING_EXTENSION = Path(__file__).resolve().parents[1] / "assets/integrations/omp-timing.mjs"
 EVENTS = [
-    "turn_start", "message_update", "auto_retry_start", "tool_execution_end",
+    "turn_start", "message_update", "auto_retry_start", "tool_execution_start", "tool_execution_end",
 ]
 WORKLOADS = {
     "short": "Find the smallest positive integer with exactly twelve positive divisors. Return just the integer.",
     "read": "Use the read tool to inspect alpha.txt and beta.txt. Return their two numbers in order. Do not change any files.",
 }
-EXTENSION = """
-export default (pi) => {
-    let notify;
-    pi.on("before_provider_request", (_, ctx) => {
-        notify = (metric) => ctx.ui.notify(
-            "kathamo-benchmark-http:" + JSON.stringify(metric), "info",
-        );
-    });
-    globalThis.fetch = new Proxy(globalThis.fetch, {
-        async apply(fetch, receiver, args) {
-            const url = new URL(args[0]?.url ?? args[0], "https://invalid.invalid");
-            if (!["cloudcode-pa.googleapis.com", "daily-cloudcode-pa.googleapis.com"].includes(url.hostname)
-                || url.pathname !== "/v1internal:streamGenerateContent") {
-                return Reflect.apply(fetch, receiver, args);
-            }
-            const start = performance.now();
-            const report = notify;
-            let response;
-            try {
-                response = await Reflect.apply(fetch, receiver, args);
-            } finally {
-                report?.({status: response?.status ?? null, elapsed_ms: performance.now() - start});
-            }
-            return response;
-        },
-    });
-};
-"""
+@dataclass
+class ToolCycle:
+    request_ms: float | None = None
+    arguments_ms: float | None = None
+    start_ms: float | None = None
+    end_ms: float | None = None
+    next_request_ms: float | None = None
+    next_delta_ms: float | None = None
+    failed: bool = False
 
 
 @dataclass
@@ -73,6 +55,17 @@ class Turn:
     reads: int = 0
     outcome: str = "timeout"
     http: list = field(default_factory=list)
+    provider_requests: list = field(default_factory=list)
+    tools: dict = field(default_factory=dict)
+
+    def tool_cycle(self, tool_id):
+        if not isinstance(tool_id, str) or not tool_id:
+            return None
+        if tool_id not in self.tools:
+            self.tools[tool_id] = ToolCycle(
+                request_ms=self.provider_requests[-1] if self.provider_requests else None,
+            )
+        return self.tools[tool_id]
 
     def consume(self, frame, prompt_id, elapsed):
         kind = frame.get("type")
@@ -84,20 +77,39 @@ class Turn:
             self.model_rounds += 1
         elif kind == "auto_retry_start":
             self.retries += 1
-        elif kind == "tool_execution_end" and frame.get("toolName") == "read" and not frame.get("isError"):
-            self.reads += 1
+        elif kind == "tool_execution_start":
+            if cycle := self.tool_cycle(frame.get("toolCallId")):
+                cycle.start_ms = elapsed
+        elif kind == "tool_execution_end":
+            if frame.get("toolName") == "read" and not frame.get("isError"):
+                self.reads += 1
+            if cycle := self.tool_cycle(frame.get("toolCallId")):
+                cycle.end_ms = elapsed
+                cycle.failed = bool(frame.get("isError"))
         elif kind == "message_update":
             event = frame.get("assistantMessageEvent", {})
+            if event.get("type") == "toolcall_end":
+                if cycle := self.tool_cycle(event.get("toolCall", {}).get("id")):
+                    cycle.arguments_ms = elapsed
             if event.get("delta", "").strip():
                 if event.get("type") == "thinking_delta" and self.first_reasoning_ms is None:
                     self.first_reasoning_ms = elapsed
                 if event.get("type") == "text_delta" and self.first_answer_ms is None:
                     self.first_answer_ms = elapsed
+                for cycle in self.tools.values():
+                    if cycle.end_ms is not None and cycle.next_delta_ms is None:
+                        cycle.next_delta_ms = elapsed
         elif kind == "extension_ui_request" and frame.get("method") == "notify":
             message = frame.get("message", "")
             if message.startswith(PROBE_PREFIX):
                 metric = json.loads(message[len(PROBE_PREFIX):])
-                self.http.append((metric["status"], metric["elapsed_ms"]))
+                if metric.get("event") == "provider_request":
+                    self.provider_requests.append(elapsed)
+                    for cycle in self.tools.values():
+                        if cycle.end_ms is not None and cycle.next_request_ms is None:
+                            cycle.next_request_ms = elapsed
+                elif metric.get("event") == "http_headers":
+                    self.http.append((metric.get("status"), metric["elapsed_ms"]))
         elif kind == "prompt_result" and frame.get("id") == prompt_id:
             status = frame.get("status")
             return self.finish(status if status in {"completed", "aborted", "cancelled", "error"} else "unknown", elapsed)
@@ -137,7 +149,7 @@ def read_frames(stdout, frames):
         frames.put((time.monotonic(), None))
 
 
-def run_turn(process, frames, prompt_id, prompt, start, timeout):
+def run_turn(process, frames, prompt_id, prompt, start, timeout, ui_handler=None):
     result = Turn()
     try:
         process.stdin.write((json.dumps({"id": prompt_id, "type": "prompt", "message": prompt}) + "\n").encode())
@@ -154,6 +166,8 @@ def run_turn(process, frames, prompt_id, prompt, start, timeout):
         if frame is None:
             result.finish("rpc_closed", elapsed)
             return result
+        if elapsed >= 0 and ui_handler and frame.get("type") == "extension_ui_request":
+            ui_handler(process, frame)
         if elapsed >= 0 and result.consume(frame, prompt_id, elapsed):
             return result
     result.finish("timeout", (time.monotonic() - start) * 1000)
@@ -166,7 +180,7 @@ def run_pair(runtime, root, workload, effort, timeout):
         (workspace / "alpha.txt").write_text("113\n", encoding="utf-8")
         (workspace / "beta.txt").write_text("127\n", encoding="utf-8")
         extension = workspace / "http-probe.mjs"
-        extension.write_text(EXTENSION, encoding="utf-8")
+        extension.write_text(TIMING_EXTENSION.read_text(encoding="utf-8"), encoding="utf-8")
         tool_args = ["--no-tools"] if workload == "short" else ["--tools", "read"]
         command = [str(runtime), "--mode", "rpc", "--model", MODEL, "--no-session",
                    "--thinking", effort, "--extension", str(extension), *tool_args]
@@ -201,6 +215,13 @@ def stats(values):
 def summarize(turns):
     successful = [turn for turn in turns if turn.outcome == "completed"]
     http = [(status, elapsed) for turn in turns for status, elapsed in turn.http]
+    cycles = [cycle for turn in successful for cycle in turn.tools.values()]
+    def durations(start, end):
+        return stats(
+            getattr(cycle, end) - getattr(cycle, start)
+            for cycle in cycles
+            if getattr(cycle, start) is not None and getattr(cycle, end) is not None
+        )
     return {
         "samples": len(turns),
         "outcomes": dict(Counter(turn.outcome for turn in turns)),
@@ -210,10 +231,21 @@ def summarize(turns):
         "total_ms": stats(turn.total_ms for turn in successful),
         "model_rounds": stats(turn.model_rounds for turn in successful),
         "read_calls": stats(turn.reads for turn in successful),
+        "provider_requests": stats(len(turn.provider_requests) for turn in successful),
+        "tool_cycles": {
+            "completed": sum(cycle.end_ms is not None for cycle in cycles),
+            "failed": sum(cycle.failed for cycle in cycles),
+            "request_to_arguments_ms": durations("request_ms", "arguments_ms"),
+            "arguments_to_start_ms": durations("arguments_ms", "start_ms"),
+            "execution_ms": durations("start_ms", "end_ms"),
+            "request_to_end_ms": durations("request_ms", "end_ms"),
+            "end_to_next_request_ms": durations("end_ms", "next_request_ms"),
+            "end_to_next_delta_ms": durations("end_ms", "next_delta_ms"),
+        },
         "retry_events": sum(turn.retries for turn in turns),
         "http_status_counts": dict(Counter(str(status) if status is not None else "transport_error"
                                           for status, _ in http)),
-        "http_headers_ms": stats(elapsed for status, elapsed in http if status is not None),
+        "provider_request_to_headers_ms": stats(elapsed for status, elapsed in http if status is not None),
     }
 
 

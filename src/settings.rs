@@ -11,7 +11,7 @@ use gpui::{Bounds, Pixels, Size, WindowBounds, point, px, size};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 const DEFAULT_WINDOW_WIDTH: f32 = 1200.0;
@@ -123,6 +123,8 @@ pub struct AppSettings {
     pub theme: ThemePreference,
     pub palette_scheme: PaletteScheme,
     pub default_agent_model: Option<AgentModel>,
+    /// Explicit OMP-only execution opt-ins, scoped to canonical workspace paths.
+    pub trusted_omp_workspaces: Vec<PathBuf>,
     pub sidebar: SavedSidebar,
     pub window: Option<SavedWindow>,
     pub restore: RestoreOptions,
@@ -135,6 +137,7 @@ impl Default for AppSettings {
             theme: ThemePreference::default(),
             palette_scheme: PaletteScheme::default(),
             default_agent_model: None,
+            trusted_omp_workspaces: Vec::new(),
             sidebar: SavedSidebar::default(),
             window: None,
             restore: RestoreOptions::default(),
@@ -296,6 +299,7 @@ mod tests {
         let settings = AppSettings {
             theme: ThemePreference::Dark,
             palette_scheme: PaletteScheme::Github,
+            trusted_omp_workspaces: vec![PathBuf::from("/tmp/explicit-workspace")],
             sidebar: SavedSidebar {
                 visible: false,
                 width: 300.0,
@@ -317,6 +321,13 @@ mod tests {
         let text = serde_json::to_string(&settings).unwrap();
         let restored: AppSettings = serde_json::from_str(&text).unwrap();
         assert_eq!(settings, restored);
+    }
+
+    #[test]
+    fn legacy_settings_never_grant_omp_trust() {
+        let settings: AppSettings = serde_json::from_str(r#"{"version":1,"theme":"dark"}"#).unwrap();
+        assert!(settings.trusted_omp_workspaces.is_empty());
+        assert!(AppSettings::default().trusted_omp_workspaces.is_empty());
     }
 
     #[test]

@@ -95,6 +95,8 @@ pub struct SavedModelChat {
 pub struct SavedChat {
     #[serde(default = "default_true")]
     pub fast_mode: bool,
+    /// Exact OMP reasoning effort; absent means the Fast/Deep preset.
+    pub thinking_override: Option<String>,
     pub selected_model: Option<AgentModel>,
     /// True when `selected_model` is a deliberate choice, so `None` can mean
     /// "Automatic (rpi)" instead of "never picked one".
@@ -124,6 +126,7 @@ impl Default for SavedChat {
     fn default() -> Self {
         Self {
             fast_mode: true,
+            thinking_override: None,
             selected_model: None,
             model_explicit: false,
             agent_title: None,
@@ -607,6 +610,13 @@ pub fn max_scrollback_lines() -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn legacy_chat_defaults_to_presets_without_an_effort_override() {
+        let chat: SavedChat = serde_json::from_str(r#"{"fast_mode":false}"#).unwrap();
+        assert!(!chat.fast_mode);
+        assert!(chat.thinking_override.is_none());
+    }
+
     const LEGACY: &str = r#"{
         "projects": [
             {"path": "/tmp/one", "name": "one", "expanded": true},
@@ -682,6 +692,7 @@ mod tests {
                             chat_active: true,
                             chat: SavedChat {
                                 fast_mode: false,
+                                thinking_override: Some("max".into()),
                                 selected_model: Some(AgentModel {
                                     provider: "xai-oauth".into(),
                                     id: "grok-4.7".into(),

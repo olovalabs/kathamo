@@ -2,16 +2,34 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::mpsc;
+#[path = "omp_bridge_ui.rs"]
+mod extension_ui;
+#[path = "omp_bridge_queue.rs"]
+mod queue;
 use std::thread;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::agent_bridge::{AgentEvent, coalesce_events, decode_message_update, decode_tool_event};
+use crate::agent_bridge::{AgentEvent, decode_message_update, decode_tool_event};
 use crate::agent_writer::AgentWriter;
 
-const WORKER_PROMPT: &str = r#"## Parallel subagents
+const WORKER_PROMPT: &str = r#"## Efficient, ordered execution
+Batch independent reads and searches in the same tool turn. OMP already runs
+shared tools concurrently and respects exclusive-tool barriers; do not serialize
+independent calls by waiting between them. Never overlap conflicting edits:
+order changes to the same file or dependent state, and inspect results before
+dependent work.
+For a deterministic sequence of local computations, use one bash or Python
+invocation with explicit dependencies, exit-on-error behavior and a concise
+result summary, rather than separate model round trips for every step. Use the
+existing specialized tools for file reads, searches and edits. Bound output at
+the source to the relevant fields/ranges; retain complete required results in
+an artifact and report its path when the full output is needed. Never silently
+truncate evidence or skip a required step. Keep provider tools, extensions and
+workspace context discovery available; do not replace their capabilities.
+
+## Parallel subagents
 When delegation is useful, start independent assignments together in one task batch
 using the tasks array when available. Use background tasks when supported. Start all
 independent workers before waiting for any result. Wait early only when a later
@@ -66,12 +84,13 @@ enum Incoming {
     Record {
         record: Value,
         event: Option<AgentEvent>,
-        /// Precomputed on the reader thread: this failed tool result is an
-        /// approval request that this view could not answer.
+        /// Precomputed on the reader thread for actionable approval failures.
         approval_error: bool,
         received: std::time::Instant,
     },
     Error(String),
+    /// A protocol block/lifecycle boundary with no transcript payload.
+    Boundary,
     /// A background read of OMP's session-file title finished.
     TitleRead(Option<String>),
     Closed,
@@ -99,8 +118,9 @@ impl WorkerPayload {
 pub struct OmpBridge {
     child: Child,
     writer: AgentWriter,
-    events: mpsc::Receiver<Incoming>,
-    sender: mpsc::Sender<Incoming>,
+    events: queue::Receiver,
+    sender: queue::Sender,
+    ui_requests: extension_ui::UiRequests,
     next_id: u64,
     trace_id: u64,
     pending_prompt: Option<String>,
@@ -124,7 +144,12 @@ pub struct OmpBridge {
 }
 
 impl OmpBridge {
-    pub fn spawn(cwd: &Path, model: &str, thinking_level: &str) -> Result<Self, String> {
+    pub fn spawn(
+        cwd: &Path,
+        model: &str,
+        thinking_level: &str,
+        trusted: bool,
+    ) -> Result<Self, String> {
         let model = model.trim();
         if model.is_empty() {
             return Err("No model was selected".into());
@@ -141,8 +166,16 @@ impl OmpBridge {
         let prepare_start = std::time::Instant::now();
         let mut command = crate::provider::runtime::command()?;
         crate::provider::auth::storage::sync_api_key(provider)?;
+        let timing_enabled = crate::stream_timing::enabled();
+        if timing_enabled {
+            command
+                .arg("--extension")
+                .arg(crate::stream_timing::omp_timing_extension()?);
+        }
         command
             .args(["--mode", "rpc", "--model", &selector])
+            .args(["--thinking", thinking_level])
+            .args(["--approval-mode", if trusted { "yolo" } else { "write" }])
             .args(["--append-system-prompt", &system_prompt])
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -165,7 +198,7 @@ impl OmpBridge {
         crate::stream_timing::record_since("engine.omp.spawn", spawn_start);
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
-        let (sender, events) = mpsc::channel();
+        let (sender, events) = queue::channel();
         let error_sender = sender.clone();
         let writer = AgentWriter::spawn(stdin, move |error| {
             let _ = error_sender.send(Incoming::Error(error));
@@ -174,8 +207,9 @@ impl OmpBridge {
         let bridge_sender = sender.clone();
         let reply_writer = writer.clone();
         let trace_id = crate::stream_timing::new_trace();
+        let ui_requests = extension_ui::UiRequests::default();
+        let reader_ui = ui_requests.clone();
         let reader_start = std::time::Instant::now();
-        let timing_enabled = crate::stream_timing::enabled();
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut cache_warming = None;
@@ -205,12 +239,11 @@ impl OmpBridge {
                             "bridge.omp.worker_update_decode",
                             parse_start,
                         );
-                        if let Some(update) = payload.into_delta() {
-                            if sender.send(update).is_err() {
-                                return;
-                            }
-                            crate::agent_bridge::signal_wake();
+                        let incoming = payload.into_delta().unwrap_or(Incoming::Boundary);
+                        if sender.send(incoming).is_err() {
+                            return;
                         }
+                        crate::agent_bridge::signal_wake();
                         continue;
                     }
                 }
@@ -246,6 +279,15 @@ impl OmpBridge {
                     _ => {}
                 }
                 if record["type"] == "message_update" {
+                    if record["assistantMessageEvent"]["type"] == "toolcall_end"
+                        && let Some(id) = record["assistantMessageEvent"]["toolCall"]["id"].as_str()
+                    {
+                        crate::stream_timing::omp_tool_arguments_complete(
+                            trace_id,
+                            id,
+                            parse_start,
+                        );
+                    }
                     if let Some(event) = decode_message_update(&record) {
                         match &event {
                             AgentEvent::Text(text) if !text.is_empty() => {
@@ -266,43 +308,102 @@ impl OmpBridge {
                             return;
                         }
                         crate::agent_bridge::signal_wake();
+                    } else {
+                        if sender.send(Incoming::Boundary).is_err() {
+                            return;
+                        }
+                        crate::agent_bridge::signal_wake();
                     }
                     continue;
                 }
                 if record["type"] == "extension_ui_request" {
-                    match record["method"].as_str().unwrap_or("") {
-                        "select" | "confirm" | "input" | "editor" | "ask" => {
-                            // Never approve a request that this UI cannot show or answer.
-                            let _ = sender.send(Incoming::Error(
-                                "The Kathamo provider requested an interactive dialog or tool approval, which is not supported in this view; the request was cancelled.".into(),
-                            ));
-                            crate::agent_bridge::signal_wake();
-                            if let Err(error) = reply_writer.send_json(json!({
-                                "type": "extension_ui_response", "id": record["id"], "cancelled": true
-                            })) {
-                                let _ = sender.send(Incoming::Error(error));
-                                crate::agent_bridge::signal_wake();
-                            }
-                        }
-                        "notify" => {
-                            if let Some(message) = record["message"].as_str() {
-                                let event = if record["notifyType"] == "error" {
-                                    Incoming::Error(message.to_owned())
-                                } else {
-                                    Incoming::Record {
-                                        record: record.clone(),
-                                        event: None,
-                                        approval_error: false,
-                                        received: parse_start,
+                    if record["method"] == "notify" {
+                        if timing_enabled
+                            && let Some(payload) = record["message"]
+                                .as_str()
+                                .and_then(|message| message.strip_prefix("kathamo-timing:"))
+                        {
+                            if let Ok(timing) = serde_json::from_str::<Value>(payload) {
+                                match timing["event"].as_str() {
+                                    Some("provider_request") => {
+                                        crate::stream_timing::omp_provider_request(
+                                            trace_id,
+                                            parse_start,
+                                        )
                                     }
-                                };
-                                let _ = sender.send(event);
-                                crate::agent_bridge::signal_wake();
+                                    Some("http_headers") => {
+                                        if let Some(elapsed) =
+                                            timing["elapsed_ms"].as_f64().filter(|elapsed| {
+                                                elapsed.is_finite() && *elapsed >= 0.0
+                                            })
+                                        {
+                                            let status = timing["status"]
+                                                .as_u64()
+                                                .and_then(|status| u16::try_from(status).ok());
+                                            crate::stream_timing::omp_http_headers(elapsed, status);
+                                        }
+                                    }
+                                    _ => {}
+                                }
                             }
+                            continue;
                         }
-                        _ => {}
+                        if let Some(message) = record["message"].as_str()
+                            && record["notifyType"] == "error"
+                        {
+                            let _ = sender.send(Incoming::Error(message.to_owned()));
+                        } else {
+                            let _ = sender.send(Incoming::Record {
+                                record,
+                                event: None,
+                                approval_error: false,
+                                received: parse_start,
+                            });
+                        }
+                    } else {
+                        reader_ui.receive(record, parse_start, &reply_writer);
+                        if sender.send(Incoming::Boundary).is_err() {
+                            return;
+                        }
                     }
+                    crate::agent_bridge::signal_wake();
                 } else {
+                    if record["type"] == "prompt_result"
+                        && let Some(id) = record["id"].as_str()
+                    {
+                        // A cancelled background title may finish after a new
+                        // prompt starts; only its own terminal result can close
+                        // that prompt's dialogs.
+                        reader_ui.finish_prompt(id, &reply_writer);
+                    }
+                    if matches!(
+                        record["type"].as_str(),
+                        Some(
+                            "message_start"
+                                | "message_end"
+                                | "agent_start"
+                                | "agent_end"
+                                | "turn_start"
+                                | "turn_end"
+                        )
+                    ) {
+                        if sender.send(Incoming::Boundary).is_err() {
+                            return;
+                        }
+                        crate::agent_bridge::signal_wake();
+                        continue;
+                    }
+                    if let Some(id) = record["toolCallId"].as_str() {
+                        match record["type"].as_str() {
+                            Some("tool_execution_start") => {
+                                crate::stream_timing::omp_tool_started(trace_id, id, parse_start)
+                            }
+                            Some("tool_execution_end") => {
+                                crate::stream_timing::omp_tool_cycle_end(trace_id, id, parse_start)
+                            }
+                            _ => {}
+                        }
+                    }
                     // Project tool payloads on the reader thread.
                     let project_start = std::time::Instant::now();
                     let event = match record["type"].as_str().unwrap_or("") {
@@ -341,6 +442,7 @@ impl OmpBridge {
                     crate::agent_bridge::signal_wake();
                 }
             }
+            reader_ui.invalidate(&reply_writer);
             let _ = sender.send(Incoming::Closed);
             crate::agent_bridge::signal_wake();
         });
@@ -349,6 +451,12 @@ impl OmpBridge {
         // projection; their ordinary full updates contain the same deltas.
         let mut session_events = vec![
             "message_update",
+            "message_start",
+            "message_end",
+            "agent_start",
+            "agent_end",
+            "turn_start",
+            "turn_end",
             "tool_execution_start",
             "tool_execution_update",
             "tool_execution_end",
@@ -369,11 +477,11 @@ impl OmpBridge {
         let _ = writer.send_json(json!({
             "type": "set_cache_warming", "id": "kathamo-cache-warming", "mode": "idle"
         }));
-        let _ = writer.send_json(json!({
-            "type": "set_thinking_level", "id": "kathamo-thinking-level", "level": thinking_level
-        }));
         // Worker messages are emitted separately from the parent transcript.
         let _ = writer.send_json(json!({"type": "set_subagent_subscription", "id": "kathamo-subagents", "level": "events"}));
+        let _ = writer.send_json(
+            json!({"type": "set_ask_dialog", "id": "kathamo-ask-dialog", "enabled": true}),
+        );
         // Learn where this session is stored so its generated title can be read.
         let _ = writer.send_json(json!({"type": "get_state", "id": "kathamo-state"}));
         Ok(Self::new(
@@ -381,6 +489,7 @@ impl OmpBridge {
             writer,
             events,
             bridge_sender,
+            ui_requests,
             trace_id,
             provider,
         ))
@@ -389,8 +498,9 @@ impl OmpBridge {
     fn new(
         child: Child,
         writer: AgentWriter,
-        events: mpsc::Receiver<Incoming>,
-        sender: mpsc::Sender<Incoming>,
+        events: queue::Receiver,
+        sender: queue::Sender,
+        ui_requests: extension_ui::UiRequests,
         trace_id: u64,
         provider: &str,
     ) -> Self {
@@ -399,6 +509,7 @@ impl OmpBridge {
             writer,
             events,
             sender,
+            ui_requests,
             next_id: 0,
             trace_id,
             pending_prompt: None,
@@ -431,12 +542,17 @@ impl OmpBridge {
         }
         self.next_id = self.next_id.wrapping_add(1);
         let id = format!("kathamo-{}", self.next_id);
-        self.writer.send_prompt(id.clone(), prompt.to_owned())?;
+        self.ui_requests.begin_prompt(&id);
+        if let Err(error) = self.writer.send_prompt(id.clone(), prompt.to_owned()) {
+            self.ui_requests.invalidate(&self.writer);
+            return Err(error);
+        }
         self.pending_prompt = Some(id);
         Ok(())
     }
 
     pub fn cancel(&mut self) -> Result<(), String> {
+        self.ui_requests.invalidate(&self.writer);
         self.send(json!({"type": "abort"})).map(|_| ())
     }
 
@@ -446,6 +562,22 @@ impl OmpBridge {
     pub fn set_thinking_level(&mut self, level: &str) -> Result<(), String> {
         self.send(json!({"type": "set_thinking_level", "level": level}))
             .map(|_| ())
+    }
+
+    /// Transient extension UI records are never persisted as agent events.
+    pub fn take_ui_requests(&mut self) -> Vec<Value> {
+        self.ui_requests.take(&self.writer)
+    }
+
+    pub fn respond_ui(&mut self, response: Value) -> Result<(), String> {
+        if self.closed {
+            return Err("The Kathamo provider process has exited".into());
+        }
+        self.ui_requests.respond(response, &self.writer)
+    }
+
+    pub fn is_ui_request_pending(&self, id: &str) -> bool {
+        !self.closed && self.ui_requests.is_pending(id)
     }
 
     fn send(&mut self, mut command: Value) -> Result<String, String> {
@@ -485,9 +617,10 @@ impl OmpBridge {
         // Leave a frame opportunity when several workers produce a burst.
         for _ in 0..256 {
             let Ok(incoming) = self.events.try_recv() else {
-                return coalesce_events(events);
+                return events;
             };
             match incoming {
+                Incoming::Boundary => {}
                 Incoming::Error(error) => events.push(AgentEvent::Error(error)),
                 Incoming::Delta(event) => events.push(event),
                 Incoming::WorkerDelta {
@@ -512,6 +645,7 @@ impl OmpBridge {
                     }
                 }
                 Incoming::Closed => {
+                    self.ui_requests.invalidate(&self.writer);
                     if !self.closed {
                         self.closed = true;
                         self.writer.close();
@@ -538,7 +672,7 @@ impl OmpBridge {
             }
         }
         crate::agent_bridge::signal_wake();
-        coalesce_events(events)
+        events
     }
 
     pub fn steer_worker(&mut self, id: &str, prompt: &str) -> Result<(), String> {
@@ -674,6 +808,7 @@ impl OmpBridge {
                 }
                 if matching_prompt && command == "prompt" {
                     self.pending_prompt = None;
+                    self.ui_requests.invalidate(&self.writer);
                     events.push(AgentEvent::Done);
                 }
             }
@@ -683,6 +818,7 @@ impl OmpBridge {
                     && record["data"]["agentInvoked"] == false =>
             {
                 // Built-in slash commands can be handled locally without a prompt_result.
+                self.ui_requests.invalidate(&self.writer);
                 self.pending_prompt = None;
                 events.push(AgentEvent::Done);
             }
@@ -696,6 +832,7 @@ impl OmpBridge {
                         "Kathamo provider request failed: {detail}"
                     )));
                 }
+                self.ui_requests.invalidate(&self.writer);
                 self.pending_prompt = None;
                 // OMP only names a session when asked. Ask once, after the
                 // first completed turn, so the sidebar gets the agent's own
@@ -736,7 +873,7 @@ impl OmpBridge {
                 }
                 if approval_error {
                     events.push(AgentEvent::Error(
-                        "The Kathamo provider could not obtain tool approval in this view.".into(),
+                        "The Kathamo provider could not obtain tool approval. Check the pending dialog or workspace execution setting.".into(),
                     ));
                 }
             }
@@ -793,6 +930,7 @@ impl OmpBridge {
                 ));
                 if record["originalType"] == "prompt_result" && self.pending_prompt.take().is_some()
                 {
+                    self.ui_requests.invalidate(&self.writer);
                     events.push(AgentEvent::Done);
                 }
             }
@@ -805,6 +943,8 @@ impl OmpBridge {
 
 impl Drop for OmpBridge {
     fn drop(&mut self) {
+        self.events.close();
+        self.ui_requests.invalidate(&self.writer);
         #[cfg(unix)]
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGKILL);
@@ -1040,8 +1180,16 @@ mod tests {
                 .unwrap();
             let mut stdout = child.stdout.take().unwrap();
             let writer = AgentWriter::spawn(child.stdin.take().unwrap(), |_| {});
-            let (sender, receiver) = mpsc::channel();
-            let mut bridge = OmpBridge::new(child, writer, receiver, sender, 0, provider);
+            let (sender, receiver) = queue::channel();
+            let mut bridge = OmpBridge::new(
+                child,
+                writer,
+                receiver,
+                sender,
+                extension_ui::UiRequests::default(),
+                0,
+                provider,
+            );
             let mut chat = crate::PaneChat::default();
             chat.set_prompt_title("First prompt".into());
             bridge.send_prompt("First prompt").unwrap();

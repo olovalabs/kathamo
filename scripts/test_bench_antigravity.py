@@ -10,7 +10,7 @@ from bench_antigravity import PROBE_PREFIX, run_turn, summarize
 
 def probe(status, elapsed_ms):
     return {"type": "extension_ui_request", "method": "notify", "message":
-            PROBE_PREFIX + json.dumps({"status": status, "elapsed_ms": elapsed_ms})}
+            PROBE_PREFIX + json.dumps({"event": "http_headers", "status": status, "elapsed_ms": elapsed_ms})}
 
 
 class AntigravityBenchmarkTest(unittest.TestCase):
@@ -39,7 +39,7 @@ class AntigravityBenchmarkTest(unittest.TestCase):
         self.assertEqual(report["model_rounds"]["median"], 2)
         self.assertEqual(report["retry_events"], 1)
         self.assertEqual(report["http_status_counts"], {"503": 1, "transport_error": 1, "200": 1})
-        self.assertEqual(report["http_headers_ms"], {"n": 2, "median": 500, "p95": 600})
+        self.assertEqual(report["provider_request_to_headers_ms"], {"n": 2, "median": 500, "p95": 600})
         self.assertEqual(report["first_reasoning_ms"], {"n": 0})
         self.assertEqual(report["first_answer_ms"]["median"], 8)
 
@@ -55,6 +55,43 @@ class AntigravityBenchmarkTest(unittest.TestCase):
         self.assertEqual(self.run_fixture(None).outcome, "rpc_closed")
         self.assertEqual(self.run_fixture({"type": "response", "id": "sample", "success": False}).outcome,
                          "rejected")
+
+    def test_overlapping_tools_keep_argument_and_execution_boundaries_separate(self):
+        turn = self.run_fixture(
+            {"type": "extension_ui_request", "method": "notify",
+             "message": PROBE_PREFIX + json.dumps({"event": "provider_request"})},
+            {"type": "message_update", "assistantMessageEvent":
+             {"type": "toolcall_end", "toolCall": {"id": "a"}}},
+            {"type": "message_update", "assistantMessageEvent":
+             {"type": "toolcall_end", "toolCall": {"id": "b"}}},
+            {"type": "tool_execution_start", "toolCallId": "b"},
+            {"type": "tool_execution_start", "toolCallId": "a"},
+            {"type": "tool_execution_end", "toolCallId": "a", "isError": True},
+            {"type": "tool_execution_end", "toolCallId": "b"},
+            {"type": "extension_ui_request", "method": "notify",
+             "message": PROBE_PREFIX + json.dumps({"event": "provider_request"})},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "done"}},
+            {"type": "prompt_result", "id": "sample", "status": "completed"},
+        )
+        cycles = summarize([turn])["tool_cycles"]
+        self.assertEqual(cycles["completed"], 2)
+        self.assertEqual(cycles["failed"], 1)
+        self.assertEqual(cycles["request_to_arguments_ms"]["median"], 1.5)
+        self.assertEqual(cycles["arguments_to_start_ms"]["median"], 2)
+        self.assertEqual(cycles["execution_ms"]["median"], 2)
+        self.assertEqual(cycles["end_to_next_request_ms"]["median"], 1.5)
+        self.assertEqual(cycles["end_to_next_delta_ms"]["median"], 2.5)
+
+    def test_missing_argument_boundary_is_not_inferred_from_tool_start(self):
+        turn = self.run_fixture(
+            {"type": "tool_execution_start", "toolCallId": "a"},
+            {"type": "tool_execution_end", "toolCallId": "a"},
+            {"type": "prompt_result", "id": "sample", "status": "completed"},
+        )
+        cycles = summarize([turn])["tool_cycles"]
+        self.assertEqual(cycles["execution_ms"]["median"], 1)
+        self.assertEqual(cycles["request_to_arguments_ms"], {"n": 0})
+        self.assertEqual(cycles["arguments_to_start_ms"], {"n": 0})
 
 
 if __name__ == "__main__":

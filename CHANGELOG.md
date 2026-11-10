@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Native OMP approval, selection, confirmation, text/editor and structured-question dialogs with cancellation, expiry and stale-session guards; interaction responses stay out of transcript persistence.
+- Explicit, confirmed workspace-scoped OMP trust: protected `write` by default, opt-in `yolo`, canonical-path checks and safe deferred authority changes during active turns.
+- Per-pane explicit OMP reasoning effort without changing models, alongside Fast/Deep presets.
+- Metadata-only OMP provider/argument/tool-cycle timings and `scripts/bench-omp-tools.py`, an isolated loopback fixture exercising real batched reads, local shell steps and approvals.
+- Center and enlarge the Kathamo wordmark on the empty Agent page; show only the selected model beneath it.
 - Zed-style per-platform app data directories (`src/paths.rs`): workspace, scrollback, agent conversations and backups under the OS data dir; user settings under the OS config dir. Missing folders are created on launch.
 - Full session restoration: projects, sidebar tabs, nested split layouts, focused pane, per-pane working directories, tab titles/logos, input drafts, command history, sidebar width and window geometry are saved and restored after a restart.
 - Terminal scrollback is snapshotted per pane and seeded above the fresh shell prompt on restore.
@@ -38,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Compact streamed OMP text, worker deltas and cumulative tool snapshots before enqueue with bounded backpressure, preserving tool lifecycle order and complete results.
+- Favor independent read/search batches and deterministic multi-step local execution while keeping OMP's shared/exclusive scheduling and full tool/extension discovery.
 - Redesigned the project sidebar with compact, smaller session titles without per-session logos, reduced left padding, subtle selection styling, and project/session remove buttons shown only while hovering their row. Each project initially shows five sessions; each "Show more" click reveals ten more, and "Show less" collapses back to five. Expanded lists scroll while the toolbar and Settings footer remain visible.
 - Poll active agent streams at approximately frame cadence while retaining the lower idle polling rate.
 - Migrated the application and terminal renderer to GPUI Fast.

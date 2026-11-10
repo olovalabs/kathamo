@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pre-warm agent bridge processes in the background upon switching to Agent mode or selecting a model.
 - Enable RPC idle cache warming and default to Fast mode (`low` thinking effort) for rapid responses, with an interactive `⚡ Fast`/`🧠 Deep` toggle and `/fast` / `/thinking` slash commands.
 - Model selector for rpi and Google Antigravity, with a persistent default provider/model for new panes.
+- Polish the agent composer with a contextual placeholder, a roomier input, hidden key hints, a pill-styled model picker, and the same overall height as the terminal composer.
 - Google Antigravity OAuth and model selection in `/auth`, with separate native chat sessions using the installed oh-my-pi agent.
 - `/auth` in agent mode opens provider discovery and authentication with masked input and rpi-managed credentials.
 - Native per-pane pi-rust agent chat with streamed replies, tool activity, cancellation, and a terminal/agent switch. Requires a separately installed and configured `rpi` executable.

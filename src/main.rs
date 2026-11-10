@@ -1505,7 +1505,7 @@ fn agent_startup_notice(error: &str) -> (String, String) {
 /// Assistant text stops streaming whenever the agent moves on to thinking,
 /// activity, a tool call, an error, or the end of the turn. The next text
 /// event starts a fresh streaming message, so completed text gets the full
-/// markdown render again.
+/// markdown render again. Completed thinking folds into its compact header.
 fn finish_chat_streaming(messages: &mut [Arc<ChatMessage>]) {
     // Only the newest message can be streaming: every other role calls this
     // before pushing, so scanning the whole transcript here is wasted work.
@@ -1515,6 +1515,9 @@ fn finish_chat_streaming(messages: &mut [Arc<ChatMessage>]) {
         let message = Arc::make_mut(message);
         message.streaming = false;
         message.stream = None;
+        if message.role == ChatRole::Thinking {
+            message.expanded = false;
+        }
     }
 }
 
@@ -5766,6 +5769,13 @@ impl AppState {
         pane.completion_menu = None;
         pane.history_index = None;
         pane.pending_draft.clear();
+        input.update(cx, |state, cx| {
+            state.set_placeholder(
+                if active { "Message the agent…" } else { "Run commands" },
+                window,
+                cx,
+            );
+        });
         set_input_text(&input, draft, window, cx);
         self.focus_pane(pane_id, window, cx);
         if active {
@@ -7209,7 +7219,11 @@ impl AppState {
         for project in &mut self.projects {
             for session in &mut project.sessions {
                 for pane in &mut session.panes {
-                    let placeholder = "Run commands";
+                    let placeholder = if pane.chat.active {
+                        "Message the agent…"
+                    } else {
+                        "Run commands"
+                    };
                     if let Some(input) = &pane.input_state {
                         input.update(cx, |state, cx| {
                             state.set_placeholder(placeholder, window, cx);
@@ -8613,8 +8627,9 @@ impl AppState {
         let input_element = if let Some(input_state) = &pane.input_state {
             div()
                 .id(("kathamo-input-wrapper", pane_id))
+                .debug_selector(|| "agent-composer-input".to_string())
                 .w_full()
-                .min_h(px(24.0))
+                .min_h(px(30.0))
                 .max_h(px(220.0))
                 .overflow_y_scrollbar()
                 .flex()
@@ -8658,7 +8673,7 @@ impl AppState {
             div()
                 .id(("kathamo-input-wrapper-empty", pane_id))
                 .w_full()
-                .min_h(px(24.0))
+                .min_h(px(30.0))
                 .into_any_element()
         };
 
@@ -8748,9 +8763,9 @@ impl AppState {
         } else {
             rgba(0x2d7a2d12).into()
         };
-
         div()
             .id(("kathamo-input-bar", pane_id))
+            .debug_selector(|| "kathamo-input-bar".to_string())
             .relative()
             .w_full()
             .flex()
@@ -8913,12 +8928,30 @@ impl AppState {
                             ),
                     )
                     .when(pane.chat.active, |row| row.child(
-                        div().id(("select-agent-model", pane_id))
-                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
-                            .text_size(px(11.0)).text_color(tokens.text_secondary)
+                        div()
+                            .id(("select-agent-model", pane_id))
+                            .debug_selector(|| "select-agent-model-pill".to_string())
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .h(px(24.0))
+                            .px(px(8.0))
+                            .rounded(px(5.0))
+                            .text_size(px(11.0))
+                            .text_color(tokens.text_primary)
+                            .bg(badge_bg)
+                            .border_1()
+                            .border_color(badge_border)
                             .cursor(CursorStyle::PointingHand)
                             .hover(|view| view.bg(tokens.pane_header_btn_hover))
-                            .child(model_pill)
+                            .child(div().max_w(px(280.0)).truncate().child(model_pill))
+                            .child(
+                                svg()
+                                    .path("icons/chevron-down.svg")
+                                    .size(px(10.0))
+                                    .flex_shrink_0()
+                                    .text_color(tokens.text_muted),
+                            )
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.open_agent_auth(pane_id, AgentDialogPage::Models, window, cx);
@@ -9020,18 +9053,17 @@ impl AppState {
                 div()
                     .w_full()
                     .mt(px(7.0))
+                    .h(px(12.0))
                     .flex()
                     .items_center()
                     .justify_between()
                     .text_size(px(10.0))
                     .text_color(tokens.text_muted)
-                    .child(div().child(
-                        if pane.chat.active {
-                            "Enter send · Shift+Enter newline · Ctrl+C stop · Drop or paste images"
-                        } else {
-                            "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images"
-                        },
-                    )),
+                    .when(!pane.chat.active, |hint| {
+                        hint.child(
+                            "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images",
+                        )
+                    }),
             )
     }
 
@@ -16589,7 +16621,12 @@ mod kathamo_bottom_input_tests {
         let (mut cx, state) = open_app(&mut app);
         let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
         cx.draw_frame().expect("draw terminal mode");
-
+        let terminal_input = cx
+            .debug_bounds("agent-composer-input")
+            .expect("terminal input renders");
+        let terminal_bar = cx
+            .debug_bounds("kathamo-input-bar")
+            .expect("terminal composer renders");
         let terminal_terminal_mode = cx
             .debug_bounds("input-mode-terminal-pill")
             .expect("terminal pill renders");
@@ -16610,8 +16647,34 @@ mod kathamo_bottom_input_tests {
             let chat = &s.pane_ref(pane_id).unwrap().chat;
             assert!(chat.selected_model.is_none());
             assert!(chat.bridge.is_some(), "automatic agent starts before Send");
+            let input = s
+                .pane_ref(pane_id)
+                .unwrap()
+                .input_state
+                .as_ref()
+                .unwrap()
+                .read(cx);
+            assert_eq!(input.placeholder_str(), "Message the agent…");
         });
         cx.draw_frame().expect("draw agent mode");
+        let agent_input = cx
+            .debug_bounds("agent-composer-input")
+            .expect("agent input renders");
+        let agent_bar = cx
+            .debug_bounds("kathamo-input-bar")
+            .expect("agent composer renders");
+        assert_eq!(
+            agent_bar.size.height, terminal_bar.size.height,
+            "agent and terminal composer heights match"
+        );
+        assert_eq!(
+            agent_input.size.height, terminal_input.size.height,
+            "agent and terminal input heights match"
+        );
+        let model_picker = cx
+            .debug_bounds("select-agent-model-pill")
+            .expect("model picker renders as a pill");
+        assert!(model_picker.size.height > px(20.0));
 
         let terminal_agent_mode = cx
             .debug_bounds("input-mode-terminal-pill")
@@ -16912,7 +16975,7 @@ mod kathamo_bottom_input_tests {
     }
 
     #[test]
-    fn live_reasoning_stays_expanded_when_the_answer_starts() {
+    fn completed_reasoning_collapses_when_the_answer_starts() {
         use agent_bridge::AgentEvent;
         let mut messages = Vec::new();
         push_chat_event(&mut messages, AgentEvent::Thinking("Looking ".into()));
@@ -16922,8 +16985,8 @@ mod kathamo_bottom_input_tests {
         assert_eq!(messages[0].text, "Looking closely");
         push_chat_event(&mut messages, AgentEvent::Text("Done".into()));
         assert!(
-            messages[0].expanded,
-            "the answer leaves the full reasoning visible"
+            !messages[0].expanded,
+            "completed reasoning folds when the answer begins"
         );
         assert!(!messages[0].streaming);
     }

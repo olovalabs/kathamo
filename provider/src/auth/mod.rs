@@ -9,10 +9,10 @@ use crate::catalog::get_provider;
 use crate::data::ALL_PROVIDERS;
 use crate::types::{AuthStatus, AuthType};
 
-/// Determine the live authentication readiness and credential source for a provider, using a pre-queried active OMP set.
+/// Determine the live authentication readiness and credential source for a provider, using the active credentials in the private runtime.
 pub fn check_auth_with_active(
     provider_id: &str,
-    active_omp: &std::collections::HashSet<String>,
+    active: &std::collections::HashSet<String>,
 ) -> AuthStatus {
     let spec = match get_provider(provider_id) {
         Some(spec) => spec,
@@ -52,22 +52,6 @@ pub fn check_auth_with_active(
                 .clone()
                 .unwrap_or_else(|| "Stored API key".to_string()),
         };
-        if let crate::types::StoredCredential::ApiKey { ref key, .. } = cred {
-            for var in &spec.env_vars {
-                if std::env::var(var).is_err() {
-                    unsafe {
-                        std::env::set_var(var, key);
-                    }
-                }
-            }
-            let upper = spec.id.replace('-', "_").to_uppercase();
-            let fallback_var = format!("{upper}_API_KEY");
-            if std::env::var(&fallback_var).is_err() {
-                unsafe {
-                    std::env::set_var(&fallback_var, key);
-                }
-            }
-        }
         return AuthStatus {
             provider: spec.id.clone(),
             ready: true,
@@ -76,12 +60,12 @@ pub fn check_auth_with_active(
         };
     }
 
-    // 2. Check if omp CLI has an authenticated token / OAuth account
-    if active_omp.contains(&spec.id) {
+    // 2. Check the private runtime credential store
+    if active.contains(&spec.id) {
         return AuthStatus {
             provider: spec.id.clone(),
             ready: true,
-            source: Some("omp OAuth".to_string()),
+            source: Some("Kathamo credential".to_string()),
             auth_type,
         };
     }
@@ -107,13 +91,13 @@ pub fn check_auth_with_active(
 
 /// Determine the live authentication readiness and credential source for a provider.
 pub fn check_auth(provider_id: &str) -> AuthStatus {
-    let active = storage::omp_authenticated_providers();
+    let active = storage::authenticated_providers();
     check_auth_with_active(provider_id, &active)
 }
 
 /// Check authentication readiness for all 103 providers in batch.
 pub fn check_all_auth() -> Vec<AuthStatus> {
-    let active = storage::omp_authenticated_providers();
+    let active = storage::authenticated_providers();
     ALL_PROVIDERS
         .iter()
         .map(|spec| check_auth_with_active(&spec.id, &active))

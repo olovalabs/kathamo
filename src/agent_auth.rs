@@ -1,7 +1,4 @@
-//! Provider discovery and interactive authentication through the installed CLIs.
-//!
-//! rpi handles its own providers; Google Antigravity uses omp's OAuth store
-//! and login flow. Both interactive commands run in a controlling terminal.
+//! Provider discovery and interactive authentication.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -21,7 +18,8 @@ pub struct Provider {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelBackend {
     Rpi,
-    Omp,
+    #[serde(alias = "Omp")]
+    Kathamo,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -44,8 +42,7 @@ fn rpi_models() -> Result<Vec<(String, String)>, String> {
         .map_err(|error| format!("Could not load the rpi model catalog: {error}"))
 }
 
-/// Discover models from rpi and omp, keeping Antigravity on its omp backend.
-/// This performs blocking IO; a missing omp omits its catalog.
+/// Merge the embedded rpi catalog with the Kathamo provider snapshot.
 pub fn available_models(_cwd: &Path) -> Result<Vec<AgentModel>, String> {
     let mut models: Vec<AgentModel> = Vec::new();
 
@@ -67,7 +64,7 @@ pub fn available_models(_cwd: &Path) -> Result<Vec<AgentModel>, String> {
         models.push(AgentModel {
             provider: spec.id.clone(),
             id: model.id.clone(),
-            backend: ModelBackend::Omp,
+            backend: ModelBackend::Kathamo,
         });
     }
 
@@ -76,11 +73,10 @@ pub fn available_models(_cwd: &Path) -> Result<Vec<AgentModel>, String> {
     Ok(models)
 }
 
-/// The model OMP would use by default, from `modelRoles.default` in its config.
-/// Only providers Kathamo can drive through OMP are returned.
+/// Read `modelRoles.default` from the private provider config.
 /// This performs blocking file IO.
-pub fn omp_default_model() -> Option<AgentModel> {
-    let selector = omp_default_selector()?;
+pub fn kathamo_provider_default_model() -> Option<AgentModel> {
+    let selector = kathamo_provider_default_selector()?;
     let (provider, model) = selector.split_once('/')?;
     let id = strip_thinking_suffix(model);
     if id.is_empty() {
@@ -89,25 +85,16 @@ pub fn omp_default_model() -> Option<AgentModel> {
     Some(AgentModel {
         provider: provider.to_owned(),
         id: id.to_owned(),
-        backend: ModelBackend::Omp,
+        backend: ModelBackend::Kathamo,
     })
 }
 
-fn omp_default_selector() -> Option<String> {
-    let path = omp_config_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
+fn kathamo_provider_default_selector() -> Option<String> {
+    let agent = crate::provider::runtime::agent_dir();
+    let text = std::fs::read_to_string(agent.join("config.yml"))
+        .or_else(|_| std::fs::read_to_string(agent.join("config.yaml")))
+        .ok()?;
     model_roles_default(&text)
-}
-
-fn omp_config_path() -> Option<std::path::PathBuf> {
-    if let Some(value) = std::env::var_os("PI_CODING_AGENT_DIR") {
-        let path = std::path::PathBuf::from(value);
-        if path.is_absolute() {
-            return Some(path.join("config.yml"));
-        }
-    }
-    let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
-    Some(home.join(".omp").join("agent").join("config.yml"))
 }
 
 /// Extract `modelRoles.default` from an OMP config.yml without pulling in a
@@ -163,14 +150,12 @@ fn strip_thinking_suffix(model: &str) -> &str {
 /// Discover catalog and configured provider IDs, then ask rpi for their local
 /// authentication status. This performs blocking IO.
 pub fn providers(_cwd: &Path) -> Result<Vec<Provider>, String> {
-    crate::provider::restore_stored_credentials();
-
     let mut result = Vec::new();
     let all_specs = crate::provider::all_providers();
-    let active_omp = crate::provider::auth::storage::omp_authenticated_providers();
+    let active = crate::provider::auth::storage::authenticated_providers();
 
     for spec in all_specs {
-        let status = crate::provider::auth::check_auth_with_active(&spec.id, &active_omp);
+        let status = crate::provider::auth::check_auth_with_active(&spec.id, &active);
         result.push(Provider {
             id: spec.id.clone(),
             ready: status.ready,
@@ -207,12 +192,7 @@ pub fn providers(_cwd: &Path) -> Result<Vec<Provider>, String> {
     // `rpi --list-models` probe and reports real local auth state.
     if let Ok(rpi_providers) = rpi_embedded::providers() {
         for provider in rpi_providers {
-            if let Some(existing) = result.iter_mut().find(|p| p.id == provider.id) {
-                existing.ready |= provider.ready;
-                if existing.source.is_none() {
-                    existing.source = provider.source;
-                }
-            } else {
+            if !result.iter().any(|p| p.id == provider.id) {
                 result.push(Provider {
                     id: provider.id,
                     ready: provider.ready,
@@ -227,13 +207,33 @@ pub fn providers(_cwd: &Path) -> Result<Vec<Provider>, String> {
     Ok(result)
 }
 
+// The broker prints the full OAuth URL on the line after this prompt.
+fn oauth_browser_url(output: &str) -> Option<&str> {
+    let mut lines = output.split_inclusive('\n');
+    while let Some(line) = lines.next() {
+        if line.trim() == "Open this URL in your browser:" {
+            let line = lines.next()?.strip_suffix('\n')?.trim();
+            let url = url::Url::parse(line).ok()?;
+            if url.scheme() == "https"
+                && url.host().is_some()
+                && url.username().is_empty()
+                && url.password().is_none()
+            {
+                return Some(line);
+            }
+            return None;
+        }
+    }
+    None
+}
+
 pub enum LoginEvent {
     Output(String),
     Finished(Result<(), String>),
 }
 
 /// Owns one interactive login. rpi providers are authenticated in-process;
-/// OMP providers keep the existing device-login PTY.
+/// Kathamo providers authenticate through the private runtime PTY.
 pub struct Login {
     backend: LoginBackend,
 }
@@ -247,12 +247,19 @@ impl Login {
     pub fn start(provider: &str, cwd: &Path) -> Result<Self, String> {
         if crate::provider::get_provider(provider).is_some() {
             Ok(Self {
-                backend: LoginBackend::Pty(PtyLogin::start(provider, cwd)?),
+                backend: LoginBackend::Pty(PtyLogin::start(provider)?),
             })
         } else {
             Ok(Self {
                 backend: LoginBackend::Embedded(rpi_embedded::Login::start(provider, cwd)?),
             })
+        }
+    }
+
+    pub fn browser_url<'a>(&self, output: &'a str) -> Option<&'a str> {
+        match self.backend {
+            LoginBackend::Pty(_) => oauth_browser_url(output),
+            LoginBackend::Embedded(_) => None,
         }
     }
 
@@ -287,7 +294,7 @@ impl Drop for Login {
     }
 }
 
-/// The OMP device-login PTY. Dropping it cancels and reaps the child.
+/// The Kathamo provider login PTY. Dropping it cancels and reaps the child.
 struct PtyLogin {
     writer: Box<dyn Write + Send>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -297,7 +304,7 @@ struct PtyLogin {
 }
 
 impl PtyLogin {
-    fn start(provider: &str, cwd: &Path) -> Result<Self, String> {
+    fn start(provider: &str) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -315,10 +322,20 @@ impl PtyLogin {
             .master
             .take_writer()
             .map_err(|e| format!("Could not write to the authentication terminal: {e}"))?;
-        let backend = "omp";
-        let mut command = CommandBuilder::new(backend);
-        command.args(["login", provider]);
-        command.cwd(cwd);
+        let backend = "Kathamo provider";
+        let mut command = CommandBuilder::new(crate::provider::runtime::executable()?);
+        for (key, _) in
+            std::env::vars_os().filter(|(key, _)| !crate::provider::runtime::inherits(key))
+        {
+            command.env_remove(key);
+        }
+        for (key, value) in crate::provider::runtime::environment()? {
+            command.env(key, value);
+        }
+        // The local broker login prints the URL and persists to this same private
+        // store. Kathamo opens the URL using the desktop's regular browser.
+        command.args(["auth-broker", "login", provider]);
+        command.cwd(crate::provider::runtime::root());
         let mut child = pair
             .slave
             .spawn_command(command)
@@ -470,7 +487,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_omp_default_model_role() {
+    fn reads_the_kathamo_provider_default_model_role() {
         let config = "\
 symbolPreset: unicode
 modelRoles:
@@ -527,9 +544,27 @@ theme:
     }
 
     #[test]
-    fn discovers_all_omp_models() {
+    fn recognizes_only_complete_https_browser_urls() {
+        let prompt = "Open this URL in your browser:\r\n";
+        let url = "https://example.com/oauth?state=test";
+        assert_eq!(oauth_browser_url(&format!("{prompt}{url}")), None);
+        assert_eq!(oauth_browser_url(&format!("{prompt}{url}\r\n")), Some(url));
+        assert_eq!(
+            oauth_browser_url(&format!("{prompt}file:///tmp/test\n")),
+            None
+        );
+        assert_eq!(oauth_browser_url(&format!("{url}\n")), None);
+    }
+
+    #[test]
+    fn discovers_available_provider_models() {
         let models = available_models(&std::path::PathBuf::from("."))
             .expect("models discovery must succeed");
+        assert!(
+            models
+                .iter()
+                .any(|model| model.provider == "google-antigravity")
+        );
         assert!(
             models.len() > 1000,
             "Must discover thousands of models, found: {}",

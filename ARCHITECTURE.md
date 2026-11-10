@@ -160,7 +160,8 @@ from the upstream library crates.
   stale resumed session id falls back to a fresh durable session.
 - **Discovery and login.** Model catalogs and provider readiness are read
   in-process through `rpi_embedded::catalog`/`providers`. rpi-only API-key and
-  OAuth logins are driven in-process; OMP keeps its existing PTY login.
+  OAuth logins are driven in-process. The Kathamo provider uses its bundled
+  runtime for PTY login and RPC, with a private data directory.
 - **Baseline.** The old subprocess bridge is retained behind
   `KATHAMO_RPI_BACKEND=rpc` for before/after measurements. The default is the
   embedded backend. `KATHAMO_STREAM_TIMINGS=1` reports startup, UI drain/apply,

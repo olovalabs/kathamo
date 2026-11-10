@@ -330,7 +330,8 @@ pub fn conversation_key(model: Option<&AgentModel>) -> String {
         Some(model) => {
             let backend = match model.backend {
                 ModelBackend::Rpi => "rpi",
-                ModelBackend::Omp => "omp",
+                // Keep the filename stem for existing Kathamo conversations.
+                ModelBackend::Kathamo => "omp",
             };
             sanitize(&format!("{backend}_{}_{}", model.provider, model.id))
         }
@@ -571,7 +572,7 @@ mod tests {
         let model = AgentModel {
             provider: "google/antigravity".into(),
             id: "gemini:3.1".into(),
-            backend: ModelBackend::Omp,
+            backend: ModelBackend::Kathamo,
         };
         let key = conversation_key(Some(&model));
         assert_eq!(key, "omp_google_antigravity_gemini_3.1");

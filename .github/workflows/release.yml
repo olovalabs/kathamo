@@ -63,6 +63,7 @@ jobs:
           mkdir -p "dist/kathamo-$TARGET"
           cp target/release/kathamo "dist/kathamo-$TARGET/"
           cp README.md "dist/kathamo-$TARGET/" 2>/dev/null || true
+          cp provider/LICENSE-OH-MY-PI provider/THIRD-PARTY-NOTICES-OH-MY-PI.txt "dist/kathamo-$TARGET/"
           tar czf "kathamo-$TARGET.tar.gz" -C dist "kathamo-$TARGET"
           sha256sum "kathamo-$TARGET.tar.gz" > "kathamo-$TARGET.tar.gz.sha256"
           ls -lh "kathamo-$TARGET.tar.gz"
@@ -104,6 +105,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/kathamo-$t" | Out-Null
           Copy-Item "target/release/kathamo.exe" "dist/kathamo-$t/"
           Copy-Item "README.md" "dist/kathamo-$t/" -ErrorAction SilentlyContinue
+          Copy-Item "provider/LICENSE-OH-MY-PI", "provider/THIRD-PARTY-NOTICES-OH-MY-PI.txt" "dist/kathamo-$t/"
           Compress-Archive -Path "dist/kathamo-$t" -DestinationPath "kathamo-$t.zip" -Force
           ((Get-FileHash "kathamo-$t.zip" -Algorithm SHA256).Hash.ToLower() + "  kathamo-$t.zip`n") | Out-File -FilePath "kathamo-$t.zip.sha256" -NoNewline -Encoding ascii
           # Standalone exe next to the zip, so users can grab it directly.
@@ -147,6 +149,7 @@ jobs:
           mkdir -p "dist/kathamo-$TARGET"
           cp target/release/kathamo "dist/kathamo-$TARGET/"
           cp README.md "dist/kathamo-$TARGET/" 2>/dev/null || true
+          cp provider/LICENSE-OH-MY-PI provider/THIRD-PARTY-NOTICES-OH-MY-PI.txt "dist/kathamo-$TARGET/"
           tar czf "kathamo-$TARGET.tar.gz" -C dist "kathamo-$TARGET"
           shasum -a 256 "kathamo-$TARGET.tar.gz" > "kathamo-$TARGET.tar.gz.sha256"
           ls -lh "kathamo-$TARGET.tar.gz"

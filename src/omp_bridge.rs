@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -73,8 +73,12 @@ impl OmpBridge {
         } else {
             format!("google-antigravity/{model}")
         };
+        let (provider, _) = selector
+            .split_once('/')
+            .expect("model selector includes provider");
         let system_prompt = format!("{}\n\n{WORKER_PROMPT}", crate::agent_ui::CATALOG_PROMPT);
-        let mut command = Command::new("omp");
+        let mut command = crate::provider::runtime::command()?;
+        crate::provider::auth::storage::sync_api_key(provider)?;
         command
             .args(["--mode", "rpc", "--model", &selector])
             .args(["--append-system-prompt", &system_prompt])
@@ -91,7 +95,7 @@ impl OmpBridge {
         let spawn_start = std::time::Instant::now();
         let mut child = command.spawn().map_err(|error| {
             format!(
-                "Could not start omp in {}: {error}. Install omp and ensure it is on PATH.",
+                "Could not start the Kathamo provider in {}: {error}.",
                 cwd.display()
             )
         })?;
@@ -118,7 +122,7 @@ impl OmpBridge {
                     Ok(0) => break,
                     Err(error) => {
                         let _ = sender.send(Incoming::Error(format!(
-                            "Failed reading omp output: {error}"
+                            "Failed reading Kathamo provider output: {error}"
                         )));
                         break;
                     }
@@ -128,7 +132,9 @@ impl OmpBridge {
                 let record: Value = match serde_json::from_str(&line) {
                     Ok(record) => record,
                     Err(_) => {
-                        let _ = sender.send(Incoming::Error("Invalid omp RPC output".into()));
+                        let _ = sender.send(Incoming::Error(
+                            "Invalid Kathamo provider RPC output".into(),
+                        ));
                         crate::agent_bridge::signal_wake();
                         continue;
                     }
@@ -167,7 +173,7 @@ impl OmpBridge {
                         "select" | "confirm" | "input" | "editor" | "ask" => {
                             // Never approve a request that this UI cannot show or answer.
                             let _ = sender.send(Incoming::Error(
-                                "OMP requested an interactive dialog or tool approval, which is not supported in this view; the request was cancelled.".into(),
+                                "The Kathamo provider requested an interactive dialog or tool approval, which is not supported in this view; the request was cancelled.".into(),
                             ));
                             crate::agent_bridge::signal_wake();
                             if let Err(error) = reply_writer.send_json(json!({
@@ -274,7 +280,7 @@ impl OmpBridge {
 
     pub fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
         if self.pending_prompt.is_some() {
-            return Err("An OMP prompt is already running".into());
+            return Err("A Kathamo provider prompt is already running".into());
         }
         // A title request is background work, never worth blocking a prompt
         // for. Cancel it and let the next completed turn ask again.
@@ -284,7 +290,7 @@ impl OmpBridge {
             let _ = self.send(json!({"type": "abort"}));
         }
         if self.closed {
-            return Err("The omp process has exited".into());
+            return Err("The Kathamo provider process has exited".into());
         }
         self.next_id = self.next_id.wrapping_add(1);
         let id = format!("kathamo-{}", self.next_id);
@@ -307,7 +313,7 @@ impl OmpBridge {
 
     fn send(&mut self, mut command: Value) -> Result<String, String> {
         if self.closed {
-            return Err("The omp process has exited".into());
+            return Err("The Kathamo provider process has exited".into());
         }
         self.next_id = self.next_id.wrapping_add(1);
         let id = format!("kathamo-{}", self.next_id);
@@ -367,7 +373,7 @@ impl OmpBridge {
                             .flatten()
                             .map(|status| format!(" ({status})"))
                             .unwrap_or_default();
-                        events.push(AgentEvent::Error(format!("OMP process exited{status}. Check your OMP installation and Google Antigravity login.")));
+                        events.push(AgentEvent::Error(format!("Kathamo provider process exited{status}. Check your provider login in /auth.")));
                         if self.pending_prompt.take().is_some() {
                             events.push(AgentEvent::Done);
                         }
@@ -503,7 +509,9 @@ impl OmpBridge {
                 if self.title_in_flight && is_busy_rejection(detail) {
                     self.title_in_flight = false;
                 } else {
-                    events.push(AgentEvent::Error(format!("OMP {command}: {detail}")));
+                    events.push(AgentEvent::Error(format!(
+                        "Kathamo provider {command}: {detail}"
+                    )));
                 }
                 if matching_prompt && command == "prompt" {
                     self.pending_prompt = None;
@@ -524,9 +532,9 @@ impl OmpBridge {
                     let detail = record["error"]["message"]
                         .as_str()
                         .or_else(|| record["error"].as_str())
-                        .unwrap_or("Check your OMP configuration and Google Antigravity login.");
+                        .unwrap_or("Check your Kathamo provider configuration and login.");
                     events.push(AgentEvent::Error(format!(
-                        "OMP agent request failed: {detail}"
+                        "Kathamo provider request failed: {detail}"
                     )));
                 }
                 self.pending_prompt = None;
@@ -568,7 +576,9 @@ impl OmpBridge {
                     }
                 }
                 if approval_error {
-                    events.push(AgentEvent::Error("OMP could not obtain tool approval in this view. Use an interactive OMP session or adjust your OMP approval settings.".into()));
+                    events.push(AgentEvent::Error(
+                        "The Kathamo provider could not obtain tool approval in this view.".into(),
+                    ));
                 }
             }
             "auto_retry_start" => {
@@ -614,12 +624,12 @@ impl OmpBridge {
             }
             "extension_error" => {
                 events.push(AgentEvent::Error(
-                    "An OMP extension failed during this session.".into(),
+                    "A Kathamo provider extension failed during this session.".into(),
                 ));
             }
             "rpc_frame_error" => {
                 events.push(AgentEvent::Error(
-                    "OMP could not deliver an RPC event because it exceeded the transport limit."
+                    "The Kathamo provider could not deliver an RPC event because it exceeded the transport limit."
                         .into(),
                 ));
                 if record["originalType"] == "prompt_result" && self.pending_prompt.take().is_some()

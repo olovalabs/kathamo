@@ -1,62 +1,30 @@
+use crate::runtime;
 use crate::types::StoredCredential;
-use std::collections::HashMap;
+use rusqlite::{Connection, OpenFlags};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
-/// Query the set of providers with active credentials in omp's SQLite database (~/.omp/agent/agent.db).
-pub fn omp_authenticated_providers() -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    let home = match directories::BaseDirs::new() {
-        Some(d) => d.home_dir().to_path_buf(),
-        None => return set,
+fn auth_db_path() -> PathBuf {
+    runtime::agent_dir().join("agent.db")
+}
+
+pub fn authenticated_providers() -> HashSet<String> {
+    let Ok(db) = Connection::open_with_flags(auth_db_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return HashSet::new();
     };
-    let db_path = home.join(".omp").join("agent").join("agent.db");
-    if !db_path.exists() {
-        return set;
-    }
-
-    if let Ok(output) = Command::new("sqlite3")
-        .arg(&db_path)
-        .arg("SELECT DISTINCT provider FROM auth_credentials WHERE disabled_cause IS NULL;")
-        .output()
-    {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    set.insert(trimmed.to_string());
-                }
-            }
-        }
-    }
-    set
-}
-
-/// Check if omp CLI has active credentials for a provider.
-pub fn check_omp_credential(provider_id: &str) -> Option<(bool, String)> {
-    let active = omp_authenticated_providers();
-    if active.contains(provider_id) {
-        Some((true, "omp OAuth".to_string()))
-    } else {
-        None
-    }
-}
-/// Retrieve raw token string from omp if available.
-pub fn get_omp_token(provider_id: &str) -> Option<String> {
-    let output = Command::new("omp")
-        .args(["token", provider_id, "--raw"])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !text.is_empty() {
-            return Some(text);
-        }
-    }
-    None
+    let Ok(mut statement) =
+        db.prepare("SELECT DISTINCT provider FROM auth_credentials WHERE disabled_cause IS NULL")
+    else {
+        return HashSet::new();
+    };
+    statement
+        .query_map([], |row| row.get(0))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
 }
 
 fn credentials_file_path() -> Option<PathBuf> {
@@ -93,176 +61,118 @@ pub fn save_local_credential(provider_id: &str, cred: StoredCredential) -> Resul
     let path = credentials_file_path()
         .ok_or_else(|| "Could not determine config directory".to_string())?;
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create config dir: {e}"))?;
-    }
-
-    let mut map = load_local_credentials();
-    map.insert(provider_id.to_string(), cred);
-
-    let json = serde_json::to_string_pretty(&map)
-        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
-
-    fs::write(&path, json).map_err(|e| format!("Failed to write credentials file: {e}"))?;
-    Ok(())
+    let _lock = lock_local_credentials(&path)?;
+    update_local_credentials(&path, |map| {
+        map.insert(provider_id.to_string(), cred);
+    })
 }
 
-/// Retrieve a stored credential for a provider (checking local store first, then omp).
-/// Retrieve a credential from local store only (fast, no external CLI calls).
+fn lock_local_credentials(path: &Path) -> Result<fs::File, String> {
+    let acquire = || -> std::io::Result<fs::File> {
+        fs::create_dir_all(path.parent().unwrap())?;
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    };
+    acquire().map_err(|error| format!("Could not lock Kathamo credentials: {error}"))
+}
+
+fn update_local_credentials(
+    path: &Path,
+    update: impl FnOnce(&mut HashMap<String, StoredCredential>),
+) -> Result<(), String> {
+    let write = || -> Result<(), Box<dyn std::error::Error>> {
+        let mut map = match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(error) => return Err(error.into()),
+        };
+        update(&mut map);
+        let mut temporary = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+        serde_json::to_writer_pretty(&mut temporary, &map)?;
+        temporary.persist(path)?;
+        Ok(())
+    };
+    write().map_err(|error| format!("Could not update Kathamo credentials: {error}"))
+}
+
 pub fn get_local_credential(provider_id: &str) -> Option<StoredCredential> {
-    let local_map = load_local_credentials();
-    local_map.get(provider_id).cloned()
+    load_local_credentials().remove(provider_id)
 }
 
-/// Retrieve a stored credential for a provider (checking local store first, then omp if active).
-pub fn get_credential(provider_id: &str) -> Option<StoredCredential> {
-    if let Some(cred) = get_local_credential(provider_id) {
-        return Some(cred);
-    }
-
-    let active = omp_authenticated_providers();
-    if active.contains(provider_id) {
-        if let Some(token) = get_omp_token(provider_id) {
-            return Some(StoredCredential::OAuth {
-                access: token,
-                refresh: None,
-                expires: None,
-                email: None,
-                account_id: None,
-                org_id: None,
-                org_name: None,
-                authorized_at: None,
-            });
-        }
-    }
-
-    None
-}
-
-/// Save an API key for a provider to local storage, process environment, and OMP credential store.
 pub fn save_api_key(provider_id: &str, key: &str) -> Result<(), String> {
     let key = key.trim();
     if key.is_empty() {
-        return Err("API key cannot be empty".to_string());
+        return Err("API key cannot be empty".into());
     }
+    save_local_credential(
+        provider_id,
+        StoredCredential::ApiKey {
+            key: key.into(),
+            source: Some("Stored API key".into()),
+        },
+    )
+}
 
-    // 1. Save to local Kathamo credentials store
-    let cred = StoredCredential::ApiKey {
-        key: key.to_string(),
-        source: Some("Stored API key".to_string()),
+/// Feed the selected Kathamo API key to the private runtime using its auth protocol.
+pub fn sync_api_key(provider_id: &str) -> Result<(), String> {
+    let Some(path) = credentials_file_path().filter(|path| path.exists()) else {
+        return Ok(());
     };
-    save_local_credential(provider_id, cred)?;
-
-    // 2. Set environment variable in the process if known
-    if let Some(spec) = crate::catalog::get_provider(provider_id) {
-        for var in &spec.env_vars {
-            unsafe {
-                std::env::set_var(var, key);
-            }
-        }
-    }
-    let upper = provider_id.replace('-', "_").to_uppercase();
-    let fallback_var = format!("{upper}_API_KEY");
-    unsafe {
-        std::env::set_var(&fallback_var, key);
-    }
-    // 3. Import into OMP credentials store via `omp auth import -`
-    let import_doc = serde_json::json!({
+    let _lock = lock_local_credentials(&path)?;
+    let Some(StoredCredential::ApiKey { key, .. }) = get_local_credential(provider_id) else {
+        return Ok(());
+    };
+    let data = serde_json::json!({
         "version": 1,
-        "credentials": [
-            {
-                "provider": provider_id,
-                "credential": {
-                    "type": "api_key",
-                    "key": key,
-                    "source": "login"
-                }
-            }
-        ]
+        "credentials": [{
+            "provider": provider_id,
+            "credential": { "type": "api_key", "key": key, "source": "login" }
+        }]
     });
-
-    if let Ok(mut child) = Command::new("omp")
+    let mut child = runtime::command()?
         .args(["auth", "import", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .current_dir(runtime::root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(import_doc.to_string().as_bytes());
-        }
-        let _ = child.wait();
+        .map_err(|error| format!("Could not load the Kathamo API key: {error}"))?;
+    let write = child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(data.to_string().as_bytes());
+    let status = child.wait();
+    match (write, status) {
+        (Ok(()), Ok(status)) if status.success() => Ok(()),
+        _ => Err("Could not import the API key into the Kathamo provider runtime".into()),
     }
-
-    Ok(())
 }
 
-/// Disconnect a provider: remove its stored credentials from local storage and OMP agent.db,
-/// and unset its environment variables in the current process.
 pub fn disconnect_provider(provider_id: &str) -> Result<(), String> {
-    // 1. Remove from local Kathamo credentials file
-    if let Some(path) = credentials_file_path() {
-        if path.exists() {
-            let mut map = load_local_credentials();
+    let path = credentials_file_path();
+    let _lock = path.as_deref().map(lock_local_credentials).transpose()?;
+    if auth_db_path().exists() {
+        let remove = || -> rusqlite::Result<()> {
+            let db =
+                Connection::open_with_flags(auth_db_path(), OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+            db.execute(
+                "DELETE FROM auth_credentials WHERE provider = ?1",
+                [provider_id],
+            )?;
+            Ok(())
+        };
+        remove().map_err(|error| format!("Could not disconnect the Kathamo provider: {error}"))?;
+    }
+    if let Some(path) = path.filter(|path| path.exists()) {
+        update_local_credentials(&path, |map| {
             map.remove(provider_id);
-            if let Ok(json) = serde_json::to_string_pretty(&map) {
-                let _ = fs::write(&path, json);
-            }
-        }
+        })?;
     }
-
-    // 2. Remove from OMP SQLite store (~/.omp/agent/agent.db)
-    if let Some(dirs) = directories::BaseDirs::new() {
-        let db_path = dirs.home_dir().join(".omp").join("agent").join("agent.db");
-        if db_path.exists() {
-            let _ = Command::new("sqlite3")
-                .arg(&db_path)
-                .arg(format!(
-                    "DELETE FROM auth_credentials WHERE provider='{provider_id}';"
-                ))
-                .output();
-        }
-    }
-
-    // 3. Unset environment variables in the running process
-    if let Some(spec) = crate::catalog::get_provider(provider_id) {
-        for var in &spec.env_vars {
-            unsafe {
-                std::env::remove_var(var);
-            }
-        }
-    }
-    let upper = provider_id.replace('-', "_").to_uppercase();
-    let fallback_var = format!("{upper}_API_KEY");
-    unsafe {
-        std::env::remove_var(&fallback_var);
-    }
-
     Ok(())
-}
-
-/// Restore all locally stored API keys into the process environment variables.
-pub fn restore_stored_credentials() {
-    let creds = load_local_credentials();
-    for (provider_id, cred) in creds {
-        if let StoredCredential::ApiKey { key, .. } = cred {
-            if let Some(spec) = crate::catalog::get_provider(&provider_id) {
-                for var in &spec.env_vars {
-                    if std::env::var(var).is_err() {
-                        unsafe {
-                            std::env::set_var(var, &key);
-                        }
-                    }
-                }
-            }
-            let upper = provider_id.replace('-', "_").to_uppercase();
-            let fallback_var = format!("{upper}_API_KEY");
-            if std::env::var(&fallback_var).is_err() {
-                unsafe {
-                    std::env::set_var(&fallback_var, &key);
-                }
-            }
-        }
-    }
 }

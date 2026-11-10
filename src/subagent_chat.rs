@@ -230,9 +230,7 @@ pub fn legacy(name: &str, text: &str) -> Vec<Worker> {
 /// Legacy logs lack the OMP session path. A matching parent tool-call ID
 /// identifies the session even when several chats used the same worker name.
 pub fn find_legacy_transcript(id: &str, tool_id: &str) -> Option<PathBuf> {
-    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .or_else(|| Some(directories::BaseDirs::new()?.home_dir().join(".omp/agent")))?;
+    let agent_dir = crate::provider::runtime::agent_dir();
     for project in fs::read_dir(agent_dir.join("sessions")).ok()?.flatten() {
         let Ok(sessions) = fs::read_dir(project.path()) else {
             continue;

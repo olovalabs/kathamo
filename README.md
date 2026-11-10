@@ -97,7 +97,10 @@ Processes are not resurrected: a restored pane starts a fresh shell in the saved
 git clone https://github.com/olovalabs/kathamo.git
 cd kathamo
 
-# Build release binary
+# Run the development build with the bundled provider
+cargo run
+
+# Build the release binary
 cargo build --release
 
 # Run Kathamo
@@ -106,17 +109,11 @@ cargo build --release
 
 ### Native agent chat
 
-Kathamo's native agent view uses the [pi-rust](https://github.com/bigfish1913/pi-rust)
-`rpi` executable. Install it before starting Kathamo:
-
-```bash
-cargo install rpi-cli --locked
-```
-
-Alternatively configure a provider using pi-rust's environment variables or
-`~/.rpi/agent/models.json`; see the upstream documentation. The agent can read
-and change files and execute commands in the project's working directory. Model
-provider charges may apply.
+Kathamo's native agent view ships with an embedded [pi-rust](https://github.com/bigfish1913/pi-rust)
+backend and the **Kathamo** provider catalog. The Kathamo provider uses a pinned
+[Oh My Pi](https://github.com/can1357/oh-my-pi) runtime snapshot bundled in the
+app. Cargo uses Python 3 to download and verify the snapshot on the first build.
+Development and release builds both include the provider.
 
 In a terminal pane, select **Agent** in the bottom input bar to open a native
 chat view. Enter sends a prompt, Shift+Enter inserts a newline, and Stop or
@@ -146,27 +143,25 @@ Readiness reports local configuration, not whether a provider accepts the key.
 A ready provider is already authenticated; select it to choose a model, or use
 **Add account** to sign in again explicitly.
 Authenticating a provider does not switch the model of an existing agent session.
-The dialog requires a Unix PTY; on other platforms use the provider's CLI login.
 
 Select **Models** in the agent input bar or enter `/model` to see the available
-rpi models and OMP Antigravity models. Select a row for the current pane, or
+rpi and Kathamo models. Select a row for the current pane, or
 choose **Set default** to use that provider and model in new panes. Each pane
 keeps the model shown in its input bar across restarts, so panes can run
 different models side by side. **Reset default to rpi automatic model** clears
 the saved default. Each selected model has a separate conversation within the
-pane, and each conversation names its sidebar entry. For OMP models Kathamo asks
-OMP's title generator once after the first completed turn, so the tab shows the
-agent's own name (e.g. `🔄 REFSH: Refactor auth for token refresh`); until that
+pane, and each conversation names its sidebar entry. For Kathamo models the provider generates a
+title after the first completed turn, so the tab shows the agent's own name (e.g. `🔄 REFSH: Refactor auth for token refresh`); until that
 arrives, or if the backend does not generate titles, the first prompt supplies
 the name. Plain shell tabs keep their shell title.
 
-Google Antigravity additionally requires [oh-my-pi](https://github.com/can1357/oh-my-pi)
-(`omp`) on `PATH`. In `/auth`, select **google-antigravity** if it is not ready,
-complete the Google sign-in in a browser, then use `/model` to select an available
-Antigravity model. If no models appear, retry discovery. These models run through
-OMP, not rpi. Use **Use rpi automatic model** in `/model` to return to the
-automatic rpi conversation. OMP interactive tool approvals and extension dialogs
-are cancelled when they cannot be shown in this view.
+Select **google-antigravity** in `/auth` to sign in, then choose a model in
+`/model`. Kathamo bundles Oh My Pi 18.18.3, the last upstream release with
+Antigravity enabled. Browser sign-ins open in your system's default browser.
+The Kathamo provider works without a system `omp` command. Its runtime, provider settings,
+login database, and sessions live under the Kathamo data directory's
+`provider/` folder. Sign in through Kathamo to create credentials for this
+store. API keys previously saved through Kathamo remain available.
 
 ---
 

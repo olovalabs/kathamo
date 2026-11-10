@@ -685,7 +685,7 @@ mod tests {
                                 selected_model: Some(AgentModel {
                                     provider: "xai-oauth".into(),
                                     id: "grok-4.7".into(),
-                                    backend: crate::agent_auth::ModelBackend::Omp,
+                                    backend: crate::agent_auth::ModelBackend::Kathamo,
                                 }),
                                 model_explicit: true,
                                 agent_title: None,
@@ -696,7 +696,7 @@ mod tests {
                                     model: Some(AgentModel {
                                         provider: "commandcode".into(),
                                         id: "deepseek/deepseek-v4-flash".into(),
-                                        backend: crate::agent_auth::ModelBackend::Omp,
+                                        backend: crate::agent_auth::ModelBackend::Kathamo,
                                     }),
                                     rpi_session_id: None,
                                     conversation: "omp_commandcode_deepseek_deepseek-v4-flash"

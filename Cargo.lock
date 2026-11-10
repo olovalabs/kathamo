@@ -5241,6 +5241,7 @@ dependencies = [
  "terminal",
  "toml 1.1.6+spec-1.1.0",
  "unicode-width 0.2.2",
+ "url",
 ]
 
 [[package]]
@@ -7226,10 +7227,13 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "directories",
+ "flate2",
  "rand 0.8.8",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

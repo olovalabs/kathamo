@@ -1980,10 +1980,12 @@ impl PaneChat {
         self.bridge = None;
         let selector = self.selected_model.as_ref().map(agent_model_selector);
         let bridge = match self.selected_model.as_ref().map(|model| &model.backend) {
-            Some(agent_auth::ModelBackend::Omp) => {
+            Some(agent_auth::ModelBackend::Kathamo) => {
                 let mut bridge = ModelBridge::Omp(omp_bridge::OmpBridge::spawn(
                     &cwd,
-                    selector.as_deref().expect("OMP model has a selector"),
+                    selector
+                        .as_deref()
+                        .expect("Kathamo provider model has a selector"),
                 )?);
                 if !self.fast_mode {
                     let _ = bridge.set_thinking_level("high");
@@ -2496,7 +2498,7 @@ struct AppState {
     /// Terminal color palette / block chrome (Warp by default).
     pub palette_scheme: PaletteScheme,
     default_agent_model: Option<agent_auth::AgentModel>,
-    /// OMP's own configured default, used when no Kathamo default is set.
+    /// The Kathamo provider's configured default, used when no Kathamo default is set.
     fallback_agent_model: Option<agent_auth::AgentModel>,
     pub sidebar_visible: bool,
     integration_panel_visible: bool,
@@ -5102,7 +5104,7 @@ impl AppState {
     }
 
     /// The model new and unpinned panes should use: the user's saved default,
-    /// otherwise the default OMP itself is configured with.
+    /// otherwise the private provider default.
     fn effective_default_agent_model(&self) -> Option<&agent_auth::AgentModel> {
         self.default_agent_model
             .as_ref()
@@ -5975,7 +5977,7 @@ impl AppState {
         auth.output.clear();
         auth.error = None;
         // rpi-only providers are authenticated in-process through the embedded
-        // agent's auth store. OMP providers keep the OMP credential path.
+        // agent's auth store. Kathamo providers use their private credential store.
         if rpi_only {
             match agent_auth::Login::start(&provider, &auth.cwd) {
                 Ok(login) => auth.login = Some(login),
@@ -6233,7 +6235,14 @@ impl AppState {
                                 changed = true;
                                 match event {
                                     agent_auth::LoginEvent::Output(text) => {
-                                        auth.output.push_str(&text)
+                                        let browser_already_opened =
+                                            login.browser_url(&auth.output).is_some();
+                                        auth.output.push_str(&text);
+                                        if !browser_already_opened
+                                            && let Some(url) = login.browser_url(&auth.output)
+                                        {
+                                            cx.open_url(url);
+                                        }
                                     }
                                     agent_auth::LoginEvent::Finished(result) => {
                                         finished = Some(result);
@@ -9449,7 +9458,7 @@ impl AppState {
                                 .text_color(tokens.text_muted)
                                 .child(match model.backend {
                                     agent_auth::ModelBackend::Rpi => "rpi",
-                                    agent_auth::ModelBackend::Omp => "OMP",
+                                    agent_auth::ModelBackend::Kathamo => "Kathamo",
                                 }),
                         )
                         .into_any_element(),
@@ -10705,7 +10714,12 @@ impl AppState {
         else {
             return;
         };
-        let path = row.worker.transcript.clone();
+        let session_root = crate::provider::runtime::agent_dir().join("sessions");
+        let path = row
+            .worker
+            .transcript
+            .clone()
+            .filter(|path| path.starts_with(&session_root));
         let tool_id = pane.chat.visible_messages()[index]
             .tool
             .as_ref()
@@ -11140,7 +11154,7 @@ impl AppState {
                 .unwrap_or_else(|| "this project".to_string());
             let backend = effective.map(|model| match model.backend {
                 agent_auth::ModelBackend::Rpi => "rpi",
-                agent_auth::ModelBackend::Omp => "OMP",
+                agent_auth::ModelBackend::Kathamo => "Kathamo",
             });
             let notice = pane.chat.visible_startup_error().map(agent_startup_notice);
 
@@ -14443,7 +14457,6 @@ fn main() -> Result<()> {
             if let Err(error) = paths::ensure_dirs() {
                 eprintln!("failed to create app data directories: {error}");
             }
-            crate::provider::restore_stored_credentials();
             #[cfg(target_os = "linux")]
             if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
                 let local_bin = home.join(".local/bin");
@@ -14513,7 +14526,7 @@ fn main() -> Result<()> {
                         theme_preference: app_settings.theme,
                         palette_scheme: app_settings.palette_scheme,
                         default_agent_model: app_settings.default_agent_model.clone(),
-                        fallback_agent_model: agent_auth::omp_default_model(),
+                        fallback_agent_model: agent_auth::kathamo_provider_default_model(),
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
                         sidebar_width: px(app_settings.sidebar.width.max(120.0)),
@@ -15022,8 +15035,7 @@ mod resize_tests {
         cx.update_window_entity(&state, |s, window, cx| {
             s.set_theme_preference(ThemePreference::Light, Some(window), cx);
             for idx in 2..=17 {
-                let title: SharedString =
-                    format!("Session {idx:02}: conversation title").into();
+                let title: SharedString = format!("Session {idx:02}: conversation title").into();
                 s.projects[0].sessions.push(Session {
                     id: idx,
                     uid: paths::uid("s"),
@@ -15073,7 +15085,7 @@ mod resize_tests {
         let model = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
             id: "gemini-default".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, window, cx| {
             s.fallback_agent_model = Some(model.clone());
@@ -15152,12 +15164,12 @@ mod resize_tests {
         let deepseek = agent_auth::AgentModel {
             provider: "commandcode".into(),
             id: "deepseek/deepseek-v4-flash".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         let grok = agent_auth::AgentModel {
             provider: "xai-oauth".into(),
             id: "grok-4.7".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, window, cx| {
             s.set_chat_mode(pane_id, true, window, cx);
@@ -15222,7 +15234,7 @@ mod resize_tests {
         let model = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
             id: "gemini-default".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
         cx.update_window_entity(&state, |s, window, cx| {
@@ -15360,12 +15372,12 @@ Done."#
         let deepseek = agent_auth::AgentModel {
             provider: "commandcode".into(),
             id: "deepseek/deepseek-v4-flash".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         let grok = agent_auth::AgentModel {
             provider: "xai-oauth".into(),
             id: "grok-4.7".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, window, cx| {
             s.split_pane(1, gpui::Axis::Horizontal, window, cx);
@@ -15424,7 +15436,7 @@ Done."#
                                 selected_model: Some(agent_auth::AgentModel {
                                     provider: "commandcode".into(),
                                     id: "deepseek/deepseek-v4-flash".into(),
-                                    backend: agent_auth::ModelBackend::Omp,
+                                    backend: agent_auth::ModelBackend::Kathamo,
                                 }),
                                 model_explicit: true,
                                 ..Default::default()
@@ -15441,7 +15453,7 @@ Done."#
                                 selected_model: Some(agent_auth::AgentModel {
                                     provider: "xai-oauth".into(),
                                     id: "grok-4.7".into(),
-                                    backend: agent_auth::ModelBackend::Omp,
+                                    backend: agent_auth::ModelBackend::Kathamo,
                                 }),
                                 model_explicit: true,
                                 ..Default::default()
@@ -15472,7 +15484,7 @@ Done."#
         let default = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
             id: "gemini-3.8-flash".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, _, cx| {
             s.default_agent_model = Some(default.clone());
@@ -15560,7 +15572,7 @@ Done."#
             s.default_agent_model = Some(agent_auth::AgentModel {
                 provider: "xai-oauth".into(),
                 id: "grok-4.7".into(),
-                backend: agent_auth::ModelBackend::Omp,
+                backend: agent_auth::ModelBackend::Kathamo,
             });
             s.startup_loaded = false;
             s.apply_saved_workspace(
@@ -15589,7 +15601,7 @@ Done."#
         let model = agent_auth::AgentModel {
             provider: "commandcode".into(),
             id: "deepseek/deepseek-v4-flash".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         assert_eq!(
             agent_model_selector(&model),
@@ -17283,7 +17295,7 @@ First report
         let model = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
             id: "gemini-example".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, window, cx| {
             s.set_chat_mode(id, true, window, cx);
@@ -17296,7 +17308,7 @@ First report
             auth.providers = vec![agent_auth::Provider {
                 id: "google-antigravity".into(),
                 ready: true,
-                source: Some("omp OAuth".into()),
+                source: Some("Kathamo credential".into()),
             }];
             auth.models = vec![model.clone()];
         });
@@ -17431,7 +17443,7 @@ First report
         let connected = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
             id: "gemini-connected".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         let disconnected = agent_auth::AgentModel {
             provider: "anthropic".into(),
@@ -17455,7 +17467,7 @@ First report
                 agent_auth::Provider {
                     id: "google-antigravity".into(),
                     ready: true,
-                    source: Some("omp OAuth".into()),
+                    source: Some("Kathamo credential".into()),
                 },
             ];
             auth.models = vec![disconnected.clone(), connected.clone()];
@@ -17536,7 +17548,7 @@ First report
         let connected = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
             id: "gemini-connected".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
         let disconnected = agent_auth::AgentModel {
             provider: "anthropic".into(),
@@ -17557,7 +17569,7 @@ First report
                 agent_auth::Provider {
                     id: "google-antigravity".into(),
                     ready: true,
-                    source: Some("omp OAuth".into()),
+                    source: Some("Kathamo credential".into()),
                 },
             ];
             auth.models = vec![disconnected, connected];
@@ -17648,7 +17660,7 @@ First report
         let model = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
             id: "gemini-pro".into(),
-            backend: agent_auth::ModelBackend::Omp,
+            backend: agent_auth::ModelBackend::Kathamo,
         };
 
         cx.update_window_entity(&state, |s, window, cx| {
@@ -17665,7 +17677,7 @@ First report
                 agent_auth::Provider {
                     id: "google-antigravity".into(),
                     ready: true,
-                    source: Some("omp OAuth".into()),
+                    source: Some("Kathamo credential".into()),
                 },
             ];
             auth.models = vec![model];

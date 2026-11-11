@@ -147,13 +147,21 @@ keeps the model shown in its input bar across restarts, so panes can run
 different models side by side. Each selected model has a separate conversation
 within the pane. The first prompt supplies the session title.
 
-#### Gemini 3.8 Flash
+#### Antigravity models
 
 For Antigravity, open `/auth`, select **google-antigravity**, and choose
-**Connect with OAuth (Browser)**. After Google sign-in, select
-`google-antigravity/gemini-3.8-flash` in `/model`. Kathamo exchanges and refreshes
-the token in its embedded backend. Sign in once to create the native credential
-store. Existing Kathamo transcripts remain readable.
+**Connect with OAuth (Browser)**. After Google sign-in, choose a model in `/model`:
+`google-antigravity/gemini-3.8-flash` (the default),
+`google-antigravity/claude-sonnet-4-6`,
+`google-antigravity/gemini-3.1-flash-lite`,
+`google-antigravity/gemini-3.5-flash-lite`,
+`google-antigravity/gemini-2.5-flash`, or
+`google-antigravity/gemini-2.5-flash-lite`. The Flash-Lite and Claude routes
+stay responsive when the Gemini 3.8 Flash Cloud Code endpoint is congested.
+The `⚡ Fast`/`🧠 Deep` toggle and `/thinking` apply to all Antigravity models.
+Kathamo exchanges and refreshes the token in its embedded backend. Sign in once
+to create the native credential store. Existing Kathamo transcripts remain
+readable.
 
 Configure the desktop OAuth client through `KATHAMO_ANTIGRAVITY_CLIENT_ID` and
 `KATHAMO_ANTIGRAVITY_CLIENT_SECRET`, or set `client_id` and `client_secret`

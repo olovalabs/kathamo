@@ -65,10 +65,14 @@ pub fn catalog() -> Result<Vec<ModelInfo>, String> {
                 })
                 .collect();
             rows.retain(|model| model.provider != ANTIGRAVITY);
-            rows.push(ModelInfo {
-                provider: ANTIGRAVITY.into(),
-                id: rpi_ai::providers::antigravity::MODEL.into(),
-            });
+            rows.extend(
+                rpi_ai::providers::antigravity::models()
+                    .into_iter()
+                    .map(|model| ModelInfo {
+                        provider: ANTIGRAVITY.into(),
+                        id: model.id,
+                    }),
+            );
             rows
         })
         .map_err(|error| error.to_string())

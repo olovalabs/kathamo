@@ -27,19 +27,56 @@ pub type AccountSource = Arc<
         + Sync,
 >;
 
-pub fn model() -> Model {
-    let mut model = Model::new(
-        MODEL,
-        "Gemini 3.8 Flash (Antigravity)",
-        Api::GoogleGenerativeAi,
-        ID,
-        ENDPOINT,
-    );
+fn descriptor(id: &str, name: &str, context_window: u64, max_tokens: u64) -> Model {
+    let mut model = Model::new(id, name, Api::GoogleGenerativeAi, ID, ENDPOINT);
     model.reasoning = true;
     model.input.push(InputModality::Image);
-    model.context_window = 1_048_576;
-    model.max_tokens = 65_536;
+    model.context_window = context_window;
+    model.max_tokens = max_tokens;
     model
+}
+
+/// Every Antigravity model this client can address. Gemini 3.8 Flash is the
+/// default; the Flash-Lite and Claude routes stay responsive when the 3.8
+/// endpoint is congested.
+pub fn models() -> Vec<Model> {
+    vec![
+        descriptor(MODEL, "Gemini 3.8 Flash (Antigravity)", 1_048_576, 65_536),
+        descriptor(
+            "gemini-3.5-flash-lite",
+            "Gemini 3.5 Flash-Lite (Antigravity)",
+            1_048_576,
+            65_536,
+        ),
+        descriptor(
+            "gemini-3.1-flash-lite",
+            "Gemini 3.1 Flash-Lite (Antigravity)",
+            1_048_576,
+            65_536,
+        ),
+        descriptor(
+            "gemini-2.5-flash",
+            "Gemini 2.5 Flash (Antigravity)",
+            1_048_576,
+            65_536,
+        ),
+        descriptor(
+            "gemini-2.5-flash-lite",
+            "Gemini 2.5 Flash-Lite (Antigravity)",
+            1_048_576,
+            65_536,
+        ),
+        descriptor(
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6 (Antigravity)",
+            250_000,
+            64_000,
+        ),
+    ]
+}
+
+pub fn model() -> Model {
+    descriptor(MODEL, "Gemini 3.8 Flash (Antigravity)", 1_048_576, 65_536)
 }
 
 pub fn user_agent() -> String {
@@ -60,7 +97,7 @@ pub fn user_agent() -> String {
 pub struct AntigravityProvider {
     http: reqwest::Client,
     source: AccountSource,
-    model: [Model; 1],
+    model: Vec<Model>,
     trajectory: uuid::Uuid,
     session_id: String,
 }
@@ -71,7 +108,7 @@ impl AntigravityProvider {
         Self {
             http,
             source,
-            model: [model()],
+            model: models(),
             trajectory: uuid::Uuid::new_v4(),
             session_id: random.to_string(),
         }
@@ -210,6 +247,14 @@ fn build_request(
         }
         _ => "LOW",
     };
+    // Gemini 3.8 selects its thinking tier through a suffixed wire id. The
+    // older Gemini and Claude routes take the unsuffixed id plus
+    // `thinkingConfig`.
+    let wire_model = if model.id == MODEL {
+        format!("{}-{}", model.id, level.to_ascii_lowercase())
+    } else {
+        model.id.clone()
+    };
     let mut request = json!({
         "sessionId": session,
         "contents": contents,
@@ -243,7 +288,7 @@ fn build_request(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis());
     json!({
-        "model": format!("{}-{}", model.id, level.to_ascii_lowercase()),
+        "model": wire_model,
         "requestId": format!("agent/{trajectory}/{now}/{trajectory}/{steps}"),
         "userAgent": "antigravity",
         "request": request,
@@ -338,5 +383,38 @@ mod tests {
         let results = contents[2]["parts"].as_array().unwrap();
         assert_eq!(results[0]["functionResponse"]["response"]["output"], "113");
         assert_eq!(results[1]["functionResponse"]["response"]["output"], "127");
+    }
+
+    #[test]
+    fn routes_effort_through_the_wire_model_id() {
+        let context = Context::new(vec![crate::UserMessage::new("hi", 0).into()]);
+        let models = models();
+        let flash = models.iter().find(|model| model.id == MODEL).unwrap();
+        let lite = models
+            .iter()
+            .find(|model| model.id == "gemini-3.1-flash-lite")
+            .unwrap();
+        let claude = models
+            .iter()
+            .find(|model| model.id == "claude-sonnet-4-6")
+            .unwrap();
+        let low = SimpleStreamOptions {
+            reasoning: Some(crate::ThinkingLevel::Low),
+            ..Default::default()
+        };
+        let high = SimpleStreamOptions {
+            reasoning: Some(crate::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let wire = |model, options| {
+            build_request(model, &context, options, "session", uuid::Uuid::nil())["model"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(wire(flash, &low), "gemini-3.8-flash-low");
+        assert_eq!(wire(flash, &high), "gemini-3.8-flash-high");
+        assert_eq!(wire(lite, &high), "gemini-3.1-flash-lite");
+        assert_eq!(wire(claude, &low), "claude-sonnet-4-6");
     }
 }

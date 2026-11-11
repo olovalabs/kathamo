@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added an auto-focused, theme-matched model search field with a search icon, clear button, case-insensitive model/provider filtering, and a no-results state.
+- Antigravity model catalog now exposes Claude Sonnet 4.6 and Gemini 3.5/3.1/2.5 Flash-Lite alongside Gemini 3.8 Flash, with the same Fast/Deep reasoning controls, so chat can use a responsive route while the 3.8 Cloud Code endpoint is congested.
 - Native OMP approval, selection, confirmation, text/editor and structured-question dialogs with cancellation, expiry and stale-session guards; interaction responses stay out of transcript persistence.
 - Explicit, confirmed workspace-scoped OMP trust: protected `write` by default, opt-in `yolo`, canonical-path checks and safe deferred authority changes during active turns.
 - Per-pane explicit OMP reasoning effort without changing models, alongside Fast/Deep presets.
@@ -43,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Restyled model selection with compact rows, trailing selection checks, free-model badges, and a two-column provider card section matching the OpenCode reference. Model selection and provider authentication now share one narrower 520px modal with theme-derived backgrounds, text, borders, and hover colors, plus consistent close and back navigation.
 - Compact streamed OMP text, worker deltas and cumulative tool snapshots before enqueue with bounded backpressure, preserving tool lifecycle order and complete results.
 - Favor independent read/search batches and deterministic multi-step local execution while keeping OMP's shared/exclusive scheduling and full tool/extension discovery.
 - Redesigned the project sidebar with compact, smaller session titles without per-session logos, reduced left padding, subtle selection styling, and project/session remove buttons shown only while hovering their row. Each project initially shows five sessions; each "Show more" click reveals ten more, and "Show less" collapses back to five. Expanded lists scroll while the toolbar and Settings footer remain visible.

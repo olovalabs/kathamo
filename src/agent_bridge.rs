@@ -341,7 +341,9 @@ impl EmbeddedBridge {
 }
 
 fn uses_gemini(model: Option<&str>) -> bool {
-    matches!(model, Some("google/gemini-3.8-flash" | "google-antigravity/gemini-3.8-flash"))
+    model.is_some_and(|model| {
+        model == "google/gemini-3.8-flash" || model.starts_with("google-antigravity/")
+    })
 }
 
 fn gemini_tool_approval() -> rpi_embedded::BeforeToolCall {
@@ -651,6 +653,17 @@ mod tests {
         assert!(matches!(&out[3], AgentEvent::ToolUpdate { output, .. } if output == "12"));
         assert!(matches!(&out[4], AgentEvent::ToolEnd { .. }));
         assert!(matches!(&out[5], AgentEvent::Done));
+    }
+
+    #[test]
+    fn every_antigravity_model_uses_the_embedded_approval_path() {
+        assert!(uses_gemini(Some("google-antigravity/gemini-3.8-flash")));
+        assert!(uses_gemini(Some(
+            "google-antigravity/gemini-3.1-flash-lite"
+        )));
+        assert!(uses_gemini(Some("google-antigravity/claude-sonnet-4-6")));
+        assert!(uses_gemini(Some("google/gemini-3.8-flash")));
+        assert!(!uses_gemini(Some("openai-codex/gpt-6.1-sol")));
     }
 
     #[test]

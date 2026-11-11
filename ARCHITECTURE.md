@@ -179,11 +179,13 @@ OpenAI-compatible HTTP transport sends requests to Google's Gemini API,
 streams text and reasoning, and carries Gemini thought signatures through
 tool calls and history. The host uses the embedded before-tool-call hook to
 ask for approval before running tools other than file reads and searches.
-The separate `google-antigravity/gemini-3.8-flash` provider uses Cloud Code
-Assist streaming. The embedded login worker performs OAuth with PKCE over a
-loopback redirect, discovers the account's project, and renews its credential
-from the local Antigravity auth store. The provider reuses the same event
-batching and tool approval path as the public Gemini API.
+The separate `google-antigravity` provider uses Cloud Code Assist streaming and
+registers Gemini 3.8 Flash, Claude Sonnet 4.6, and the Gemini Flash-Lite models,
+so a congested 3.8 route can be swapped for a faster one without changing
+providers. The embedded login worker performs OAuth with PKCE over a loopback
+redirect, discovers the account's project, and renews its credential from the
+local Antigravity auth store. The provider reuses the same event batching and
+tool approval path as the public Gemini API.
 
 ---
 

@@ -1916,7 +1916,11 @@ impl PaneChat {
         let selector = self.selected_model.as_ref().map(agent_model_selector);
         self.bridge_resume = self.rpi_session_id.clone();
         let bridge = ModelBridge::spawn_resumed(&cwd, self.bridge_resume.as_deref(), selector.as_deref())?;
-        if self.selected_model.as_ref().is_some_and(agent_auth::AgentModel::is_gemini_flash) {
+        if self
+            .selected_model
+            .as_ref()
+            .is_some_and(agent_auth::AgentModel::supports_reasoning_effort)
+        {
             bridge.set_thinking_level(self.mode_thinking_level())?;
         }
         self.cwd = Some(cwd);
@@ -5653,7 +5657,12 @@ impl AppState {
         let Some(pane) = self.pane_mut(pane_id) else {
             return;
         };
-        if !pane.chat.selected_model.as_ref().is_some_and(agent_auth::AgentModel::is_gemini_flash) {
+        if !pane
+            .chat
+            .selected_model
+            .as_ref()
+            .is_some_and(agent_auth::AgentModel::supports_reasoning_effort)
+        {
             return;
         }
         pane.chat.fast_mode = !pane.chat.fast_mode;
@@ -5730,7 +5739,7 @@ impl AppState {
             cx.new(|cx| InputState::new(window, cx).placeholder("Other provider ID"));
         let filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder(if page == AgentDialogPage::Models {
-                "Search models"
+                "Search models or providers"
             } else {
                 "Search providers"
             })
@@ -5739,7 +5748,7 @@ impl AppState {
         if page == AgentDialogPage::Auth {
             provider_input.update(cx, |state, cx| state.focus(window, cx));
         } else {
-            focus.focus(window, cx);
+            filter.update(cx, |state, cx| state.focus(window, cx));
         }
         let mut auth = AuthModal {
             page,
@@ -5820,7 +5829,7 @@ impl AppState {
         }
         if auth.page != page {
             let placeholder = if page == AgentDialogPage::Models {
-                "Search models"
+                "Search models or providers"
             } else {
                 "Search providers"
             };
@@ -5831,7 +5840,7 @@ impl AppState {
         }
         auth.page = page;
         if page == AgentDialogPage::Models {
-            auth.focus.focus(window, cx);
+            auth.filter.update(cx, |state, cx| state.focus(window, cx));
         } else {
             auth.provider_input
                 .update(cx, |state, cx| state.focus(window, cx));
@@ -6272,7 +6281,7 @@ impl AppState {
                     if pane.chat.auth_refresh_pending && !pane.chat.running {
                         let mut retry = false;
                         let thinking = pane.chat.bridge_model.as_ref()
-                            .filter(|model| model.is_gemini_flash())
+                            .filter(|model| model.supports_reasoning_effort())
                             .map(|_| pane.chat.mode_thinking_level().to_owned());
                         if let Some(bridge) = pane.chat.bridge.as_mut() {
                             let result = bridge.restart_after_auth().and_then(|()| {
@@ -6429,7 +6438,7 @@ impl AppState {
             input.update(cx, |state, cx| state.set_value("", window, cx));
             self.toggle_fast_mode(pane_id, cx);
             if !self.pane_ref(pane_id).is_some_and(|pane| pane.chat.selected_model.as_ref()
-                .is_some_and(|model| model.is_gemini_flash())) {
+                .is_some_and(|model| model.supports_reasoning_effort())) {
                 return;
             }
             let fast = self
@@ -6457,15 +6466,15 @@ impl AppState {
             let status = if !supported_thinking_effort(level) {
                 "Usage: /thinking auto|inherit|off|minimal|low|medium|high|xhigh|max.".to_owned()
             } else if !pane.chat.selected_model.as_ref().is_some_and(|model|
-                model.is_gemini_flash()) {
-                "Choose Gemini 3.8 Flash to adjust reasoning effort.".to_owned()
+                model.supports_reasoning_effort()) {
+                "Choose a Gemini or Claude Antigravity model to adjust reasoning effort.".to_owned()
             } else {
                 let result = pane.chat.bridge.as_mut()
                     .map(|bridge| bridge.set_thinking_level(level)).unwrap_or(Ok(()));
                 match result {
                     Ok(()) => {
                         pane.chat.thinking_override = Some(level.to_owned());
-                        format!("Gemini reasoning effort: {level}.")
+                        format!("Reasoning effort: {level}.")
                     }
                     Err(error) => format!("Could not set reasoning effort: {error}"),
                 }
@@ -8840,7 +8849,7 @@ impl AppState {
                             }))
                     ))
                     .when(pane.chat.active && pane.chat.selected_model.as_ref()
-                        .is_some_and(agent_auth::AgentModel::is_gemini_flash), |row| row.child(
+                        .is_some_and(agent_auth::AgentModel::supports_reasoning_effort), |row| row.child(
                         div().id(("agent-speed-toggle", pane_id))
                             .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
                             .text_size(px(11.0))
@@ -9099,7 +9108,487 @@ impl AppState {
         else {
             return div().into_any_element();
         };
-        self.render_agent_auth(pane_id, auth, cx)
+        let tokens = self.tokens(cx);
+        let page = auth.page;
+        let content = match page {
+            AgentDialogPage::Models => self.render_agent_models(pane_id, auth, cx),
+            AgentDialogPage::Auth => self.render_agent_auth(pane_id, auth, cx),
+        };
+        deferred(
+            div()
+                .id(("auth-layer", pane_id))
+                .debug_selector(|| "agent-auth-layer".into())
+                .absolute()
+                .size_full()
+                .top_0()
+                .left_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x000000a6))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.close_agent_auth(pane_id, window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .id(("auth-panel", pane_id))
+                        .debug_selector(move || {
+                            if page == AgentDialogPage::Models {
+                                "agent-model-panel".into()
+                            } else {
+                                "agent-provider-panel".into()
+                            }
+                        })
+                        .track_focus(&auth.focus)
+                        .w(px(520.0))
+                        .max_w(relative(0.97))
+                        .max_h(relative(0.98))
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(tokens.card_border)
+                        .bg(tokens.card_bg)
+                        .text_color(tokens.text_primary)
+                        .text_size(px(14.0))
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                        )
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.close_agent_auth(pane_id, window, cx);
+                            }
+                        }))
+                        .child(
+                            div()
+                                .h(px(48.0))
+                                .flex_shrink_0()
+                                .px(px(20.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .when(page == AgentDialogPage::Auth, |header| {
+                                            header.child(
+                                                div()
+                                                    .id(("models-tab", pane_id))
+                                                    .debug_selector(|| "agent-model-back".into())
+                                                    .size(px(24.0))
+                                                    .rounded(px(4.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .cursor(CursorStyle::PointingHand)
+                                                    .hover(move |view| view.bg(tokens.card_hover))
+                                                    .child(
+                                                        svg()
+                                                            .path("icons/arrow-left.svg")
+                                                            .size(px(14.0))
+                                                            .text_color(tokens.text_muted),
+                                                    )
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            this.set_agent_dialog_page(
+                                                                pane_id,
+                                                                AgentDialogPage::Models,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }),
+                                                    ),
+                                            )
+                                        })
+                                        .child(div().text_size(px(15.0)).child(match page {
+                                            AgentDialogPage::Models => "Select model",
+                                            AgentDialogPage::Auth => "Authenticate provider",
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(("auth-close", pane_id))
+                                        .debug_selector(|| "agent-dialog-close".into())
+                                        .size(px(24.0))
+                                        .rounded(px(4.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |view| view.bg(tokens.card_hover))
+                                        .child(
+                                            svg()
+                                                .path("icons/x.svg")
+                                                .size(px(14.0))
+                                                .text_color(tokens.text_muted),
+                                        )
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.close_agent_auth(pane_id, window, cx);
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .child(content),
+                ),
+        )
+        .priority(210)
+        .into_any_element()
+    }
+
+    fn render_agent_models(
+        &self,
+        pane_id: usize,
+        auth: &AuthModal,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tokens = self.tokens(cx);
+        let background = tokens.card_bg;
+        let inset = tokens.card_hover;
+        let card = tokens.pane_bg;
+        let border = tokens.card_border;
+        let muted = tokens.text_muted;
+        let foreground = tokens.text_primary;
+        let query = auth.filter.read(cx).value().trim().to_lowercase();
+        let selected = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.chat.selected_model.as_ref());
+        let provider_name = |id: &str| {
+            match id {
+                "opencode-zen" => "OpenCode",
+                "opencode-go" => "OpenCode Go",
+                "openai" => "OpenAI",
+                "anthropic" => "Anthropic",
+                "google" => "Google",
+                "github-copilot" => "GitHub Copilot",
+                _ => id,
+            }
+            .to_string()
+        };
+        let mut rows = Vec::new();
+        let mut last_provider = None;
+        for (index, model) in auth
+            .models
+            .iter()
+            .filter(|model| {
+                auth.providers
+                    .iter()
+                    .any(|provider| provider.id == model.provider && provider.ready)
+                    && (query.is_empty()
+                        || model.id.to_lowercase().contains(&query)
+                        || model.provider.to_lowercase().contains(&query))
+            })
+            .enumerate()
+        {
+            if last_provider != Some(model.provider.as_str()) {
+                last_provider = Some(model.provider.as_str());
+                rows.push(
+                    div()
+                        .px(px(20.0))
+                        .pt(px(4.0))
+                        .pb(px(8.0))
+                        .text_size(px(14.0))
+                        .text_color(muted)
+                        .child(format!(
+                            "Models provided by {}",
+                            provider_name(&model.provider)
+                        ))
+                        .into_any_element(),
+                );
+            }
+            let choice = model.clone();
+            rows.push(
+                div()
+                    .id(("agent-model", index))
+                    .debug_selector(move || format!("agent-model-{index}"))
+                    .h(px(36.0))
+                    .flex_shrink_0()
+                    .px(px(20.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .text_size(px(14.0))
+                    .text_color(foreground)
+                    .cursor(CursorStyle::PointingHand)
+                    .hover(move |row| row.bg(inset))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .min_w_0()
+                            .child(
+                                div().truncate().child(
+                                    model
+                                        .id
+                                        .trim_end_matches(":free")
+                                        .trim_end_matches("-free")
+                                        .to_string(),
+                                ),
+                            )
+                            .when(
+                                model.id.ends_with(":free") || model.id.ends_with("-free"),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .px(px(4.0))
+                                            .h(px(16.0))
+                                            .rounded(px(2.0))
+                                            .border_1()
+                                            .border_color(border)
+                                            .bg(inset)
+                                            .text_size(px(11.0))
+                                            .text_color(muted)
+                                            .child("Free"),
+                                    )
+                                },
+                            ),
+                    )
+                    .when(selected == Some(model), |row| {
+                        row.child(
+                            svg()
+                                .path("icons/status-check.svg")
+                                .size(px(12.0))
+                                .text_color(foreground),
+                        )
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.select_agent_model(
+                                pane_id,
+                                Some(choice.clone()),
+                                false,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let loading = auth.discovery.is_some() || auth.model_discovery.is_some();
+        let empty = rows.is_empty();
+        let featured = [
+            (
+                "opencode-go",
+                "OpenCode Go",
+                "Low cost subscription for everyone",
+                "icons/provider-opencode-go.svg",
+            ),
+            (
+                "opencode-zen",
+                "OpenCode Console",
+                "Reliable optimized models",
+                "icons/provider-opencode.svg",
+            ),
+            ("openai", "OpenAI", "", "icons/provider-openai.svg"),
+            ("anthropic", "Anthropic", "", "icons/provider-anthropic.svg"),
+            ("google", "Google", "", "icons/provider-google.svg"),
+            (
+                "github-copilot",
+                "GitHub Copilot",
+                "",
+                "icons/provider-github-copilot.svg",
+            ),
+        ];
+        let mut cards = Vec::new();
+        for (index, pair) in featured.chunks(2).enumerate() {
+            cards.push(div().flex().gap(px(8.0)).children(pair.iter().map(
+                |&(id, name, description, icon)| {
+                    div()
+                        .id(SharedString::from(format!("model-provider-{id}")))
+                        .debug_selector(move || format!("model-provider-{id}"))
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(if index == 0 { 62.0 } else { 44.0 }))
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(border)
+                        .bg(card)
+                        .flex()
+                        .items_start()
+                        .gap(px(10.0))
+                        .cursor(CursorStyle::PointingHand)
+                        .hover(move |view| view.bg(background))
+                        .child(
+                            svg()
+                                .path(icon)
+                                .size(px(14.0))
+                                .mt(px(3.0))
+                                .flex_shrink_0()
+                                .text_color(foreground),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(div().truncate().text_color(foreground).child(name))
+                                .when(!description.is_empty(), |view| {
+                                    view.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(px(12.0))
+                                            .text_color(muted)
+                                            .child(description),
+                                    )
+                                }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.set_agent_dialog_page(
+                                    pane_id,
+                                    AgentDialogPage::Auth,
+                                    window,
+                                    cx,
+                                );
+                                this.select_provider_for_auth(pane_id, id.to_string(), window, cx);
+                            }),
+                        )
+                },
+            )));
+        }
+        let remaining = auth
+            .providers
+            .iter()
+            .filter(|provider| !featured.iter().any(|(id, _, _, _)| *id == provider.id))
+            .count();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                div()
+                    .id(("model-filter", pane_id))
+                    .debug_selector(|| "agent-model-filter".into())
+                    .mx(px(20.0))
+                    .mb(px(12.0))
+                    .flex_shrink_0()
+                    .child(
+                        Input::new(&auth.filter)
+                            .h(px(36.0))
+                            .rounded(px(8.0))
+                            .bg(card)
+                            .border_color(border)
+                            .text_color(foreground)
+                            .text_size(px(13.0))
+                            .prefix(
+                                svg()
+                                    .path("ui_icons/search.svg")
+                                    .size(px(14.0))
+                                    .text_color(muted),
+                            )
+                            .cleanable(true),
+                    ),
+            )
+            .child(
+                div()
+                    .id(("agent-models", pane_id))
+                    .min_h_0()
+                    .max_h(px(488.0))
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .flex()
+                    .flex_col()
+                    .pb(px(12.0))
+                    .children(rows)
+                    .when(empty, |view| {
+                        view.child(div().px(px(20.0)).py(px(24.0)).text_color(muted).child(
+                            if loading {
+                                "Loading models…"
+                            } else if !query.is_empty() {
+                                "No models match your search."
+                            } else {
+                                "Connect a provider below to select a model."
+                            },
+                        ))
+                    })
+                    .when_some(
+                        auth.model_error.as_ref().or(auth.error.as_ref()),
+                        |view, error| {
+                            view.child(
+                                div()
+                                    .px(px(20.0))
+                                    .py(px(8.0))
+                                    .text_color(tokens.block_failure)
+                                    .child(error.clone()),
+                            )
+                        },
+                    ),
+            )
+            .child(
+                div()
+                    .mx(px(8.0))
+                    .mb(px(8.0))
+                    .mt(px(6.0))
+                    .p(px(10.0))
+                    .flex_shrink_0()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(border)
+                    .bg(inset)
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .pb(px(6.0))
+                            .text_color(muted)
+                            .child("Add more models from popular providers"),
+                    )
+                    .children(cards)
+                    .child(
+                        div()
+                            .id(("models-open-providers", pane_id))
+                            .debug_selector(|| "agent-more-providers".into())
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .text_color(muted)
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(move |view| view.text_color(foreground))
+                            .child(if remaining > 0 {
+                                format!("See {remaining} more providers")
+                            } else {
+                                "See all providers".into()
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.set_agent_dialog_page(
+                                        pane_id,
+                                        AgentDialogPage::Auth,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_agent_auth(
@@ -9109,24 +9598,16 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let tokens = self.tokens(cx);
-        let current_model = self
-            .pane_ref(pane_id)
-            .and_then(|pane| pane.chat.selected_model.clone());
         let filter_query = auth.filter.read(cx).value().trim().to_lowercase();
 
         let mut providers: Vec<&agent_auth::Provider> = auth
             .providers
             .iter()
             .filter(|provider| {
-                filter_query.is_empty()
-                    || provider.id.to_lowercase().contains(&filter_query)
-
+                filter_query.is_empty() || provider.id.to_lowercase().contains(&filter_query)
             })
             .collect();
         providers.sort_by_key(|provider| (!provider.ready, provider.id.clone()));
-        let mut modal_bg = tokens.card_bg;
-        modal_bg.a = if tokens.is_dark { 0.95 } else { 0.96 };
-        let modal_border = tokens.card_border;
         let modal_divider = tokens.border_subtle;
 
         let row_hover_bg = tokens.card_hover;
@@ -9141,29 +9622,13 @@ impl AppState {
         let mut dot_unconnected = tokens.text_muted;
         dot_unconnected.a = if tokens.is_dark { 0.38 } else { 0.30 };
 
-        let btn_contrast_bg = tokens.card_hover;
+        let btn_contrast_bg = tokens.pane_bg;
         let btn_contrast_border = tokens.card_border;
         let btn_contrast_hover = tokens.pane_header_btn_hover;
 
-        let close_btn_hover = tokens.card_hover;
-
-        let tabs_bg = tokens.pane_bg;
-        let tabs_border = tokens.card_border;
-        let active_tab_bg = tokens.card_bg;
-        let active_tab_border = tokens.card_border;
-
-        let card_sub_bg = tokens.pane_header_bg;
-
-        let esc_chip_bg = tokens.pane_bg;
-        let esc_chip_border = tokens.card_border;
-
-        let open_providers_bg = tokens.card_hover;
-        let open_providers_hover = tokens.pane_header_btn_hover;
-
+        let card_sub_bg = tokens.card_hover;
         let disconnect_bg = tokens.card_hover;
 
-        let mut modal_top_highlight = tokens.border_subtle;
-        modal_top_highlight.a = if tokens.is_dark { 0.45 } else { 0.70 };
         let provider_rows = providers
             .iter()
             .enumerate()
@@ -9316,362 +9781,20 @@ impl AppState {
             })
             .collect::<Vec<_>>();
         let has_matching_providers = !provider_rows.is_empty();
-        let connected_models: Vec<&agent_auth::AgentModel> = auth
-            .models
-            .iter()
-            .filter(|model| {
-                auth.providers
-                    .iter()
-                    .any(|provider| provider.id == model.provider && provider.ready)
-            })
-            .collect();
-        let has_connected_models = !connected_models.is_empty();
-        let matching_models: Vec<&agent_auth::AgentModel> = connected_models
-            .iter()
-            .copied()
-            .filter(|model| {
-                filter_query.is_empty()
-                    || model.id.to_lowercase().contains(&filter_query)
-                    || model.provider.to_lowercase().contains(&filter_query)
-            })
-            .collect();
-        let has_matching_models = !matching_models.is_empty();
-        let mut model_rows: Vec<AnyElement> = Vec::new();
-        let mut last_provider: Option<&str> = None;
-        for (index, model) in matching_models.iter().enumerate() {
-            if last_provider != Some(model.provider.as_str()) {
-                last_provider = Some(model.provider.as_str());
-                model_rows.push(
-                    div()
-                        .id(("agent-model-provider", index))
-                        .mt(px(8.0))
-                        .mb(px(2.0))
-                        .px(px(10.0))
-                        .py(px(3.0))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(tokens.text_muted)
-                                .child(model.provider.to_uppercase()),
-                        )
-                        .child(
-                            div()
-                                .px(px(5.0))
-                                .py(px(1.0))
-                                .rounded(px(3.0))
-                                .bg(chip_bg)
-                                .border_1()
-                                .border_color(modal_divider)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(tokens.text_muted)
-                                .child(match model.backend {
-                                    agent_auth::ModelBackend::Rpi => "rpi",
-                                    agent_auth::ModelBackend::Kathamo => "Kathamo",
-                                }),
-                        )
-                        .into_any_element(),
-                );
-            }
-            let is_selected = current_model.as_ref() == Some(*model);
-            let is_default = self.effective_default_agent_model() == Some(*model);
-            let selected_model = (*model).clone();
-            let default_model = (*model).clone();
-            model_rows.push(
-                div()
-                    .id(("agent-model", index))
-                    .debug_selector(move || format!("agent-model-{index}"))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .py(px(6.5))
-                    .rounded(px(6.0))
-                    .text_color(tokens.text_primary)
-                    .cursor(CursorStyle::PointingHand)
-                    .when(is_selected, move |view| view.bg(row_selected_bg))
-                    .hover(move |view| view.bg(row_hover_bg))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .size(px(14.0))
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(is_selected, |slot| {
-                                        slot.child(
-                                            svg()
-                                                .path("icons/status-check.svg")
-                                                .size(px(11.5))
-                                                .text_color(tokens.block_success),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .font_family(MONO_FONT)
-                                    .text_size(px(12.5))
-                                    .truncate()
-                                    .child(model.id.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("default-agent-model", index))
-                            .px(px(7.0))
-                            .py(px(2.5))
-                            .rounded(px(4.0))
-                            .text_size(px(10.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .cursor(CursorStyle::PointingHand)
-                            .when(is_default, move |view| {
-                                view.bg(chip_bg)
-                                    .border_1()
-                                    .border_color(modal_divider)
-                                    .text_color(tokens.text_muted)
-                            })
-                            .when(!is_default, move |view| {
-                                view.border_1()
-                                    .border_color(modal_divider)
-                                    .text_color(tokens.text_secondary)
-                                    .hover(move |view| {
-                                        view.text_color(tokens.text_primary).bg(chip_bg)
-                                    })
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.select_agent_model(
-                                        pane_id,
-                                        Some(default_model.clone()),
-                                        true,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            ),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.select_agent_model(
-                                pane_id,
-                                Some(selected_model.clone()),
-                                false,
-                                window,
-                                cx,
-                            );
-                        }),
-                    )
-                    .into_any_element(),
-            );
-        }
-        deferred(
-             div().id(("auth-layer", pane_id)).absolute().size_full().top_0().left_0()
-                 .debug_selector(|| "agent-auth-layer".into())
-                 .occlude()
-                 .flex().items_center().justify_center()
-                 .bg(rgba(0x000000a6))
-                 .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                     cx.stop_propagation();
-                     this.close_agent_auth(pane_id, window, cx);
-                 }))
-                 .child(
-                     div().id(("auth-panel", pane_id))
-                         .track_focus(&auth.focus)
-                         .w(px(540.0)).max_w(relative(0.95)).max_h(relative(0.9))
-                        .rounded(px(14.0)).border_1()
-                        .border_color(modal_border).bg(modal_bg).shadow_2xl()
-                        .child(
-                            div()
-                                .w_full()
-                                .h(px(1.0))
-                                .bg(modal_top_highlight),
-                        )
-                         .flex().flex_col()
-                         .overflow_hidden()
-                         .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
-                         .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                             if event.keystroke.key == "escape" {
-                                 cx.stop_propagation();
-                                 this.close_agent_auth(pane_id, window, cx);
-                             }
-                         }))
-                         .on_action(cx.listener(move |this, _: &gpui_component::input::Enter, window, cx| {
-                             cx.stop_propagation();
-                             this.submit_agent_auth(pane_id, window, cx);
-                         }))
-                         .child(
-                             div()
-                                 .px(px(20.0))
-                                 .pt(px(18.0))
-                                 .pb(px(14.0))
-                                 .flex()
-                                 .items_start()
-                                 .justify_between()
-                                 .gap(px(12.0))
-                                 .child(
-                                     div()
-                                         .flex_1()
-                                         .flex()
-                                         .flex_col()
-                                         .gap(px(3.0))
-                                         .child(
-                                             div()
-                                                 .text_size(px(15.0))
-                                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                 .text_color(tokens.text_primary)
-                                                 .child(if auth.page == AgentDialogPage::Models {
-                                                     "Choose model"
-                                                 } else {
-                                                     "Authenticate provider"
-                                                 }),
-                                         )
-                                         .child(
-                                             div()
-                                                 .text_size(px(12.5))
-                                                 .text_color(tokens.text_muted)
-                                                 .child(if auth.page == AgentDialogPage::Models {
-                                                     "Select an AI model for this pane."
-                                                 } else {
-                                                     "Sign in to a provider to unlock its models."
-                                                 }),
-                                         ),
-                                 )
-                                 .child(
-                                     div()
-                                         .id(("auth-close", pane_id))
-                                         .cursor(CursorStyle::PointingHand)
-                                         .size(px(24.0))
-                                         .rounded(px(5.0))
-                                         .flex()
-                                         .items_center()
-                                         .justify_center()
-                                        .hover(move |btn| {
-                                            btn.bg(close_btn_hover)
-                                        })
-                                         .child(
-                                             svg()
-                                                 .path("icons/x.svg")
-                                                 .size(px(13.0))
-                                                 .text_color(tokens.text_muted),
-                                         )
-                                         .on_mouse_down(
-                                             MouseButton::Left,
-                                             cx.listener(move |this, _, window, cx| {
-                                                 cx.stop_propagation();
-                                                 this.close_agent_auth(pane_id, window, cx);
-                                             }),
-                                         ),
-                                 ),
-                         )
-                         .child(
-                             div()
-                                 .mx(px(20.0))
-                                 .mb(px(12.0))
-                                .p(px(3.0))
-                                .rounded(px(8.0))
-                                .bg(tabs_bg)
-                                .border_1()
-                                .border_color(tabs_border)
-                                .flex()
-                                .items_center()
-                                .child(
-                                    div()
-                                        .id(("models-tab", pane_id))
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .py(px(5.0))
-                                        .rounded(px(6.0))
-                                        .text_size(px(12.5))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .cursor(CursorStyle::PointingHand)
-                                        .text_color(if auth.page == AgentDialogPage::Models {
-                                            tokens.text_primary
-                                        } else {
-                                            tokens.text_muted
-                                        })
-                                        .when(auth.page == AgentDialogPage::Models, move |tab| {
-                                            tab.bg(active_tab_bg)
-                                                .border_1()
-                                                .border_color(active_tab_border)
-                                                .shadow_sm()
-                                        })
-                                        .hover(|tab| tab.text_color(tokens.text_primary))
-                                        .child("Models")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.set_agent_dialog_page(
-                                                    pane_id,
-                                                    AgentDialogPage::Models,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id(("auth-tab", pane_id))
-                                        .debug_selector(|| "agent-auth-tab".into())
-                                        .flex_1()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .py(px(5.0))
-                                        .rounded(px(6.0))
-                                        .text_size(px(12.5))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .cursor(CursorStyle::PointingHand)
-                                        .text_color(if auth.page == AgentDialogPage::Auth {
-                                            tokens.text_primary
-                                        } else {
-                                            tokens.text_muted
-                                        })
-                                        .when(auth.page == AgentDialogPage::Auth, move |tab| {
-                                            tab.bg(active_tab_bg)
-                                                .border_1()
-                                                .border_color(active_tab_border)
-                                                .shadow_sm()
-                                        })
-                                        .hover(|tab| tab.text_color(tokens.text_primary))
-                                        .child("Providers")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.set_agent_dialog_page(
-                                                    pane_id,
-                                                    AgentDialogPage::Auth,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                ),
-                        )
+        div()
+            .id(("agent-auth-content", pane_id))
+            .flex().flex_col().flex_1().min_h_0().overflow_hidden()
+            .on_action(cx.listener(move |this, _: &gpui_component::input::Enter, window, cx| {
+                cx.stop_propagation();
+                this.submit_agent_auth(pane_id, window, cx);
+            }))
                         .child(
                             div()
                                 .id(("auth-filter", pane_id))
                                 .debug_selector(|| "agent-dialog-filter".into())
                                 .mx(px(20.0))
                                 .mb(px(10.0))
+                                .flex_shrink_0()
                                 .child(
                                     Input::new(&auth.filter)
                                         .prefix(
@@ -9700,11 +9823,12 @@ impl AppState {
                         )
                         .child(
                             div()
+                                .id(("auth-provider-body", pane_id))
                                 .px(px(16.0))
                                 .py(px(8.0))
                                 .flex_1()
                                 .min_h_0()
-                                .overflow_hidden()
+                                .overflow_y_scrollbar()
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.0))
@@ -9867,7 +9991,7 @@ impl AppState {
                                                                         .justify_center()
                                                                         .cursor(CursorStyle::PointingHand)
                                                                         .hover(move |b| {
-                                                                            b.bg(close_btn_hover)
+                                                                            b.bg(tokens.card_hover)
                                                                         })
                                                                         .child(
                                                                             svg()
@@ -10046,258 +10170,9 @@ impl AppState {
                                                 ),
                                         )
                                     })
-                                })
-                                .when(auth.page == AgentDialogPage::Models, |view| {
-                                    view.child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .px(px(4.0))
-                                            .py(px(2.0))
-                                            .child(
-                                                div()
-                                                    .text_size(px(12.0))
-                                                    .text_color(tokens.text_muted)
-                                                    .child(if auth.discovery.is_some() && !has_connected_models {
-                                                        "Checking provider connections…"
-                                                    } else if has_connected_models
-                                                        && !has_matching_models
-                                                        && !filter_query.is_empty()
-                                                    {
-                                                        "No matching models"
-                                                    } else if has_connected_models {
-                                                        "Models from connected providers"
-                                                    } else {
-                                                        "No connected providers"
-                                                    }),
-                                            )
-                                            .when(auth.model_discovery.is_none(), |header| {
-                                                header.child(
-                                                    div()
-                                                        .id(("refresh-models", pane_id))
-                                                        .px(px(7.0))
-                                                        .py(px(2.0))
-                                                        .rounded(px(4.0))
-                                                        .text_size(px(11.0))
-                                                        .text_color(tokens.text_muted)
-                                                        .cursor(CursorStyle::PointingHand)
-                                                        .hover(move |view| {
-                                                            view.text_color(tokens.text_primary)
-                                                                .bg(chip_bg)
-                                                        })
-                                                        .child("Refresh")
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            cx.listener(move |this, _, _, cx| {
-                                                                cx.stop_propagation();
-                                                                if let Some(auth) = this
-                                                                    .pane_mut(pane_id)
-                                                                    .and_then(|pane| pane.chat.auth.as_mut())
-                                                                {
-                                                                    auth.discover();
-                                                                    cx.notify();
-                                                                }
-                                                            }),
-                                                        ),
-                                                )
-                                            }),
-                                    )
-                                    .when(auth.model_discovery.is_some(), |view| {
-                                        view.child(
-                                            div()
-                                                .py(px(8.0))
-                                                .text_size(px(12.0))
-                                                .text_color(tokens.text_muted)
-                                                .child("Loading models…"),
-                                        )
-                                    })
-                                    .when_some(auth.model_error.as_ref(), |view, error| {
-                                        view.child(
-                                            div()
-                                                .py(px(4.0))
-                                                .text_size(px(11.0))
-                                                .text_color(tokens.block_failure)
-                                                .child(error.clone()),
-                                        )
-                                    })
-                                    .when(
-                                        auth.model_discovery.is_none() && has_matching_models,
-                                        |view| {
-                                            view.child(
-                                                div()
-                                                    .id(("agent-models", pane_id))
-                                                    .max_h(px(240.0))
-                                                    .overflow_y_scrollbar()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .gap(px(1.0))
-                                                    .children(model_rows),
-                                            )
-                                        },
-                                    )
-                                    .when(
-                                        auth.model_discovery.is_none()
-                                            && !has_connected_models
-                                            && auth.discovery.is_none(),
-                                        |view| {
-                                            view.child(
-                                                div()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .items_center()
-                                                    .gap(px(8.0))
-                                                    .py(px(16.0))
-                                                    .child(
-                                                        div()
-                                                            .text_size(px(12.5))
-                                                            .text_color(tokens.text_secondary)
-                                                            .child(
-                                                                "No models available from connected providers.",
-                                                            ),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .id(("models-open-providers", pane_id))
-                                                            .px(px(12.0))
-                                                            .py(px(5.0))
-                                                            .rounded(px(5.0))
-                                                            .bg(open_providers_bg)
-                                                            .border_1()
-                                                            .border_color(btn_contrast_border)
-                                                            .hover(move |v| {
-                                                                v.bg(open_providers_hover)
-                                                            })
-                                                            .text_size(px(11.5))
-                                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                                            .text_color(tokens.text_primary)
-                                                            .cursor(CursorStyle::PointingHand)
-                                                            .child("Open providers")
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                cx.listener(move |this, _, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.set_agent_dialog_page(
-                                                                        pane_id,
-                                                                        AgentDialogPage::Auth,
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                }),
-                                                            ),
-                                                    ),
-                                            )
-                                        },
-                                    )
-                                    .when_some(auth.error.as_ref(), |view, error| {
-                                        view.child(
-                                            div()
-                                                .py(px(4.0))
-                                                .text_size(px(11.0))
-                                                .text_color(tokens.block_failure)
-                                                .child(error.clone()),
-                                        )
-                                    })
                                 }),
                         )
-                        .child(
-                            div()
-                                .border_t_1()
-                                .border_color(modal_divider)
-                                .px(px(20.0))
-                                .py(px(10.0))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .px(px(5.0))
-                                                .py(px(1.5))
-                                                .rounded(px(3.5))
-                                                .bg(esc_chip_bg)
-                                                .border_1()
-                                                .border_color(esc_chip_border)
-                                                .text_size(px(10.0))
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                                .font_family(MONO_FONT)
-                                                .text_color(tokens.text_secondary)
-                                                .child("Esc"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.0))
-                                                .text_color(tokens.text_muted)
-                                                .child(if auth.page == AgentDialogPage::Auth {
-                                                    "Close cancels login"
-                                                } else {
-                                                    "Close dismisses"
-                                                }),
-                                        ),
-                                )
-                                .when(auth.page == AgentDialogPage::Models, |footer| {
-                                    footer.child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(12.0))
-                                            .child(
-                                                div()
-                                                    .id(("use-rpi", pane_id))
-                                                    .px(px(8.0))
-                                                    .py(px(3.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(chip_bg)
-                                                    .border_1()
-                                                    .border_color(modal_divider)
-                                                    .text_size(px(11.0))
-                                                    .text_color(tokens.text_secondary)
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .hover(|view| view.text_color(tokens.text_primary).bg(btn_contrast_bg))
-                                                    .child("Use automatic model")
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            cx.stop_propagation();
-                                                            this.select_agent_model(
-                                                                pane_id, None, false, window, cx,
-                                                            );
-                                                        }),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id(("reset-default-model", pane_id))
-                                                    .px(px(8.0))
-                                                    .py(px(3.0))
-                                                    .rounded(px(4.0))
-                                                    .bg(chip_bg)
-                                                    .border_1()
-                                                    .border_color(modal_divider)
-                                                    .text_size(px(11.0))
-                                                    .text_color(tokens.text_secondary)
-                                                    .cursor(CursorStyle::PointingHand)
-                                                    .hover(|view| view.text_color(tokens.text_primary).bg(btn_contrast_bg))
-                                                    .child("Reset default")
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(move |this, _, window, cx| {
-                                                            cx.stop_propagation();
-                                                            this.select_agent_model(
-                                                                pane_id, None, true, window, cx,
-                                                            );
-                                                        }),
-                                                    ),
-                                            ),
-                                    )
-                                }),
-                        )
-                )
-        ).priority(210).into_any_element()
+            .into_any_element()
     }
 
     fn render_chat_message(
@@ -17185,7 +17060,7 @@ First report
             cx.debug_bounds("auth-provider-0").is_none(),
             "model page must not show login rows"
         );
-        let bounds = cx.debug_bounds("agent-auth-tab").unwrap();
+        let bounds = cx.debug_bounds("agent-more-providers").unwrap();
         let center = point(
             bounds.origin.x + bounds.size.width / 2.0,
             bounds.origin.y + bounds.size.height / 2.0,
@@ -17404,22 +17279,12 @@ First report
     }
 
     #[test]
-    fn agent_dialog_filters_providers_and_models() {
+    fn agent_dialog_filters_providers() {
         let mut app = TestAppContext::new();
         let (mut cx, state) = open_app(&mut app);
         let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
-        let connected = agent_auth::AgentModel {
-            provider: "google-antigravity".into(),
-            id: "gemini-connected".into(),
-            backend: agent_auth::ModelBackend::Kathamo,
-        };
-        let disconnected = agent_auth::AgentModel {
-            provider: "anthropic".into(),
-            id: "claude-disconnected".into(),
-            backend: agent_auth::ModelBackend::Rpi,
-        };
         cx.update_window_entity(&state, |s, window, cx| {
-            s.open_agent_auth(id, AgentDialogPage::Models, window, cx);
+            s.open_agent_auth(id, AgentDialogPage::Auth, window, cx);
             let auth = s.pane_mut(id).unwrap().chat.auth.as_mut().unwrap();
             auth.discovery = None;
             auth.model_discovery = None;
@@ -17435,56 +17300,8 @@ First report
                     source: Some("Kathamo credential".into()),
                 },
             ];
-            auth.models = vec![disconnected, connected];
-        });
-        cx.draw_frame().expect("draw model page");
-
-        let filter = cx
-            .debug_bounds("agent-dialog-filter")
-            .expect("filter input renders");
-        let center = point(
-            filter.origin.x + filter.size.width / 2.0,
-            filter.origin.y + filter.size.height / 2.0,
-        );
-        cx.simulate_mouse_move(center, None, Modifiers::default());
-        cx.simulate_click(center, Modifiers::default());
-        cx.draw_frame().expect("draw focused filter");
-        cx.simulate_input("gemini");
-        cx.draw_frame().expect("draw filtered models");
-
-        assert!(
-            cx.debug_bounds("agent-model-0").is_some(),
-            "the matching model stays listed"
-        );
-        assert!(
-            cx.debug_bounds("agent-model-1").is_none(),
-            "non-matching models are filtered out"
-        );
-
-        // Enter belongs to the search field here, not the API-key form.
-        cx.simulate_keystrokes("enter");
-        cx.draw_frame().expect("draw after enter");
-        state.read_with(&cx, |s, _| {
-            let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
-            assert!(
-                auth.error.is_none(),
-                "pressing enter while searching must not submit a key"
-            );
-        });
-
-        cx.update_window_entity(&state, |s, window, cx| {
-            s.set_agent_dialog_page(id, AgentDialogPage::Auth, window, cx);
         });
         cx.draw_frame().expect("draw provider page");
-        state.read_with(&cx, |s, cx| {
-            let auth = s.pane_ref(id).unwrap().chat.auth.as_ref().unwrap();
-            assert_eq!(
-                auth.filter.read(cx).value().to_string(),
-                "",
-                "switching tabs clears the filter"
-            );
-        });
-
         let filter = cx
             .debug_bounds("agent-dialog-filter")
             .expect("filter input renders on the provider page");
@@ -17512,62 +17329,6 @@ First report
                 auth.providers.iter().any(|p| p.id == "anthropic"),
                 "filtering hides rows without dropping provider data"
             );
-        });
-    }
-    #[test]
-    fn agent_dialog_opencode_style_verification() {
-        let mut app = TestAppContext::new();
-        let (mut cx, state) = open_app(&mut app);
-        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
-
-        let model = agent_auth::AgentModel {
-            provider: "google-antigravity".into(),
-            id: "gemini-pro".into(),
-            backend: agent_auth::ModelBackend::Kathamo,
-        };
-
-        cx.update_window_entity(&state, |s, window, cx| {
-            s.open_agent_auth(id, AgentDialogPage::Models, window, cx);
-            let auth = s.pane_mut(id).unwrap().chat.auth.as_mut().unwrap();
-            auth.discovery = None;
-            auth.model_discovery = None;
-            auth.providers = vec![
-                agent_auth::Provider {
-                    id: "anthropic".into(),
-                    ready: false,
-                    source: None,
-                },
-                agent_auth::Provider {
-                    id: "google-antigravity".into(),
-                    ready: true,
-                    source: Some("Kathamo credential".into()),
-                },
-            ];
-            auth.models = vec![model];
-        });
-        cx.draw_frame().expect("draw opencode style models dialog");
-
-        assert!(cx.debug_bounds("agent-auth-layer").is_some());
-        assert!(cx.debug_bounds("agent-dialog-filter").is_some());
-        assert!(cx.debug_bounds("agent-model-0").is_some());
-
-        // Switch to providers tab
-        let tab_bounds = cx.debug_bounds("agent-auth-tab").unwrap();
-        let center = point(
-            tab_bounds.origin.x + tab_bounds.size.width / 2.0,
-            tab_bounds.origin.y + tab_bounds.size.height / 2.0,
-        );
-        cx.simulate_mouse_move(center, None, Modifiers::default());
-        cx.simulate_click(center, Modifiers::default());
-        cx.draw_frame().expect("draw providers page");
-        assert!(cx.debug_bounds("auth-provider-0").is_some());
-
-        cx.update_window_entity(&state, |s, window, cx| {
-            s.close_agent_auth(id, window, cx);
-        });
-        cx.draw_frame().expect("draw after close");
-        state.read_with(&cx, |s, _| {
-            assert!(s.pane_ref(id).unwrap().chat.auth.is_none());
         });
     }
 

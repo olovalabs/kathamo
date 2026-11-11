@@ -243,17 +243,15 @@ pub(crate) fn resolve(model: Option<&str>) -> Result<rpi_runtime::provider::Reso
         Box::pin(async move { account(&http, &path, rejected).await }) as _
     });
     let mut factories = rpi_runtime::provider::RuntimeFactories::default();
-    let descriptor = antigravity::model();
+    let descriptors = antigravity::models();
+    let api = descriptors[0].api.clone();
     factories.declare(rpi_runtime::ProviderDeclaration {
         id: ID.into(),
-        models: vec![descriptor.clone()],
+        models: descriptors,
         api_key_env: None,
         requires_auth: false,
     });
-    factories.register(
-        Arc::new(AntigravityProvider::new(http, source)),
-        descriptor.api,
-    );
+    factories.register(Arc::new(AntigravityProvider::new(http, source)), api);
     rpi_runtime::RuntimeConfig::default()
         .resolve(
             &rpi_runtime::ModelRequest {

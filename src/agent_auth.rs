@@ -30,6 +30,11 @@ impl AgentModel {
         matches!(self.provider.as_str(), "google" | "google-antigravity")
             && self.id == "gemini-3.8-flash"
     }
+
+    /// Gemini 3.8 and every Antigravity route accept a per-turn thinking level.
+    pub fn supports_reasoning_effort(&self) -> bool {
+        self.provider == "google-antigravity" || self.is_gemini_flash()
+    }
 }
 
 pub fn available_models(_cwd: &Path) -> Result<Vec<AgentModel>, String> {
@@ -80,13 +85,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn discovers_gemini_through_the_embedded_catalog() {
+    fn discovers_gemini_and_antigravity_models_through_the_embedded_catalog() {
         let cwd = Path::new(".");
         let models = available_models(cwd).unwrap();
         assert!(
             models
                 .iter()
                 .any(|model| model.provider == "google" && model.is_gemini_flash())
+        );
+        for id in [
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "claude-sonnet-4-6",
+        ] {
+            assert!(
+                models
+                    .iter()
+                    .any(|model| model.provider == "google-antigravity" && model.id == id),
+                "missing Antigravity model {id}"
+            );
+        }
+        assert!(
+            models
+                .iter()
+                .filter(|model| model.provider == "google-antigravity")
+                .all(AgentModel::supports_reasoning_effort)
         );
         assert!(
             providers(cwd)

@@ -9607,6 +9607,7 @@ impl AppState {
         let mut providers: Vec<&agent_auth::Provider> = auth
             .providers
             .iter()
+            .filter(|provider| provider.source.as_deref() != Some("anonymous"))
             .filter(|provider| {
                 filter_query.is_empty() || provider.id.to_lowercase().contains(&filter_query)
             })

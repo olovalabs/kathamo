@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Hide anonymous/keyless provider entries from the authentication list without removing their backend support.
 - Restyled model selection with compact rows, trailing selection checks, free-model badges, and a two-column provider card section matching the OpenCode reference. Model selection and provider authentication now share one narrower 520px modal with theme-derived backgrounds, text, borders, and hover colors, plus consistent close and back navigation.
 - Compact streamed OMP text, worker deltas and cumulative tool snapshots before enqueue with bounded backpressure, preserving tool lifecycle order and complete results.
 - Favor independent read/search batches and deterministic multi-step local execution while keeping OMP's shared/exclusive scheduling and full tool/extension discovery.

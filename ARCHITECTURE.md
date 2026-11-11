@@ -151,10 +151,12 @@ from the upstream library crates.
   reuses upstream's `rpi_cli::session::build`: model/credential resolution,
   built-in `read`/`bash`/`edit`/`write`/`docs` tools, the coding system prompt,
   durable JSONL session storage and `AgentHarness`.
-- **Typed transport.** A forwarding task maps `rpi_agent::AgentEvent` into the
-  existing `AgentEvent` contract, so the UI reducer, coalescing, tool grouping,
-  markdown, scrolling and transcript persistence are unchanged. No `rpi`
-  subprocess, stdio pipe or RPC JSONL transport is used.
+- **Typed transport.** A dedicated host emitter retains shared tool snapshots
+  before projecting text. Raw and projected queues each allow 256 records /
+  4 MiB, admitting one oversized final record exclusively. Async text/lifecycle
+  delivery backpressures without blocking runtime workers; intermediate
+  identified snapshots can coalesce. GPUI drains 64 records / 256 KiB per pane
+  and resignals pending work. The default backend uses no `rpi` subprocess.
 - **Lifecycle.** Prompts run on the session runtime. Stop and pane close call
   `request_stop_round` + `abort_reclaiming`, which cancels active tools. A
   stale resumed session id falls back to a fresh durable session.
@@ -168,6 +170,29 @@ from the upstream library crates.
 - **Isolation.** Embedded sessions build with `no_extensions` because upstream
   extension identity is process-global. Built-in tools/providers, `models.json`,
   `auth.json`, environment credentials and session storage are reused.
+- **Content search.** The built-in `grep` embeds ripgrep's matcher and searcher.
+  Native searches stream files on a blocking worker and discover directories
+  incrementally, retaining ignore rules, deterministic breadth-first ordering,
+  cancellation and bounded output without an external `rg` process.
+- **Shell execution.** `tokio::process::Command` runs Bash/PowerShell with
+  concurrently driven stdin, stdout, stderr, status, cancellation and deadlines.
+  An eight-record output channel feeds a bounded tail and complete asynchronous
+  log spool. First output is immediate; subsequent UI checkpoints use one
+  execution-local 16 ms timer, including quiet periods. Timeouts do not add a
+  post-reap sleep. Interrupted/dropped calls clean up their process groups.
+- **Interactive PTYs.** `terminal::pty_session` owns setup, resize, termination,
+  reaping and handle destruction off GPUI, using the existing smol pool and
+  worker-only deferred I/O. One FIFO writer bounds accepted/in-flight input to
+  32 MiB / 4,096 frames. Submission pacing starts after physical-write receipts;
+  refusals/failures remain visible and retain drafts. Parser/restoration batches
+  stay at most 128 KiB and yield between batches. Reader EOF is not a fake child
+  exit code.
+- **Persistence and RPC.** Conversation fields are capped before copying into a
+  256-entry / 8 MiB writer queue; overload/disk failures surface in chat.
+  Optional RPC spawn/restart/kill/wait/join run on lifecycle workers, not GPUI.
+
+See [SHELL_TOOL_AUDIT.md](SHELL_TOOL_AUDIT.md) for measured baselines, final
+timings, dependencies, file inventory and remaining limits.
 
 See `EMBEDDED_AGENT.md` for the upstream commit, integration details, verification
 and remaining limitations.

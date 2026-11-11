@@ -5250,8 +5250,10 @@ dependencies = [
  "flume",
  "gpui-fast",
  "gpui-fast-platform",
+ "libc",
  "parking_lot",
  "portable-pty",
+ "smol",
 ]
 
 [[package]]

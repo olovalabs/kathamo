@@ -65,7 +65,7 @@ impl AgentTool for PowerShellTool {
         _tool_call_id: &str,
         params: serde_json::Value,
         signal: CancellationToken,
-        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+        on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, AgentError> {
         if !cfg!(windows) {
             return Err(AgentError::Tool(
@@ -81,14 +81,14 @@ impl AgentTool for PowerShellTool {
             .collect();
         let encoded = STANDARD.encode(utf16);
         let command = encoded;
-        let program = if cfg!(windows) {
-            std::env::var_os("ProgramFiles")
-                .map(|p| std::path::PathBuf::from(p).join("PowerShell/7/pwsh.exe"))
-                .filter(|p| p.exists())
-                .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"))
-        } else {
-            std::path::PathBuf::from("powershell.exe")
+        let candidate = std::env::var_os("ProgramFiles")
+            .map(|p| std::path::PathBuf::from(p).join("PowerShell/7/pwsh.exe"));
+        let program = match candidate {
+            Some(path) if tokio::fs::metadata(&path).await.is_ok() => path,
+            _ => std::path::PathBuf::from("powershell.exe"),
         };
+        super::bash::emit_update(&on_update, String::new(), None, None);
+        let progress_update = on_update.clone();
         let capture = execute_shell_with_capture(
             &self.env,
             &command,
@@ -109,7 +109,17 @@ impl AgentTool for PowerShellTool {
                 inherit_env: true,
                 timeout: input.timeout,
                 cancel: Some(&signal),
-                on_chunk: None,
+                on_chunk: Some(Box::new(move |_, progress| {
+                    if let Some(progress) = progress() {
+                        super::bash::emit_update(
+                            &progress_update,
+                            progress.output,
+                            progress.truncation.truncated.then_some(progress.truncation),
+                            progress.full_output_path.map(|path| path.to_string_lossy().into_owned()),
+                        );
+                    }
+                })),
+                update_interval: Some(super::bash::update_throttle()),
                 return_execution_errors: true,
             },
         )

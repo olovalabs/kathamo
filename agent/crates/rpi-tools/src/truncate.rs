@@ -69,9 +69,8 @@ pub struct TruncationResult {
 }
 
 impl TruncationResult {
-    fn not_truncated(content: String, max_lines: usize, max_bytes: usize) -> Self {
+    fn not_truncated(content: String, max_lines: usize, max_bytes: usize, total_lines: usize) -> Self {
         let total_bytes = content.len();
-        let total_lines = split_lines_for_counting(&content).len();
         Self {
             output_bytes: total_bytes,
             output_lines: total_lines,
@@ -125,7 +124,7 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationRes
     let total_lines = lines.len();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {
-        return TruncationResult::not_truncated(content.to_string(), max_lines, max_bytes);
+        return TruncationResult::not_truncated(content.to_string(), max_lines, max_bytes, total_lines);
     }
 
     // First-line check: a single oversized first line yields empty output.
@@ -193,95 +192,52 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationRes
 pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationResult {
     let (max_lines, max_bytes) = options.resolve();
     let total_bytes = content.len();
-    let lines = split_lines_for_counting(content);
-    let total_lines = lines.len();
-
+    let total_lines = content.bytes().filter(|byte| *byte == b'\n').count()
+        + usize::from(!content.is_empty() && !content.ends_with('\n'));
     if total_lines <= max_lines && total_bytes <= max_bytes {
-        return TruncationResult::not_truncated(content.to_string(), max_lines, max_bytes);
+        return TruncationResult::not_truncated(content.to_string(), max_lines, max_bytes, total_lines);
     }
 
-    let mut output_lines_arr: Vec<&str> = Vec::new();
-    let mut output_bytes_count = 0usize;
-    let mut truncated_by: Option<TruncationLimit> = None;
+    // A contiguous suffix needs no per-line allocation, insertion or recount.
+    // As before, truncated output excludes the final newline delimiter.
+    let text = content.strip_suffix('\n').unwrap_or(content);
+    let mut start = text.len();
+    let mut output_bytes = 0usize;
+    let mut output_lines = 0usize;
     let mut last_line_partial = false;
-
-    let mut i = lines.len() as isize - 1;
-    while i >= 0 && output_lines_arr.len() < max_lines {
-        let idx = i as usize;
-        // +1 byte for the '\n' separator BEFORE this line when it's not the
-        // first element added (i.e., when there's already a line after it).
-        let line_bytes = lines[idx].len() + if output_lines_arr.is_empty() { 0 } else { 1 };
-        if output_bytes_count + line_bytes > max_bytes {
-            truncated_by = Some(TruncationLimit::Bytes);
-            if output_lines_arr.is_empty() {
-                // Edge case: the final line alone exceeds max_bytes → take a
-                // partial end of it (char-boundary-snapped).
-                let partial = trim_to_last_utf8_bytes(lines[idx], max_bytes);
-                output_lines_arr.insert(0, partial);
-                output_bytes_count = partial.len();
+    for line in text.rsplit('\n').take(max_lines) {
+        let bytes = line.len() + usize::from(output_lines != 0);
+        if bytes > max_bytes.saturating_sub(output_bytes) {
+            if output_lines == 0 {
+                let partial = trim_to_last_utf8_bytes(line, max_bytes);
+                start -= partial.len();
+                output_bytes = partial.len();
+                output_lines = 1;
                 last_line_partial = true;
             }
             break;
         }
-        output_lines_arr.insert(0, lines[idx]);
-        output_bytes_count += line_bytes;
-        i -= 1;
+        start -= bytes;
+        output_bytes += bytes;
+        output_lines += 1;
     }
-
-    if output_lines_arr.len() >= max_lines && output_bytes_count <= max_bytes {
-        truncated_by = Some(TruncationLimit::Lines);
-    }
-
-    let output_content: String = output_lines_arr
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    // Special-case: when we took a partial slice, `output_lines_arr` holds an
-    // owned `&str` borrowed from a temporary. Rebuild from the partial anyway.
-    let output_content = if last_line_partial {
-        // `output_lines_arr` was inserted with a slice from a local we no longer
-        // own — recompute directly from the captured partial above by re-slicing.
-        // Simpler: re-derive from the last line.
-        let last = lines.last().copied().unwrap_or("");
-        let partial = trim_to_last_utf8_bytes(last, max_bytes);
-        partial.to_string()
-    } else {
-        output_content
-    };
-    let final_output_bytes = output_content.len();
-    let output_lines_len = if last_line_partial {
-        1
-    } else {
-        // recount from the collected slice count before the type lie above
-        // (we can't read output_lines_arr after the temp is gone)
-        count_tail_output_lines(content, max_lines, max_bytes)
-    };
-
     TruncationResult {
-        content: output_content,
+        content: text[start..].to_owned(),
         truncated: true,
-        truncated_by,
+        truncated_by: Some(if output_lines >= max_lines {
+            TruncationLimit::Lines
+        } else {
+            TruncationLimit::Bytes
+        }),
         total_lines,
         total_bytes,
-        output_lines: output_lines_len,
-        output_bytes: final_output_bytes,
+        output_lines,
+        output_bytes,
         last_line_partial,
         first_line_exceeds_limit: false,
         max_lines,
         max_bytes,
     }
-}
-
-/// Count how many trailing lines `truncate_tail` would emit (non-partial path).
-fn count_tail_output_lines(content: &str, max_lines: usize, _max_bytes: usize) -> usize {
-    // Best-effort recount — only used for the `output_lines` field. The TS
-    // recounts from `outputLinesArr.length`, which we approximate by re-walking
-    // the (byte-binding-free) line accumulation up to max_lines. This field is
-    // purely informational; the byte-binding case is rare and the partial-path
-    // overrides it to 1 above.
-    let lines = split_lines_for_counting(content);
-    std::cmp::min(lines.len(), max_lines)
 }
 
 /// Keep the trailing ≤`max_bytes` bytes, snapped to a char boundary. Mirrors the
@@ -428,6 +384,22 @@ mod tests {
         assert!(r.truncated);
         assert!(r.last_line_partial);
         assert!(r.content.len() <= DEFAULT_MAX_BYTES);
+    }
+
+    #[test]
+    fn tail_byte_limit_reports_actual_rows_and_preserves_utf8_suffix() {
+        let options = TruncationOptions { max_lines: Some(10), max_bytes: Some(6) };
+        let tail = truncate_tail("old\nmiddle\nnew", options);
+        assert_eq!(tail.content, "new");
+        assert_eq!(tail.output_lines, 1);
+        assert_eq!(tail.output_bytes, 3);
+        assert_eq!(tail.truncated_by, Some(TruncationLimit::Bytes));
+        let tail = truncate_tail("prefix\n界界界", TruncationOptions {
+            max_lines: Some(10), max_bytes: Some(4),
+        });
+        assert_eq!(tail.content, "界");
+        assert_eq!(tail.output_bytes, 3);
+        assert!(tail.last_line_partial);
     }
 
     #[test]

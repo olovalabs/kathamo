@@ -1,240 +1,119 @@
-//! Mirrors `packages/agent/test/harness/tools.test.ts` "coalesces updates and
-//! persists truncated full output" — the bash tool must emit at most one
-//! `on_update` per ~100ms throttle window when the command streams many chunks.
-//!
-//! We drive a custom env whose `exec` fires `on_stdout` many times in rapid
-//! succession (one `on_update` would be expected per chunk without throttling).
-//! With throttling, the count stays bounded well below the chunk count. The
-//! InMemory env emits a single chunk per script, so we use a delegating wrapper
-//! that replays N chunks — same pattern as `abort_bracketing.rs`.
+//! Consumer-visible streaming regressions: sparse output must not wait for exit.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
-use rpi_tools::{
-    ExecutionEnv, ExecutionToolContext, FileContent, FileError, FileInfo, FileSystem,
-    InMemoryExecutionEnv, MutatingEnv, MutationQueueRegistry, Shell, ShellExecOptions, ShellOutput,
-};
+use rpi_agent::types::{AgentToolResult, TextContentOrImage};
+use rpi_tools::{ExecutionEnv, ExecutionToolContext, OsExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
-/// A delegating env that, for the command "stream", fires `on_stdout` 500 times
-/// (one line each) so the throttle has something to coalesce.
-struct StreamingEnv {
-    inner: Arc<InMemoryExecutionEnv>,
-    registry: Arc<MutationQueueRegistry>,
+fn text(result: &AgentToolResult) -> String {
+    result.content.iter().filter_map(|content| match content {
+        TextContentOrImage::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    }).collect()
 }
 
-impl StreamingEnv {
-    fn new(inner: Arc<InMemoryExecutionEnv>) -> Self {
-        Self {
-            inner,
-            registry: Arc::new(MutationQueueRegistry::new()),
-        }
-    }
-}
-
-impl MutatingEnv for StreamingEnv {
-    fn as_env(&self) -> &dyn ExecutionEnv {
-        self
-    }
-    fn mutation_registry(&self) -> &MutationQueueRegistry {
-        &self.registry
-    }
-}
-
-#[async_trait]
-impl FileSystem for StreamingEnv {
-    fn cwd(&self) -> &Path {
-        self.inner.cwd()
-    }
-    async fn absolute_path(
-        &self,
-        p: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<PathBuf, FileError> {
-        self.inner.absolute_path(p, c).await
-    }
-    async fn join_path(
-        &self,
-        p: &[&str],
-        c: Option<&CancellationToken>,
-    ) -> Result<PathBuf, FileError> {
-        self.inner.join_path(p, c).await
-    }
-    async fn read_text_file(
-        &self,
-        p: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<String, FileError> {
-        self.inner.read_text_file(p, c).await
-    }
-    async fn read_text_lines(
-        &self,
-        p: &str,
-        m: Option<usize>,
-        c: Option<&CancellationToken>,
-    ) -> Result<Vec<String>, FileError> {
-        self.inner.read_text_lines(p, m, c).await
-    }
-    async fn read_binary_file(
-        &self,
-        p: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<Vec<u8>, FileError> {
-        self.inner.read_binary_file(p, c).await
-    }
-    async fn write_file(
-        &self,
-        p: &str,
-        c: FileContent,
-        c2: Option<&CancellationToken>,
-    ) -> Result<(), FileError> {
-        self.inner.write_file(p, c, c2).await
-    }
-    async fn append_file(
-        &self,
-        p: &str,
-        c: FileContent,
-        c2: Option<&CancellationToken>,
-    ) -> Result<(), FileError> {
-        self.inner.append_file(p, c, c2).await
-    }
-    async fn rename_file(
-        &self,
-        s: &str,
-        d: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<(), FileError> {
-        self.inner.rename_file(s, d, c).await
-    }
-    async fn file_info(
-        &self,
-        p: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<FileInfo, FileError> {
-        self.inner.file_info(p, c).await
-    }
-    async fn list_dir(
-        &self,
-        p: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<Vec<FileInfo>, FileError> {
-        self.inner.list_dir(p, c).await
-    }
-    async fn canonical_path(
-        &self,
-        p: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<PathBuf, FileError> {
-        self.inner.canonical_path(p, c).await
-    }
-    async fn exists(&self, p: &str, c: Option<&CancellationToken>) -> Result<bool, FileError> {
-        self.inner.exists(p, c).await
-    }
-    async fn create_dir(
-        &self,
-        p: &str,
-        r: bool,
-        c: Option<&CancellationToken>,
-    ) -> Result<(), FileError> {
-        self.inner.create_dir(p, r, c).await
-    }
-    async fn remove(
-        &self,
-        p: &str,
-        r: bool,
-        f: bool,
-        c: Option<&CancellationToken>,
-    ) -> Result<(), FileError> {
-        self.inner.remove(p, r, f, c).await
-    }
-    async fn create_temp_dir(
-        &self,
-        p: Option<&str>,
-        c: Option<&CancellationToken>,
-    ) -> Result<PathBuf, FileError> {
-        self.inner.create_temp_dir(p, c).await
-    }
-    async fn create_temp_file(
-        &self,
-        p: &str,
-        s: &str,
-        c: Option<&CancellationToken>,
-    ) -> Result<PathBuf, FileError> {
-        self.inner.create_temp_file(p, s, c).await
-    }
-    async fn cleanup(&self) {
-        let inner: &dyn FileSystem = &*self.inner;
-        inner.cleanup().await;
-    }
-}
-
-#[async_trait]
-impl Shell for StreamingEnv {
-    async fn exec<'a>(
-        &'a self,
-        command: &str,
-        mut options: ShellExecOptions<'a>,
-    ) -> Result<ShellOutput, rpi_tools::ExecutionError> {
-        if command.starts_with("stream") {
-            // Fire 500 chunks as fast as possible — without throttling this
-            // would produce ~500 on_update calls.
-            if let Some(cb) = options.on_stdout.as_mut() {
-                for i in 0..500u32 {
-                    cb(&format!("line-{i}\n"));
-                }
-            }
-            return Ok(ShellOutput {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: 0,
-            });
-        }
-        self.inner.exec(command, options).await
-    }
-    async fn cleanup(&self) {
-        let inner: &dyn Shell = &*self.inner;
-        inner.cleanup().await;
-    }
-}
-
-impl ExecutionEnv for StreamingEnv {}
-
+#[cfg(unix)]
 #[tokio::test]
-async fn coalesces_updates_within_throttle_window() {
-    let inner = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let wrapper = Arc::new(StreamingEnv::new(inner));
-    let env_dyn: Arc<dyn ExecutionEnv> = wrapper.clone() as Arc<dyn ExecutionEnv>;
-    let mut_env: Arc<dyn MutatingEnv> = wrapper.clone() as Arc<dyn MutatingEnv>;
-    let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
+async fn sparse_output_is_visible_while_the_command_is_still_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let env: Arc<dyn ExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(dir.path().to_path_buf()));
+    let tool = rpi_tools::create_bash_tool(&ExecutionToolContext::new(env, None), None);
+    let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let on_update = Arc::new(move |result: AgentToolResult| {
+        let _ = updates.send(text(&result));
+    });
+    let execution = tool.execute(
+        "sparse",
+        serde_json::json!({"command": "printf 'first\\n'; sleep 0.02; printf 'second\\n'; sleep 1; printf 'finished\\n'"}),
+        CancellationToken::new(),
+        on_update,
+    );
+    tokio::pin!(execution);
+    let visible = async {
+        while let Some(output) = receiver.recv().await {
+            if output.contains("second\n") {
+                assert!(!output.contains("finished"));
+                return;
+            }
+        }
+        panic!("stream ended without the sparse update");
+    };
+    tokio::select! {
+        result = &mut execution => panic!("command completed before its sparse update: {result:?}"),
+        result = tokio::time::timeout(Duration::from_millis(750), visible) => {
+            result.expect("quiet output was hidden until command completion");
+        }
+    }
+    let result = execution.await.expect("shell execution");
+    assert_eq!(text(&result), "first\nsecond\nfinished\n");
+    let mut final_update = String::new();
+    while let Ok(update) = receiver.try_recv() {
+        final_update = update;
+    }
+    assert_eq!(final_update, "first\nsecond\nfinished\n");
+}
 
-    let tool = rpi_tools::create_bash_tool(&ctx, None);
+#[cfg(windows)]
+#[tokio::test]
+async fn powershell_streams_encoded_unicode_command_before_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let env: Arc<dyn ExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(dir.path().to_path_buf()));
+    let tool = rpi_tools::create_powershell_tool(&ExecutionToolContext::new(env, None));
+    let (updates, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let execution = tool.execute(
+        "powershell-stream",
+        serde_json::json!({
+            "command": "$word = '界'; Write-Output 'first'; Start-Sleep -Milliseconds 20; Write-Output $word; Start-Sleep -Seconds 1; Write-Output 'finished'"
+        }),
+        CancellationToken::new(),
+        Arc::new(move |result: AgentToolResult| { let _ = updates.send(text(&result)); }),
+    );
+    tokio::pin!(execution);
+    let visible = async {
+        while let Some(output) = receiver.recv().await {
+            if output.contains('界') {
+                assert!(!output.contains("finished"));
+                return;
+            }
+        }
+        panic!("PowerShell did not publish live output");
+    };
+    tokio::select! {
+        result = &mut execution => panic!("PowerShell completed before publishing live output: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(10), visible) => {
+            result.expect("PowerShell live output timed out");
+        }
+    }
+    let result = execution.await.expect("PowerShell execution");
+    assert_eq!(text(&result), "first\n界\nfinished\n");
+}
 
-    // Count on_update invocations. The Arc<AtomicUsize> survives the closure.
-    let count = Arc::new(AtomicUsize::new(0));
-    let count_for_cb = count.clone();
-    let on_update: Arc<dyn Fn(rpi_agent::types::ToolResultPartial) + Send + Sync> =
-        Arc::new(move |_p| {
-            count_for_cb.fetch_add(1, Ordering::SeqCst);
-        });
-
-    let signal = CancellationToken::new();
-    let _r = tool
-        .execute(
-            "bash-throttle",
-            serde_json::json!({ "command": "stream" }),
-            signal,
-            on_update,
-        )
-        .await
-        .expect("ok");
-
-    let n = count.load(Ordering::SeqCst);
-    // 500 raw chunks + 1 initial empty + 1 final flush. With a 100ms throttle
-    // the whole stream (synchronous, sub-ms) collapses to very few flushes.
-    // The TS test asserts updates.length < 25; we match that bound.
-    assert!(n < 25, "throttle should coalesce, got {n} updates");
-    assert!(n >= 1, "at least the initial empty update should fire");
+#[cfg(windows)]
+#[tokio::test(flavor = "current_thread")]
+async fn shell_preserves_mixed_utf8_and_console_encoded_output() {
+    use rpi_tools::{Shell, ShellExecOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let env = OsExecutionEnv::with_cwd(dir.path().to_path_buf());
+    let mut streamed = String::new();
+    let output = env.exec(
+        "$out = [Console]::OpenStandardOutput(); $bytes = [byte[]](0x61,0x73,0x63,0x69,0x69,10,0xe4,0xb8,0xad,10,0xff,10); $out.Write($bytes,0,$bytes.Length); $out.Flush()",
+        ShellExecOptions {
+            shell: Some(rpi_tools::env::ShellOverride {
+                program: "powershell.exe".into(),
+                args: vec!["-NoLogo".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into()],
+            }),
+            on_stdout: Some(Box::new(|text| streamed.push_str(text))),
+            timeout: Some(10.0),
+            ..Default::default()
+        },
+    ).await.expect("PowerShell raw output");
+    let expected = rpi_tools::output_decode::decode_output(
+        b"ascii\n\xE4\xB8\xAD\n\xff\n",
+    );
+    assert_eq!(output.stdout, expected);
+    assert_eq!(streamed, expected);
+    assert!(output.stdout.starts_with("ascii\n中\n"));
+    assert!(output.stderr.is_empty());
 }

@@ -771,10 +771,38 @@ impl Shell for InMemoryExecutionEnv {
                 cb(&script.stderr);
             }
         }
+        if let Some(output) = &options.output {
+            for (text, stderr) in [(&script.stdout, false), (&script.stderr, true)] {
+                let mut rest = text.as_str();
+                while !rest.is_empty() {
+                    let mut end = rest.len().min(8192);
+                    while !rest.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let chunk = rest[..end].to_string();
+                    let chunk = if stderr {
+                        crate::env::ShellOutputChunk::Stderr(chunk)
+                    } else {
+                        crate::env::ShellOutputChunk::Stdout(chunk)
+                    };
+                    tokio::select! {
+                        _ = async {
+                            if let Some(token) = options.cancel {
+                                token.cancelled().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => return Err(ExecutionError::aborted()),
+                        _ = output.send(chunk) => {}
+                    }
+                    rest = &rest[end..];
+                }
+            }
+        }
 
         Ok(ShellOutput {
-            stdout: script.stdout,
-            stderr: script.stderr,
+            stdout: if options.capture_output { script.stdout } else { String::new() },
+            stderr: if options.capture_output { script.stderr } else { String::new() },
             exit_code: script.exit_code,
         })
     }

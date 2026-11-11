@@ -27,7 +27,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
-/// Shared, writable handle to the PTY master.
+/// Standalone synchronous writer, retained for hosts constructing their own notifier.
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 /// Formatter used by alacritty to turn a clipboard payload into the escape
@@ -38,9 +38,15 @@ pub type ClipboardFormatter = Arc<dyn Fn(&str) -> String + Sync + Send + 'static
 /// without touching the UI thread.
 #[derive(Clone)]
 pub struct TerminalNotifier {
-    writer: PtyWriter,
+    writer: NotifierWriter,
     window_size: Arc<Mutex<WindowSize>>,
     palette: Arc<Mutex<ColorPalette>>,
+}
+
+#[derive(Clone)]
+enum NotifierWriter {
+    Standalone(PtyWriter),
+    Queued(crate::pty_writer::QueuedWriter),
 }
 
 impl TerminalNotifier {
@@ -50,20 +56,34 @@ impl TerminalNotifier {
         palette: Arc<Mutex<ColorPalette>>,
     ) -> Self {
         Self {
-            writer,
+            writer: NotifierWriter::Standalone(writer),
             window_size,
             palette,
         }
     }
 
+    pub(crate) fn queued(
+        writer: crate::pty_writer::QueuedWriter,
+        window_size: Arc<Mutex<WindowSize>>,
+        palette: Arc<Mutex<ColorPalette>>,
+    ) -> Self {
+        Self { writer: NotifierWriter::Queued(writer), window_size, palette }
+    }
+
     /// Write raw bytes into the PTY.
     ///
-    /// Terminal replies are latency sensitive (the application is usually
-    /// blocked reading stdin), so we never buffer them. The writer itself is
-    /// unbuffered, so no explicit flush is needed.
+    /// TerminalView replies enter the same bounded FIFO as user input; only
+    /// standalone notifiers constructed with `new` perform synchronous I/O.
     pub fn write(&self, bytes: &[u8]) {
-        let mut writer = self.writer.lock();
-        let _ = writer.write_all(bytes);
+        match &self.writer {
+            NotifierWriter::Standalone(writer) => {
+                let _ = writer.lock().write_all(bytes);
+            }
+            NotifierWriter::Queued(writer) => {
+                // Admission failures are delivered to the view's independent error task.
+                let _ = writer.send(bytes);
+            }
+        }
     }
 
     pub fn write_str(&self, text: &str) {
@@ -147,7 +167,7 @@ pub struct TerminalNotifierHandle {
 }
 
 impl TerminalNotifierHandle {
-    /// Write raw bytes into the PTY, flushing immediately. No-op until the
+    /// Write raw bytes into the installed notifier's FIFO. No-op until the
     /// host installs the PTY notifier via `notifier_slot`.
     pub fn write(&self, bytes: &[u8]) {
         if let Some(notifier) = self.notifier.lock().as_ref() {

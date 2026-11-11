@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use terminal::{ColorPalette, ShellEvent, TerminalConfig, TerminalView};
 
 mod agent_auth;
@@ -43,6 +43,7 @@ mod integrations;
 mod kathamo_compat;
 mod logos;
 mod paths;
+use terminal::pty_session;
 mod settings;
 mod shell_history;
 #[path = "blocks/shell_integration.rs"]
@@ -116,26 +117,6 @@ fn status_snapshot_due() -> bool {
             .is_ok()
 }
 
-struct SharedWriter {
-    writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
-    read_only: Arc<AtomicBool>,
-}
-
-impl std::io::Write for SharedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Ok(buf.len());
-        }
-        self.writer.lock().write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.read_only.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        self.writer.lock().flush()
-    }
-}
 /// Access to the owning app entity from a render closure that only receives a
 /// plain `&mut App` (for example a virtualized list item).
 #[derive(Clone)]
@@ -571,7 +552,8 @@ struct ToolDisplay {
 
 impl ToolDisplay {
     fn new(name: &str, input: &str) -> Self {
-        let content_body = tool_content_body(name, input).map(SharedString::from);
+        let parsed = serde_json::from_str::<serde_json::Value>(input.trim()).ok();
+        let content_body = tool_content_body(name, parsed.as_ref()).map(SharedString::from);
         let (content_preview, content_truncated) = match content_body.as_ref() {
             Some(body) => {
                 let (end, truncated) = output_preview_len(body);
@@ -587,8 +569,9 @@ impl ToolDisplay {
             None => (None, false),
         };
         Self {
-            view: tool_view(name, input),
-            shell_command: is_shell_tool(name).then(|| SharedString::from(shell_command(input))),
+            view: tool_view(name, input, parsed.as_ref()),
+            shell_command: is_shell_tool(name)
+                .then(|| SharedString::from(shell_command(input, parsed.as_ref()))),
             content_body,
             content_preview,
             content_truncated,
@@ -597,9 +580,8 @@ impl ToolDisplay {
 }
 
 /// Parse the compact tool summary and its expanded arguments.
-fn tool_view(name: &str, input: &str) -> ToolView {
-    let parsed = serde_json::from_str::<serde_json::Value>(input.trim()).ok();
-    let object = parsed.as_ref().and_then(|value| value.as_object());
+fn tool_view(name: &str, input: &str, parsed: Option<&serde_json::Value>) -> ToolView {
+    let object = parsed.and_then(|value| value.as_object());
     let field = |key: &str| {
         object
             .and_then(|map| map.get(key))
@@ -928,10 +910,8 @@ fn chat_tool_output_block(text: SharedString, is_error: bool, tokens: ThemeToken
         .child(text)
 }
 
-fn shell_command(input: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(input)
-        .ok()
-        .and_then(|value| {
+fn shell_command(input: &str, parsed: Option<&serde_json::Value>) -> String {
+    parsed.and_then(|value| {
             value
                 .get("command")
                 .or_else(|| value.get("cmd"))
@@ -947,7 +927,7 @@ fn shell_command(input: &str) -> String {
         })
 }
 
-fn tool_content_body(name: &str, input: &str) -> Option<String> {
+fn tool_content_body(name: &str, parsed: Option<&serde_json::Value>) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     if !matches!(
         lower.as_str(),
@@ -962,8 +942,7 @@ fn tool_content_body(name: &str, input: &str) -> Option<String> {
     ) {
         return None;
     }
-    let value = serde_json::from_str::<serde_json::Value>(input).ok()?;
-    let object = value.as_object()?;
+    let object = parsed?.as_object()?;
     object
         .get("content")
         .and_then(|value| value.as_str())
@@ -2112,6 +2091,9 @@ pub struct TerminalPane {
     pub command_history: Vec<String>,
     pub history_index: Option<usize>,
     pub pending_draft: String,
+    /// Prevent duplicate submissions while physical PTY writes are outstanding.
+    input_submitting: bool,
+    input_cancel: Option<smol::channel::Sender<()>>,
     /// Open completion menu (Kathamo-style suggestions above the input).
     pub completion_menu: Option<CompletionMenuState>,
     pub bottom_input_visible: bool,
@@ -2194,6 +2176,8 @@ impl TerminalPane {
             command_history: Vec::new(),
             history_index: None,
             pending_draft: String::new(),
+            input_submitting: false,
+            input_cancel: None,
             completion_menu: None,
             bottom_input_visible: true,
             plus_menu_open: false,
@@ -3236,98 +3220,77 @@ impl AppState {
         String,
         gpui::Subscription,
     )> {
-        let (shell_cmd, shell_name) = detect_shell();
         #[cfg(unix)]
         let generation = status_bus::new_generation();
         #[cfg(not(unix))]
         let generation = format!("pane-{pane_id}-{}", std::process::id());
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| anyhow::anyhow!("PTY open error: {e}"))?;
-
-        let mut cmd = CommandBuilder::new(&shell_cmd);
-        if let Some(d) = dir {
-            cmd.cwd(d);
-        }
-        shell_integration::configure_shell(&mut cmd, &shell_name);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-        cmd.env("TERM_PROGRAM", "kathamo");
-        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-        cmd.env("LANG", "en_US.UTF-8");
-        cmd.env("LC_ALL", "en_US.UTF-8");
-        if let Ok(executable) = std::env::current_exe() {
-            cmd.env("KATHAMO_EXECUTABLE", &executable);
-            cmd.env("MARKUP_EXECUTABLE", &executable);
-        }
         #[cfg(unix)]
         if let Some(bus) = STATUS_BUS.as_ref() {
             kathamo_compat::register(&bus.app_id, pane_id, &generation);
-            cmd.env("KATHAMO_STATUS_SOCKET", &bus.socket);
-            cmd.env("KATHAMO_APP_ID", &bus.app_id);
-            cmd.env("KATHAMO_PANE_ID", pane_id.to_string());
-            cmd.env("KATHAMO_PANE_GENERATION", &generation);
-            cmd.env("MARKUP_STATUS_SOCKET", &bus.socket);
-            cmd.env("MARKUP_APP_ID", &bus.app_id);
-            cmd.env("MARKUP_PANE_ID", pane_id.to_string());
-            cmd.env("MARKUP_PANE_GENERATION", &generation);
-            // Native Kathamo reporters (including Command Code) can use the
-            // scoped reporting API. The opaque ID is bound to this generation.
-            cmd.env("KATHAMO_ENV", "1");
-            cmd.env("KATHAMO_SOCKET_PATH", &bus.socket);
-            cmd.env("KATHAMO_PANE_ID", &generation);
-            cmd.env("HERDR_ENV", "1");
-            cmd.env("HERDR_SOCKET_PATH", &bus.socket);
-            cmd.env("HERDR_PANE_ID", &generation);
-            // A new pane is independent of a Command Code process that may
-            // have launched Kathamo; its inherited child-owner guard must not
-            // disable the vendor reporter for the new foreground agent.
-            cmd.env_remove("CMD_KATHAMO_PANE_OWNER");
-            cmd.env_remove("CMD_HERDR_PANE_OWNER");
-            if let Ok(executable) = std::env::current_exe() {
-                cmd.env("KATHAMO_BIN_PATH", &executable);
-                cmd.env("HERDR_BIN_PATH", executable);
+        }
+        let startup_generation = generation.clone();
+        let dir = dir.cloned();
+        let pending = pty_session::PendingPty::spawn(move || {
+            let generation = startup_generation;
+            let (shell_cmd, shell_name) = detect_shell();
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| anyhow::anyhow!("PTY open error: {e}"))?;
+            let mut cmd = CommandBuilder::new(&shell_cmd);
+            if let Some(d) = &dir {
+                cmd.cwd(d);
             }
-            let snapshot_path = status_bus::snapshot_path(bus, pane_id, &generation);
-            cmd.env("KATHAMO_STATUS_SNAPSHOT", &snapshot_path);
-            cmd.env("MARKUP_STATUS_SNAPSHOT", &snapshot_path);
-        }
-        #[cfg(unix)]
-        if let Some(tty) = pair.master.tty_name() {
-            cmd.env("KATHAMO_STATUS_TTY", &tty);
-            cmd.env("MARKUP_STATUS_TTY", &tty);
-        }
-
-        let child = pair.slave.spawn_command(cmd).map_err(|e| {
+            shell_integration::configure_shell(&mut cmd, &shell_name);
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            cmd.env("TERM_PROGRAM", "kathamo");
+            cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+            cmd.env("LANG", "en_US.UTF-8");
+            cmd.env("LC_ALL", "en_US.UTF-8");
+            if let Ok(executable) = std::env::current_exe() {
+                cmd.env("KATHAMO_EXECUTABLE", &executable);
+                cmd.env("MARKUP_EXECUTABLE", &executable);
+            }
             #[cfg(unix)]
-            kathamo_compat::unregister(&generation);
-            anyhow::anyhow!("Spawn shell error: {e}")
-        })?;
-        let pid = child.process_id();
-
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let pty_master = Arc::new(Mutex::new(pair.master));
-        let read_only = Arc::new(AtomicBool::new(false));
-
-        let pty_writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(Mutex::new(writer));
-        let shared_writer = SharedWriter {
-            writer: pty_writer,
-            read_only,
-        };
+            if let Some(bus) = STATUS_BUS.as_ref() {
+                cmd.env("KATHAMO_STATUS_SOCKET", &bus.socket);
+                cmd.env("KATHAMO_APP_ID", &bus.app_id);
+                cmd.env("KATHAMO_PANE_ID", pane_id.to_string());
+                cmd.env("KATHAMO_PANE_GENERATION", &generation);
+                cmd.env("MARKUP_STATUS_SOCKET", &bus.socket);
+                cmd.env("MARKUP_APP_ID", &bus.app_id);
+                cmd.env("MARKUP_PANE_ID", pane_id.to_string());
+                cmd.env("MARKUP_PANE_GENERATION", &generation);
+                // Scoped vendor reporters bind to this exact pane generation.
+                cmd.env("KATHAMO_ENV", "1");
+                cmd.env("KATHAMO_SOCKET_PATH", &bus.socket);
+                cmd.env("KATHAMO_PANE_ID", &generation);
+                cmd.env("HERDR_ENV", "1");
+                cmd.env("HERDR_SOCKET_PATH", &bus.socket);
+                cmd.env("HERDR_PANE_ID", &generation);
+                cmd.env_remove("CMD_KATHAMO_PANE_OWNER");
+                cmd.env_remove("CMD_HERDR_PANE_OWNER");
+                if let Ok(executable) = std::env::current_exe() {
+                    cmd.env("KATHAMO_BIN_PATH", &executable);
+                    cmd.env("HERDR_BIN_PATH", executable);
+                }
+                let snapshot_path = status_bus::snapshot_path(bus, pane_id, &generation);
+                cmd.env("KATHAMO_STATUS_SNAPSHOT", &snapshot_path);
+                cmd.env("MARKUP_STATUS_SNAPSHOT", &snapshot_path);
+            }
+            #[cfg(unix)]
+            if let Some(tty) = pair.master.tty_name() {
+                cmd.env("KATHAMO_STATUS_TTY", &tty);
+                cmd.env("MARKUP_STATUS_TTY", &tty);
+            }
+            pty_session::PreparedPty::spawn(pair, cmd)
+        });
+        let pty_session::PendingPty { reader, writer, control, events } = pending;
 
         let config = TerminalConfig {
             font_family: MONO_FONT.into(),
@@ -3349,9 +3312,8 @@ impl AppState {
             ..TerminalConfig::default()
         };
 
-        let pty_for_resize = pty_master;
         let resize_callback = move |cols: usize, rows: usize| {
-            let _ = pty_for_resize.lock().resize(PtySize {
+            control.resize(PtySize {
                 cols: cols as u16,
                 rows: rows as u16,
                 pixel_width: 0,
@@ -3362,7 +3324,7 @@ impl AppState {
         let target = window_title_target.clone();
         let seed = scrollback.map(str::to_string);
         let terminal = cx.new(|cx| {
-            TerminalView::new_with_scrollback(shared_writer, reader, config, seed, cx)
+            let mut view = TerminalView::new_with_scrollback(writer, reader, config, seed, cx)
                 .with_resize_callback(resize_callback)
                 .with_title_callback(move |window, cx, title| {
                     window.set_window_title(title);
@@ -3370,10 +3332,44 @@ impl AppState {
                     let _ = target.update(cx, |state, cx| {
                         state.update_pane_title(pane_id, &title_str, cx);
                     });
-                })
-            // Exit status is intentionally not set here: the status poller
-            // derives Done/Error from the real exit code (see poll_sessions_status).
+                });
+            view.set_capture_output(false);
+            view
         });
+
+        // Setup, resize, child waiting and teardown happen away from GPUI.
+        // This relay owns only weak UI handles: closing a pane drops control.
+        let target = window_title_target;
+        let terminal_weak = terminal.downgrade();
+        let event_generation = generation.clone();
+        cx.spawn(async move |_, cx| {
+            while let Ok(event) = events.recv().await {
+                match event {
+                    pty_session::PtyEvent::Ready { pid } => {
+                        let _ = target.update(cx, |state, cx| {
+                            if let Some(pane) = state.pane_mut(pane_id)
+                                && pane.generation == event_generation
+                            {
+                                pane.pid = pid;
+                                cx.notify();
+                            }
+                        });
+                    }
+                    pty_session::PtyEvent::Exited(status) => {
+                        let _ = terminal_weak.update(cx, |term, cx| {
+                            term.record_child_exit(status.exit_code() as i32, cx);
+                        });
+                    }
+                    pty_session::PtyEvent::Error(error) => {
+                        #[cfg(unix)]
+                        kathamo_compat::unregister(&event_generation);
+                        let _ = terminal_weak.update(cx, |term, cx| {
+                            term.report_io_error(error, cx);
+                        });
+                    }
+                }
+            }
+        }).detach();
 
         // Shell-integration events arrive on the UI thread from the reader task.
         // The subscription is stored on the pane so it survives until the pane
@@ -3385,7 +3381,7 @@ impl AppState {
             },
         );
 
-        Ok((terminal, pid, generation, terminal_subscription))
+        Ok((terminal, None, generation, terminal_subscription))
     }
 
     fn update_pane_title(&mut self, pane_id: usize, title: &str, cx: &mut Context<Self>) {
@@ -6272,6 +6268,14 @@ impl AppState {
                             pane.chat.bridge = Some(bridge);
                         }
                     }
+                    if let Some(error) = pane.chat.conversation.as_mut()
+                        .and_then(conversations::Log::take_error)
+                    {
+                        // Persistence failures are visible, but never logged recursively.
+                        pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+                        pane.chat.mark_active_dirty();
+                        changed = true;
+                    }
                     streaming |= pane.chat.running;
                 }
             }
@@ -6553,104 +6557,91 @@ impl AppState {
             self.submit_agent_prompt(pane_id, window, cx);
             return;
         }
-        let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
+        let target = cx.entity().downgrade();
+        let handle = window.window_handle();
+        let Some(pane) = self.pane_mut(pane_id) else { return };
+        if pane.input_submitting { return; }
+        let Some(input) = pane.input_state.clone() else { return };
+        let raw = input.read(cx).value().to_string();
+        if raw.is_empty() && pane.attachments.is_empty() {
+            pane.terminal.update(cx, |term, cx| term.send_bytes(b"\r", cx));
             return;
-        };
-        let Some(project) = self.projects.get_mut(p_idx) else {
-            return;
-        };
-        let Some(session) = project.sessions.get_mut(s_idx) else {
-            return;
-        };
-        let Some(pane) = session.panes.get_mut(pane_idx) else {
-            return;
-        };
-        let Some(input_state) = pane.input_state.clone() else {
-            return;
-        };
-
-        let raw = input_state.read(cx).value().to_string();
-        let has_attachments = !pane.attachments.is_empty();
-
-        if raw.is_empty() && !has_attachments {
-            pane.terminal.update(cx, |term, cx| {
-                term.send_bytes(b"\r", cx);
-            });
-        } else {
-            let terminal = pane.terminal.clone();
-
-            if has_attachments {
-                // Deliver image paths with real paste semantics. Agent TUIs
-                // (Claude Code, Codex) auto-attach an image path that arrives
-                // as a paste, but show it as literal text when it is typed.
-                let paths: Vec<String> = pane
-                    .attachments
-                    .iter()
-                    .map(|attachment| attachments::prompt_path(&attachment.path))
-                    .collect();
-                let prompt = raw.clone();
-                App::spawn(cx, async move |cx: &mut gpui::AsyncApp| {
-                    if !prompt.is_empty() {
-                        let text = format!("{prompt} ");
-                        let _ = terminal.update(cx, |term, cx| {
-                            term.send_text(&text, cx);
-                        });
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(30))
-                            .await;
-                    }
-                    for path in paths {
-                        let _ = terminal.update(cx, |term, cx| {
-                            term.paste_text_from_app(&path, cx);
-                        });
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(100))
-                            .await;
-                    }
-                    // Give the TUI time to finish reading and attaching the
-                    // images before the submitting Enter arrives.
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(300))
-                        .await;
-                    let _ = terminal.update(cx, |term, cx| {
-                        term.send_bytes(b"\r", cx);
-                    });
-                })
-                .detach();
-            } else {
-                terminal.update(cx, |term, cx| {
-                    term.send_text(&raw, cx);
-                });
-
-                // Send Enter separately after a brief tick so raw-mode CLI agents
-                // (Claude Code, Ink, readline) receive it as an authentic Enter
-                // keystroke rather than pasted text, triggering immediate
-                // automatic prompt submission.
-                let terminal = terminal.clone();
-                App::spawn(cx, async move |cx: &mut gpui::AsyncApp| {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(25))
-                        .await;
-                    let _ = terminal.update(cx, |term, cx| {
-                        term.send_bytes(b"\r", cx);
-                    });
-                })
-                .detach();
-            }
-
-            if pane.command_history.last().map(|s| s.as_str()) != Some(&raw) && !raw.is_empty() {
-                pane.command_history.push(raw);
-            }
-            pane.history_index = None;
-            pane.pending_draft.clear();
-            pane.attachments.clear();
-            input_state.update(cx, |state, cx| {
-                state.set_value("", window, cx);
-            });
         }
-        input_state.update(cx, |state, cx| {
-            state.focus(window, cx);
-        });
+        let submitted_files: Vec<PathBuf> = pane.attachments.iter()
+            .map(|attachment| attachment.path.clone()).collect();
+        let paths: Vec<String> = submitted_files.iter()
+            .map(|path| attachments::prompt_path(path)).collect();
+        let terminal = pane.terminal.downgrade();
+        let generation = pane.generation.clone();
+        pane.input_submitting = true;
+        let (cancel, cancelled) = smol::channel::bounded(1);
+        pane.input_cancel = Some(cancel);
+        input.update(cx, |state, cx| state.focus(window, cx));
+        App::spawn(cx, async move |cx: &mut gpui::AsyncApp| {
+            // Timers begin after physical delivery, never merely after enqueue.
+            let delivery = async {
+                if paths.is_empty() {
+                    let receipt = terminal.update(cx, |term, cx| {
+                        term.send_text_with_completion(&raw, cx)
+                    }).map_err(|error| error.to_string())??;
+                    receipt.wait().await?;
+                    cx.background_executor().timer(std::time::Duration::from_millis(25)).await;
+                } else {
+                    if !raw.is_empty() {
+                        let receipt = terminal.update(cx, |term, cx| {
+                            term.send_text_with_completion(&format!("{raw} "), cx)
+                        }).map_err(|error| error.to_string())??;
+                        receipt.wait().await?;
+                        cx.background_executor().timer(std::time::Duration::from_millis(30)).await;
+                    }
+                    for path in &paths {
+                        let receipt = terminal.update(cx, |term, cx| {
+                            term.paste_text_from_app_with_completion(path, cx)
+                        }).map_err(|error| error.to_string())??;
+                        receipt.wait().await?;
+                        cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                    }
+                    cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+                }
+                let receipt = terminal.update(cx, |term, cx| {
+                    term.send_bytes_with_completion(b"\r", cx)
+                }).map_err(|error| error.to_string())??;
+                receipt.wait().await
+            };
+            let delivered: std::result::Result<(), String> = smol::future::race(
+                delivery,
+                async {
+                    let _ = cancelled.recv().await;
+                    Err("PTY input submission cancelled; accepted bytes are not replayed".into())
+                },
+            ).await;
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = target.update(cx, |state, cx| {
+                    let Some(pane) = state.pane_mut(pane_id)
+                        .filter(|pane| pane.generation == generation) else { return };
+                    pane.input_submitting = false;
+                    pane.input_cancel = None;
+                    match delivered {
+                        Ok(()) => {
+                            if !raw.is_empty() && pane.command_history.last() != Some(&raw) {
+                                pane.command_history.push(raw.clone());
+                            }
+                            pane.history_index = None;
+                            // Do not erase anything typed/attached during delivery.
+                            pane.attachments.retain(|attachment| !submitted_files.contains(&attachment.path));
+                            if input.read(cx).value().as_ref() == raw.as_str() {
+                                pane.pending_draft.clear();
+                                input.update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                        }
+                        Err(error) => {
+                            pane.terminal.update(cx, |term, cx| term.report_io_error(error, cx));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        }).detach();
         cx.notify();
     }
 
@@ -6725,6 +6716,10 @@ impl AppState {
             return;
         }
 
+        if let Some(cancel) = &pane.input_cancel {
+            let _ = cancel.try_send(());
+        }
+
         // 1. Clear input state and draft
         if let Some(input_state) = &pane.input_state {
             input_state.update(cx, |state, cx| {
@@ -6743,13 +6738,15 @@ impl AppState {
         // 3. On Unix: also directly signal the active foreground process group
         #[cfg(unix)]
         if let Some(pid) = pane.pid {
-            if let Some(tpgid) = status::read_proc_tpgid(pid) {
-                if tpgid > 0 && tpgid != pid as i64 {
-                    unsafe {
-                        libc::kill(-(tpgid as libc::pid_t), libc::SIGINT);
+            smol::spawn(smol::unblock(move || {
+                if let Some(tpgid) = status::read_proc_tpgid(pid) {
+                    if tpgid > 0 && tpgid != pid as i64 {
+                        unsafe {
+                            libc::kill(-(tpgid as libc::pid_t), libc::SIGINT);
+                        }
                     }
                 }
-            }
+            })).detach();
         }
 
         // 4. If an agent/command was working, interrupt and return to Idle
@@ -7973,9 +7970,12 @@ impl AppState {
             return;
         };
         pane.plus_menu_open = false;
-        pane.terminal.update(cx, |term, cx| {
-            term.send_text(&format!("{cmd}\r"), cx);
+        let accepted = pane.terminal.update(cx, |term, cx| {
+            term.send_text_with_completion(&format!("{cmd}\r"), cx).is_ok()
         });
+        if !accepted {
+            return;
+        }
         if pane.command_history.last().map(|s| s.as_str()) != Some(&cmd) {
             pane.command_history.push(cmd.to_string());
         }
@@ -10745,13 +10745,13 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let visible = pane.chat.visible_messages();
-        let workers = subagent_chat::rows(visible);
-        if let Some(view) = &pane.chat.worker_view
-            && let Some(worker) = workers
-                .iter()
+        if let Some(view) = &pane.chat.worker_view {
+            let workers = subagent_chat::rows(visible);
+            if let Some(worker) = workers.iter()
                 .find(|row| row.index == view.index && row.worker.id == view.id)
-        {
-            return self.render_worker_view(pane, view, worker, window, cx);
+            {
+                return self.render_worker_view(pane, view, worker, window, cx);
+            }
         }
         let render_start = std::time::Instant::now();
         let tokens = self.tokens(cx);
@@ -16290,6 +16290,52 @@ mod kathamo_bottom_input_tests {
     use gpui::{Modifiers, VisualContext, point};
     use resize_tests::{DrawFrame, TestAppContext, open_app};
 
+    fn wait_for_terminal_submission(cx: &mut gpui::VisualTestContext, state: &Entity<AppState>, pane_id: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if !state.read_with(cx, |state, _| state.pane_ref(pane_id).unwrap().input_submitting) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "PTY submission did not settle");
+            cx.background_executor.advance_clock(std::time::Duration::from_millis(50));
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn failed_physical_pty_write_keeps_draft_and_never_sends_enter() {
+        struct FailingWriter(Arc<std::sync::atomic::AtomicUsize>);
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed test PTY"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut cx = TestAppContext::new();
+        let (mut cx, app) = open_app(&mut cx);
+        cx.draw_frame().unwrap();
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pane_id = app.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&app, |state, window, cx| {
+            let pane = state.pane_mut(pane_id).unwrap();
+            pane.terminal = cx.new(|cx| TerminalView::new(
+                FailingWriter(writes.clone()), std::io::empty(), TerminalConfig::default(), cx,
+            ));
+            pane.input_state.as_ref().unwrap().update(cx, |input, cx| input.set_value("do not lose this", window, cx));
+            state.execute_pane_input(pane_id, window, cx);
+        });
+        wait_for_terminal_submission(&mut cx, &app, pane_id);
+        app.read_with(&cx, |state, cx| {
+            let pane = state.pane_ref(pane_id).unwrap();
+            assert_eq!(pane.input_state.as_ref().unwrap().read(cx).value().as_str(), "do not lose this");
+            assert!(pane.command_history.is_empty());
+        });
+        assert_eq!(writes.load(Ordering::Relaxed), 1, "failed input must not be replayed or followed by Enter");
+        cx.draw_frame().unwrap();
+    }
+
     #[test]
     fn input_mode_pills_show_label_only_on_the_active_tab() {
         let mut app = TestAppContext::new();
@@ -16622,32 +16668,6 @@ mod kathamo_bottom_input_tests {
         assert!(messages[2].role == ChatRole::Thinking);
     }
 
-    #[test]
-    fn tool_view_formats_compact_summaries() {
-        let read = tool_view(
-            "read",
-            r#"{"path":"/tmp/project/src/main.rs","offset":10,"limit":20}"#,
-        );
-        assert_eq!(read.title, "Read");
-        assert_eq!(read.subtitle, "main.rs");
-        assert_eq!(read.args, vec!["offset=10", "limit=20"]);
-
-        let shell = tool_view("bash", r#"{"command":"cargo test\n--all"}"#);
-        assert_eq!(shell.title, "Shell");
-        assert_eq!(shell.subtitle, "cargo test");
-
-        let agent = tool_view("task", r#"{"agent":"build","description":"Fix the build"}"#);
-        assert_eq!(agent.title, "Build Agent");
-        assert_eq!(agent.subtitle, "Fix the build");
-
-        let grep = tool_view(
-            "grep",
-            r#"{"path":"src","pattern":"Tool","include":"*.rs"}"#,
-        );
-        assert_eq!(grep.title, "Grep");
-        assert_eq!(grep.subtitle, "Tool in src");
-        assert_eq!(grep.args, vec!["pattern=Tool", "include=*.rs"]);
-    }
 
     #[test]
     fn completed_reasoning_collapses_when_the_answer_starts() {
@@ -17789,10 +17809,7 @@ First report
             state.execute_pane_input(pane_id, window, cx);
         });
 
-        // Advance executor so the 25ms timer fires and delivers Enter
-        cx.background_executor
-            .advance_clock(std::time::Duration::from_millis(50));
-        cx.run_until_parked();
+        wait_for_terminal_submission(&mut cx, &app_state, pane_id);
 
         // Terminal received input and cleared draft
         app_state.read_with(&cx, |state, cx| {
@@ -17839,9 +17856,7 @@ First report
             input.update(cx, |input, cx| input.set_value("what is this", window, cx));
             state.execute_pane_input(pane_id, window, cx);
         });
-        cx.background_executor
-            .advance_clock(std::time::Duration::from_millis(100));
-        cx.run_until_parked();
+        wait_for_terminal_submission(&mut cx, &app_state, pane_id);
 
         app_state.read_with(&cx, |state, _| {
             let pane = &state.projects[0].sessions[0].panes[0];
@@ -18666,8 +18681,8 @@ First report
                     messages,
                     AgentEvent::ToolStart {
                         id: Some(id.clone()),
-                        name: "read".into(),
-                        input: r#"{"path":"Cargo.toml"}"#.into(),
+                        name: "bash".into(),
+                        input: r#"{"command":"printf ready"}"#.into(),
                     },
                 );
                 Arc::make_mut(messages.last_mut().unwrap())
@@ -18679,6 +18694,24 @@ First report
             });
             cx.draw_frame().unwrap();
             assert!(cx.debug_bounds("tool-row-0").is_some());
+            cx.update_window_entity(&state, |s, _, cx| {
+                push_chat_event(
+                    s.pane_mut(pane_id).unwrap().chat.visible_messages_mut(),
+                    AgentEvent::ToolUpdate {
+                        id: Some(id.clone()), name: "bash".into(), output: "ready".into(),
+                    },
+                );
+                cx.notify();
+            });
+            cx.draw_frame().unwrap();
+            if sample == 0 {
+                if let Some(path) = std::env::var_os("KATHAMO_BENCH_SCREENSHOT") {
+                    cx.update(|window, _| {
+                        window.render_to_image().expect("capture tool card")
+                            .save(path).expect("save tool card");
+                    });
+                }
+            }
             timing::tool_finished(&id);
             cx.update_window_entity(&state, |s, _, cx| {
                 let messages = s.pane_mut(pane_id).unwrap().chat.visible_messages_mut();
@@ -18686,8 +18719,8 @@ First report
                     messages,
                     AgentEvent::ToolEnd {
                         id: Some(id),
-                        name: "read".into(),
-                        output: "[package]".into(),
+                        name: "bash".into(),
+                        output: "ready".into(),
                         failed: false,
                     },
                 );
@@ -19325,9 +19358,9 @@ First report
         );
         let start = Instant::now();
         for _ in 0..10_000 {
-            black_box(tool_view("write", &big_input));
-            black_box(shell_command(&big_input));
-            black_box(tool_content_body("write", &big_input));
+            black_box(tool_view("write", &big_input, serde_json::from_str(&big_input).ok().as_ref()));
+            black_box(shell_command(&big_input, serde_json::from_str(&big_input).ok().as_ref()));
+            black_box(tool_content_body("write", serde_json::from_str(&big_input).ok().as_ref()));
         }
         let old_tool = start.elapsed();
 
@@ -19369,9 +19402,10 @@ First report
         let _ = std::fs::remove_file(&path);
 
         let mut log = conversations::Log::at_path(path.clone(), u64::MAX);
+        let conversations::Entry::Event { event } = &entry else { unreachable!() };
         let start = Instant::now();
         for _ in 0..2_000 {
-            log.append(entry.clone());
+            log.append_event(event);
         }
         let new_history_enqueue = start.elapsed();
         log.flush();

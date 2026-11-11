@@ -53,3 +53,9 @@ version = "0.12"
 
 [dependencies.portable-pty]
 version = "0.9"
+
+[dependencies.smol]
+version = "2"
+
+[dependencies.libc]
+version = "0.2"

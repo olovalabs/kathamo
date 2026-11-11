@@ -4,7 +4,7 @@ use gpui::{
     ParentElement, Render, Styled, Window, div, px,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::sync::Arc;
+use terminal::pty_session::{PendingPty, PreparedPty, PtyEvent};
 use terminal::{ColorPalette, TerminalConfig, TerminalView};
 
 struct TerminalApp {
@@ -53,39 +53,24 @@ fn main() -> Result<()> {
     let app = gpui_platform::application();
 
     app.run(move |cx| {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-
-        let pty_system = native_pty_system();
-
-        let pair = pty_system
-            .openpty(PtySize {
+        let PendingPty {
+            reader,
+            writer,
+            control,
+            events,
+        } = PendingPty::spawn(|| {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let pair = native_pty_system().openpty(PtySize {
                 rows: 24,
                 cols: 80,
                 pixel_width: 0,
                 pixel_height: 0,
-            })
-            .expect("Failed to open PTY");
-
-        let mut cmd = CommandBuilder::new(&shell);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
-
-        let _child = pair
-            .slave
-            .spawn_command(cmd)
-            .expect("Failed to spawn shell");
-
-        let writer = pair.master.take_writer().expect("Failed to get PTY writer");
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .expect("Failed to get PTY reader");
-
-        let pty_master = Arc::new(parking_lot::Mutex::new(pair.master));
-
-        drop(pair.slave);
-
-        let pty_master_clone = pty_master.clone();
+            })?;
+            let mut cmd = CommandBuilder::new(&shell);
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("COLORTERM", "truecolor");
+            PreparedPty::spawn(pair, cmd)
+        });
         cx.spawn(async move |cx| {
             let colors = ColorPalette::builder()
                 .background(0x16, 0x16, 0x17)
@@ -122,16 +107,13 @@ fn main() -> Result<()> {
                 ..TerminalConfig::default()
             };
 
-            let pty_for_resize = pty_master_clone.clone();
             let resize_callback = move |cols: usize, rows: usize| {
-                if let Err(e) = pty_for_resize.lock().resize(PtySize {
+                control.resize(PtySize {
                     cols: cols as u16,
                     rows: rows as u16,
                     pixel_width: 0,
                     pixel_height: 0,
-                }) {
-                    eprintln!("Failed to resize PTY: {}", e);
-                }
+                });
             };
 
             cx.open_window(
@@ -144,14 +126,33 @@ fn main() -> Result<()> {
                 },
                 |window, cx| {
                     let terminal = cx.new(|cx| {
-                        TerminalView::new(writer, reader, config, cx)
+                        let mut view = TerminalView::new(writer, reader, config, cx)
                             .with_resize_callback(resize_callback)
                             .with_exit_callback(|_window, cx| {
                                 cx.quit();
-                            })
+                            });
+                        view.set_capture_output(false);
+                        view
                     });
+                    let weak = terminal.downgrade();
+                    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                        while let Ok(event) = events.recv().await {
+                            let result = weak.update(cx, |terminal, cx| match event {
+                                PtyEvent::Ready { .. } => {}
+                                PtyEvent::Exited(status) => {
+                                    terminal.record_child_exit(status.exit_code() as i32, cx)
+                                }
+                                PtyEvent::Error(error) => terminal.report_io_error(error, cx),
+                            });
+                            if result.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
 
-                    terminal.read(cx).focus_handle().focus(window);
+                    let focus = terminal.read(cx).focus_handle().clone();
+                    focus.focus(window, cx);
 
                     cx.new(|_cx| TerminalApp::new(terminal))
                 },

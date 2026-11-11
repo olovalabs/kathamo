@@ -1,35 +1,26 @@
 //! Mirrors `packages/agent/src/harness/utils/shell-output.ts` — the bash tool's
 //! output-capture layer wrapping `Shell::exec`.
 //!
-//! Combines stdout+stderr into a single rolling tail buffer (capped at
-//! `max_output_bytes = DEFAULT_MAX_BYTES * 2 = 100KB`), spills to a temp file
-//! (`bash-*.log`) once cumulative output exceeds `DEFAULT_MAX_BYTES`/`DEFAULT_MAX_LINES`,
-//! and produces a [`ShellCaptureResult`] carrying truncation metadata + the
-//! temp-file path. `on_chunk` fires per sanitized/CR-stripped chunk with a
-//! progress snapshot.
-//!
-//! `return_execution_errors: true` causes exec failures to come back as a
-//! success-result with `execution_error` populated (so the bash tool — not the
-//! env — owns error rendering via `append_status`). There is NO time-based
-//! throttle here; throttling lives in the bash tool.
-//!
-//! **v1 divergence from the TS:** the TS initializes the temp file mid-stream
-//! (inside the stdout/stderr callback) and appends subsequent chunks. Doing
-//! async file I/O from a sync `FnMut` callback is unsound in Rust, so the v1
-//! port performs the spill in a single **post-stream** pass: the entire
-//! captured tail is written to the temp file after `exec` resolves. The
-//! `full_output_path` and truncation metadata are identical; only the timing
-//! of the file write differs. Tests verify the temp file exists when output
-//! exceeds limits — they don't depend on mid-stream creation.
+//! Combines sanitized stdout+stderr into a bounded rolling tail. Once output
+//! exceeds display limits, a complete sanitized log is persisted asynchronously.
+//! A bounded channel backpressures pipe readers while filesystem writes yield;
+//! child status, timeout and cancellation are driven independently of the spool.
+//! Optional progress coalescing uses one execution-local timer, including during
+//! quiet periods. Snapshots are constructed only when a consumer is notified.
+//! The persisted log contains all sanitized output delivered by the backend,
+//! not arbitrary output from descendants after shell exit: backend pipe draining
+//! has a 100ms grace followed by at most 1MiB of ready bytes per stream.
+//! Slow storage can delay the final result while these bounded writes finish,
+//! but cannot delay polling shell cancellation, deadlines or tree termination.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::env::{ExecutionEnv, FileContent, ShellExecOptions};
+use crate::env::{ExecutionEnv, FileContent, ShellExecOptions, ShellOutputChunk};
 use crate::error::{ExecutionError, ExecutionErrorCode};
 use crate::truncate::{
     trim_to_last_utf8_bytes, truncate_tail, TruncationLimit, TruncationOptions, TruncationResult,
@@ -38,6 +29,7 @@ use crate::truncate::{
 
 /// The 100KB cap on the in-memory `tail_output` rolling buffer.
 const MAX_OUTPUT_BYTES: usize = DEFAULT_MAX_BYTES * 2;
+const SPOOL_BATCH_BYTES: usize = 64 * 1024;
 
 /// Mirrors `ShellCaptureProgress`.
 #[derive(Clone)]
@@ -71,6 +63,8 @@ pub struct ShellCaptureOptions<'a> {
     pub cancel: Option<&'a CancellationToken>,
     pub on_chunk:
         Option<Box<dyn FnMut(&str, &dyn Fn() -> Option<ShellCaptureProgress>) + Send + 'a>>,
+    /// Coalesce progress with one timer; `None` preserves per-chunk callbacks.
+    pub update_interval: Option<Duration>,
     pub return_execution_errors: bool,
 }
 
@@ -84,22 +78,22 @@ impl<'a> Default for ShellCaptureOptions<'a> {
             timeout: None,
             cancel: None,
             on_chunk: None,
+            update_interval: None,
             return_execution_errors: false,
         }
     }
 }
 
-/// Shared capture state, mutated by the stdout/stderr closures and read by the
-/// post-stream progress computation.
+/// Owned by the capture consumer; pipe readers only send bounded chunks.
 #[derive(Default)]
 struct CaptureState {
     tail_output: String,
+    tail_start: usize,
     total_bytes: usize,
     completed_lines: usize,
     has_open_line: bool,
     current_line_bytes: usize,
     full_output_path: Option<PathBuf>,
-    full_output_requested: bool,
 }
 
 impl CaptureState {
@@ -121,16 +115,19 @@ impl CaptureState {
             }
             None => {}
         }
+        // Advance a logical start without moving the tail on every pipe read.
         self.tail_output.push_str(text);
-        // Cap the in-memory tail at MAX_OUTPUT_BYTES.
-        let trimmed = trim_to_last_utf8_bytes(&self.tail_output, MAX_OUTPUT_BYTES);
-        if trimmed.len() != self.tail_output.len() {
-            self.tail_output = trimmed.to_string();
+        let live = &self.tail_output[self.tail_start..];
+        self.tail_start += live.len() - trim_to_last_utf8_bytes(live, MAX_OUTPUT_BYTES).len();
+        if self.tail_start >= MAX_OUTPUT_BYTES {
+            self.tail_output.drain(..self.tail_start);
+            self.tail_start = 0;
         }
     }
 
     fn create_progress(&self) -> ShellCaptureProgress {
-        let tail_truncation = truncate_tail(&self.tail_output, TruncationOptions::default());
+        let tail = &self.tail_output[self.tail_start..];
+        let tail_truncation = truncate_tail(tail, TruncationOptions::default());
         let total_lines = self.completed_lines + if self.has_open_line { 1 } else { 0 };
         let truncated = total_lines > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES;
         let truncated_by = if truncated {
@@ -154,7 +151,7 @@ impl CaptureState {
         let output = if truncated {
             truncation.content.clone()
         } else {
-            self.tail_output.clone()
+            tail.to_string()
         };
         ShellCaptureProgress {
             output,
@@ -165,185 +162,225 @@ impl CaptureState {
     }
 }
 
-/// Sanitize a chunk: drop C0 controls (except TAB/LF/CR) and interlinear
-/// annotation chars (U+FFF9..U+FFFB), then strip all CR. Mirrors
-/// `sanitizeBinaryOutput` + the per-chunk `.replace(/\r/g, "")`.
-///
-/// ANSI escape sequences are consumed whole rather than having just their
-/// leading ESC byte (a C0 control) dropped: dropping only ESC left the
-/// sequence body behind, so colored output (e.g. `vite` build logs) surfaced
-/// as literal `[36m`-style garbage in the tool response.
-fn sanitize_and_strip_cr(chunk: &str) -> String {
-    let mut out = String::with_capacity(chunk.len());
-    let mut chars = chunk.chars().peekable();
-    while let Some(c) = chars.next() {
-        let u = c as u32;
-        if c == '\x1b' {
-            skip_escape_sequence(&mut chars);
-        } else if u == 0x09 || u == 0x0a || u == 0x0d {
-            out.push(c);
-        } else if u <= 0x1f {
-            // other C0 controls → drop
-        } else if (0xfff9..=0xfffb).contains(&u) {
-            // interlinear annotation → drop
-        } else {
-            out.push(c);
-        }
-    }
-    out.replace('\r', "")
+/// ANSI state belongs to each stream: escape sequences may span pipe reads.
+#[derive(Default)]
+struct Sanitizer {
+    escape: Escape,
 }
 
-/// Consume one ANSI escape sequence, starting just after the ESC byte the
-/// caller already read. Handles CSI (`ESC [ … final`), OSC (`ESC ] … BEL |
-/// `ESC \`), and charset designators (`ESC ( X`); any other escape swallows a
-/// single following char.
-fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    match chars.peek() {
-        Some('[') => {
-            chars.next();
-            // CSI: parameter/intermediate bytes, terminated by a final byte in
-            // the 0x40..=0x7E range.
-            while let Some(c) = chars.next() {
-                if (0x40..=0x7e).contains(&(c as u32)) {
-                    break;
-                }
-            }
+#[derive(Default, Clone, Copy)]
+enum Escape {
+    #[default]
+    Text,
+    Start,
+    Csi,
+    Osc,
+    OscEscape,
+    Charset,
+}
+
+impl Sanitizer {
+    fn push_owned(&mut self, chunk: String) -> String {
+        if matches!(self.escape, Escape::Text)
+            && !chunk.chars().any(|c| matches!(c, '\x00'..='\x08' | '\x0b'..='\x1f' | '\u{fff9}'..='\u{fffb}'))
+        {
+            return chunk;
         }
-        Some(']') => {
-            chars.next();
-            // OSC: terminated by BEL (0x07) or ST (ESC \).
-            while let Some(c) = chars.next() {
-                if c == '\x07' {
-                    break;
-                }
-                if c == '\x1b' {
-                    if let Some('\\') = chars.peek() {
-                        chars.next();
+        self.push(&chunk)
+    }
+
+    fn push(&mut self, chunk: &str) -> String {
+        let mut out = String::with_capacity(chunk.len());
+        for c in chunk.chars() {
+            match self.escape {
+                Escape::Text => match c {
+                    '\x1b' => self.escape = Escape::Start,
+                    '\t' | '\n' => out.push(c),
+                    '\x00'..='\x1f' | '\u{fff9}'..='\u{fffb}' => {}
+                    _ => out.push(c),
+                },
+                Escape::Start => self.escape = match c {
+                    '[' => Escape::Csi,
+                    ']' => Escape::Osc,
+                    '(' | ')' => Escape::Charset,
+                    _ => Escape::Text,
+                },
+                Escape::Csi => {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        self.escape = Escape::Text;
                     }
-                    break;
                 }
+                Escape::Osc => match c {
+                    '\x07' => self.escape = Escape::Text,
+                    '\x1b' => self.escape = Escape::OscEscape,
+                    _ => {}
+                },
+                Escape::OscEscape => self.escape = if c == '\\' {
+                    Escape::Text
+                } else {
+                    Escape::Osc
+                },
+                Escape::Charset => self.escape = Escape::Text,
             }
         }
-        Some('(') | Some(')') => {
-            // Charset designator: ESC ( or ESC ) followed by one char.
-            chars.next();
-            chars.next();
-        }
-        Some(_) => {
-            chars.next();
-        }
-        None => {}
+        out
     }
 }
 
-/// Mirrors `executeShellWithCapture`. Drives `env.exec` with on_stdout/on_stderr
-/// callbacks that fold into [`CaptureState`], spills to a temp file in a
-/// post-stream pass, and returns the terminal [`ShellCaptureResult`].
+#[cfg(test)]
+fn sanitize_and_strip_cr(chunk: &str) -> String {
+    Sanitizer::default().push(chunk)
+}
+
+/// Capture with bounded asynchronous persistence and optional timed progress.
 pub async fn execute_shell_with_capture(
     env: &Arc<dyn ExecutionEnv>,
     command: &str,
     options: ShellCaptureOptions<'_>,
 ) -> Result<ShellCaptureResult, ExecutionError> {
-    let state = Arc::new(Mutex::new(CaptureState::default()));
-
-    // The user on_chunk callback. Both streams fire it (the TS wires both to the
-    // same onChunk); we share it via Arc<Mutex<Option<Box>>> so both closures can
-    // call it without moving the Box twice.
-    let user_cb: Arc<
-        Mutex<Option<Box<dyn FnMut(&str, &dyn Fn() -> Option<ShellCaptureProgress>) + Send>>>,
-    > = Arc::new(Mutex::new(options.on_chunk));
-
-    let state_stdout = state.clone();
-    let user_cb_stdout = user_cb.clone();
-    let on_stdout: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
-        let text = sanitize_and_strip_cr(chunk);
-        {
-            let mut s = match state_stdout.try_lock() {
-                Ok(g) => g,
-                Err(_) => return, // contention — skip this chunk's callback
-            };
-            s.ingest_chunk(&text);
-        }
-        let mut cbg = match user_cb_stdout.try_lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if let Some(cb) = cbg.as_mut() {
-            // The progress snapshot is O(tail) because it runs tail truncation
-            // and copies the output. Build it lazily so a throttled consumer
-            // only pays for it on the checkpoints it actually emits.
-            let progress_state = state_stdout.clone();
-            let getter = move || progress_state.try_lock().ok().map(|s| s.create_progress());
-            cb(chunk, &getter);
-        }
-    });
-
-    let state_stderr = state.clone();
-    let user_cb_stderr = user_cb.clone();
-    let on_stderr: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
-        let text = sanitize_and_strip_cr(chunk);
-        {
-            let mut s = match state_stderr.try_lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            s.ingest_chunk(&text);
-        }
-        let mut cbg = match user_cb_stderr.try_lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        if let Some(cb) = cbg.as_mut() {
-            let progress_state = state_stderr.clone();
-            let getter = move || progress_state.try_lock().ok().map(|s| s.create_progress());
-            cb(chunk, &getter);
-        }
-    });
-
+    let (output, mut receiver) = tokio::sync::mpsc::channel(8);
     let exec_opts = ShellExecOptions {
-        shell: options.shell.clone(),
-        cwd: options.cwd.clone(),
-        env: options.env.clone(),
+        shell: options.shell,
+        cwd: options.cwd,
+        env: options.env,
         inherit_env: options.inherit_env,
         timeout: options.timeout,
         cancel: options.cancel,
-        on_stdout: Some(on_stdout),
-        on_stderr: Some(on_stderr),
-        // The capture state below already keeps the bounded tail that the
-        // result is built from; retaining a second full copy in the exec
-        // layer only costs memory and copies.
+        on_stdout: None,
+        on_stderr: None,
+        output: Some(output),
         capture_output: false,
     };
-
-    let exec_result = env.exec(command, exec_opts).await;
-
-    // Post-stream safety net: if truncated and no temp file yet, init it now
-    // with the captured tail.
-    {
-        let progress = state.lock().await.create_progress();
-        if progress.truncation.truncated {
-            let s = state.lock().await;
-            if !s.full_output_requested {
-                let initial = s.tail_output.clone();
-                drop(s);
-                match init_full_output_file(env.clone(), &initial, options.cancel).await {
-                    Ok(path) => {
-                        let mut s2 = state.lock().await;
-                        s2.full_output_path = Some(path);
-                        s2.full_output_requested = true;
+    let execution = env.exec(command, exec_opts);
+    let consumer = async {
+        let mut state = CaptureState::default();
+        let mut sanitizers = [Sanitizer::default(), Sanitizer::default()];
+        // Retain the prefix only until display truncation requires a spool.
+        let mut prefix = String::new();
+        let mut spool_failed = false;
+        let mut spool_writer: Option<Box<dyn crate::env::AppendFile>> = None;
+        let mut spool_buffer = String::new();
+        let mut on_chunk = options.on_chunk;
+        let mut dirty = false;
+        let mut first = true;
+        let mut deadline = tokio::time::Instant::now();
+        let timer = tokio::time::sleep_until(deadline);
+        tokio::pin!(timer);
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = &mut timer, if dirty && options.update_interval.is_some() => {
+                    if let Some(cb) = on_chunk.as_mut() {
+                        cb("", &|| Some(state.create_progress()));
                     }
-                    Err(e) => {
-                        // Spill failure is non-fatal — the capture still
-                        // returns; the truncation metadata is present, just no
-                        // fullOutputPath. Log via tracing.
-                        tracing::warn!("bash full-output temp file init failed: {e}");
+                    dirty = false;
+                    deadline = tokio::time::Instant::now() + options.update_interval.unwrap();
+                    timer.as_mut().reset(deadline);
+                    continue;
+                }
+                chunk = receiver.recv() => match chunk {
+                    Some(chunk) => chunk,
+                    None => break,
+                },
+            };
+            let text = match chunk {
+                ShellOutputChunk::Stdout(text) => sanitizers[0].push_owned(text),
+                ShellOutputChunk::Stderr(text) => sanitizers[1].push_owned(text),
+            };
+            if text.is_empty() {
+                continue;
+            }
+            state.ingest_chunk(&text);
+            dirty = true;
+            let now = tokio::time::Instant::now();
+            if first || options.update_interval.is_none() || now >= deadline {
+                if let Some(cb) = on_chunk.as_mut() {
+                    cb(&text, &|| Some(state.create_progress()));
+                }
+                first = false;
+                dirty = false;
+                deadline = now + options.update_interval.unwrap_or_default();
+                timer.as_mut().reset(deadline);
+            }
+
+            if !spool_failed {
+                if state.full_output_path.is_none() {
+                    prefix.push_str(&text);
+                }
+                let total_lines = state.completed_lines + usize::from(state.has_open_line);
+                let needs_spool = state.total_bytes > DEFAULT_MAX_BYTES || total_lines > DEFAULT_MAX_LINES;
+                if state.full_output_path.is_none() && !needs_spool {
+                    continue;
+                }
+                if state.full_output_path.is_some() {
+                    spool_buffer.push_str(&text);
+                    // Coalesce an existing backlog, never wait to create one.
+                    // Sparse output still reaches disk immediately.
+                    if spool_buffer.len() < SPOOL_BATCH_BYTES && !receiver.is_empty() {
+                        continue;
+                    }
+                }
+                let result = {
+                    let writing = async {
+                        if let Some(path) = &state.full_output_path {
+                            append_full_output(env, path, &mut spool_writer, &mut spool_buffer)
+                                .await.map(|()| None)
+                        } else if needs_spool {
+                            init_full_output_file(env, &prefix).await.map(Some)
+                        } else {
+                            Ok(None)
+                        }
+                    };
+                    tokio::pin!(writing);
+                    loop {
+                        tokio::select! {
+                            result = &mut writing => break result,
+                            _ = &mut timer, if dirty && options.update_interval.is_some() => {
+                                if let Some(cb) = on_chunk.as_mut() {
+                                    cb("", &|| Some(state.create_progress()));
+                                }
+                                dirty = false;
+                                deadline = tokio::time::Instant::now() + options.update_interval.unwrap();
+                                timer.as_mut().reset(deadline);
+                            }
+                        }
+                    }
+                };
+                match result {
+                    Ok(Some((path, writer))) => {
+                        state.full_output_path = Some(path);
+                        spool_writer = writer;
+                        prefix = String::new();
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!("shell full-output persistence failed: {error}");
+                        // Never advertise a partial file as complete.
+                        state.full_output_path = None;
+                        spool_writer = None;
+                        prefix = String::new();
+                        spool_failed = true;
+                        spool_buffer.clear();
                     }
                 }
             }
         }
-    }
-
-    let progress = state.lock().await.create_progress();
+        if !spool_buffer.is_empty() {
+            if let Some(path) = &state.full_output_path {
+                if let Err(error) = append_full_output(env, path, &mut spool_writer, &mut spool_buffer).await {
+                    tracing::warn!("shell full-output persistence failed: {error}");
+                    state.full_output_path = None;
+                }
+            }
+        }
+        let progress = state.create_progress();
+        if let Some(cb) = on_chunk.as_mut() {
+            cb("", &|| Some(progress.clone()));
+        }
+        progress
+    };
+    // A stalled spool backpressures reads, not child status/kill/deadline.
+    let (exec_result, progress) = tokio::join!(execution, consumer);
     // Pull the scalar/move fields out once so we never read a partially-moved
     // `progress` (e.g. `progress.truncation.truncated` after `truncation:` moved it).
     let ShellCaptureProgress {
@@ -357,9 +394,9 @@ pub async fn execute_shell_with_capture(
         Ok(out) => {
             let cancelled = options.cancel.map(|t| t.is_cancelled()).unwrap_or(false);
             Ok(ShellCaptureResult {
-                output: output.clone(),
-                truncation: truncation.clone(),
-                full_output_path: full_output_path.clone(),
+                output,
+                truncation,
+                full_output_path,
                 last_line_bytes,
                 exit_code: if cancelled { None } else { Some(out.exit_code) },
                 cancelled,
@@ -399,26 +436,40 @@ pub async fn execute_shell_with_capture(
     }
 }
 
-/// Create the temp file with initial content. Mirrors `ensureFullOutputFile`'s
-/// first-call path: `env.createTempFile({prefix:"bash-", suffix:".log"})` +
-/// `appendFile(path, initialContent)`.
+async fn append_full_output(
+    env: &Arc<dyn ExecutionEnv>,
+    path: &std::path::Path,
+    writer: &mut Option<Box<dyn crate::env::AppendFile>>,
+    buffer: &mut String,
+) -> Result<(), ExecutionError> {
+    let result = if let Some(writer) = writer {
+        writer.append(buffer.as_bytes()).await
+    } else {
+        env.append_file(&path.to_string_lossy(), FileContent::Text(std::mem::take(buffer)), None).await
+    };
+    result.map_err(|error| ExecutionError::new(ExecutionErrorCode::Unknown, error.to_string()))?;
+    buffer.clear();
+    Ok(())
+}
+
+/// Persist the prefix and reuse the backend's asynchronous append capability
+/// when available; other environments keep their existing append implementation.
 async fn init_full_output_file(
-    env: Arc<dyn ExecutionEnv>,
+    env: &Arc<dyn ExecutionEnv>,
     initial: &str,
-    cancel: Option<&CancellationToken>,
-) -> Result<PathBuf, ExecutionError> {
+) -> Result<(PathBuf, Option<Box<dyn crate::env::AppendFile>>), ExecutionError> {
     let path = env
-        .create_temp_file("bash-", ".log", cancel)
+        .create_temp_file("bash-", ".log", None)
         .await
         .map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
-    env.append_file(
-        &path.to_string_lossy(),
-        FileContent::Text(initial.to_string()),
-        cancel,
-    )
-    .await
-    .map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
-    Ok(path)
+    let mut writer = env.open_append_file(&path.to_string_lossy())
+        .await
+        .map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
+    match &mut writer {
+        Some(writer) => writer.append(initial.as_bytes()).await,
+        None => env.append_file(&path.to_string_lossy(), FileContent::Text(initial.to_string()), None).await,
+    }.map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
+    Ok((path, writer))
 }
 
 /// Re-export `format_size` for the bash tool's truncation footer messages.

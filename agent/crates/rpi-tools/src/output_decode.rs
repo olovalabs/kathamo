@@ -22,6 +22,8 @@
 //!
 //! Windows resolves its console code page lazily, only when fallback is needed;
 //! UTF-8 and console-encoded output can coexist in one command's output.
+//! Async consumers use `push_async` / `finish_async`: the first-needed query is
+//! coalesced on the blocking pool, never on a pipe reader's runtime thread.
 
 use encoding_rs::{Decoder, Encoding};
 
@@ -73,6 +75,33 @@ impl StreamDecoder {
     /// Emit the unambiguous prefix, holding undecided non-ASCII spans as above.
     pub fn push(&mut self, mut bytes: &[u8]) -> String {
         let mut out = String::new();
+        while let Some((consumed, last)) = self.push_into(bytes, &mut out) {
+            self.fallback = Some(console_encoding());
+            self.commit_pending(last, &mut out);
+            bytes = &bytes[consumed..];
+        }
+        out
+    }
+
+    /// Like `push`, but first-needed console discovery runs off the runtime.
+    /// ASCII and valid UTF-8 never wait for or start a console probe.
+    pub async fn push_async(
+        &mut self,
+        mut bytes: &[u8],
+    ) -> Result<String, tokio::task::JoinError> {
+        let mut out = String::new();
+        while let Some((consumed, last)) = self.push_into(bytes, &mut out) {
+            self.fallback = Some(console_encoding_async().await?);
+            self.commit_pending(last, &mut out);
+            bytes = &bytes[consumed..];
+        }
+        Ok(out)
+    }
+
+    // Pause exactly at the first span that needs an unknown fallback. Pending
+    // bytes and the segment boundary remain intact across asynchronous discovery.
+    fn push_into(&mut self, mut bytes: &[u8], out: &mut String) -> Option<(usize, bool)> {
+        let input_len = bytes.len();
         while !bytes.is_empty() {
             let (mut line, ends_line) = match bytes.iter().position(|&b| b == b'\n' || b == b'\r') {
                 Some(end) => (&bytes[..=end], true),
@@ -82,7 +111,7 @@ impl StreamDecoder {
                 self.legacy = Some(encoding_rs::UTF_8.new_decoder_without_bom_handling());
             }
             if let Some(decoder) = self.legacy.as_mut() {
-                decode_legacy(decoder, line, ends_line, &mut out);
+                decode_legacy(decoder, line, ends_line, out);
                 bytes = &bytes[line.len()..];
                 if ends_line {
                     self.legacy = None;
@@ -111,10 +140,13 @@ impl StreamDecoder {
             bytes = &bytes[count..];
             let last = ends_line && count == line.len();
             if last || (self.pending.len() > PENDING_LIMIT && utf8_decided(&self.pending)) {
-                self.commit_pending(last, &mut out);
+                if self.fallback.is_none() && std::str::from_utf8(&self.pending).is_err() {
+                    return Some((input_len - bytes.len(), last));
+                }
+                self.commit_pending(last, out);
             }
         }
-        out
+        None
     }
 
     fn commit_pending(&mut self, last: bool, out: &mut String) {
@@ -144,6 +176,17 @@ impl StreamDecoder {
         }
         out
     }
+
+    /// Finalize already-read bytes without blocking on console discovery.
+    pub async fn finish_async(&mut self) -> Result<String, tokio::task::JoinError> {
+        if self.legacy.is_none()
+            && self.fallback.is_none()
+            && std::str::from_utf8(&self.pending).is_err()
+        {
+            self.fallback = Some(console_encoding_async().await?);
+        }
+        Ok(self.finish())
+    }
 }
 
 /// Whether `bytes` is valid UTF-8 or contains an invalid sequence, as opposed
@@ -160,6 +203,14 @@ pub fn decode_output(bytes: &[u8]) -> String {
     out
 }
 
+/// Nonblocking counterpart for asynchronous consumers such as shell probes.
+pub async fn decode_output_async(bytes: &[u8]) -> Result<String, tokio::task::JoinError> {
+    let mut decoder = StreamDecoder::new();
+    let mut out = decoder.push_async(bytes).await?;
+    out.push_str(&decoder.finish_async().await?);
+    Ok(out)
+}
+
 fn decode_legacy(decoder: &mut Decoder, bytes: &[u8], last: bool, out: &mut String) {
     let room = decoder
         .max_utf8_buffer_length(bytes.len())
@@ -168,11 +219,32 @@ fn decode_legacy(decoder: &mut Decoder, bytes: &[u8], last: bool, out: &mut Stri
     let _ = decoder.decode_to_string(bytes, out, last);
 }
 
+#[cfg(windows)]
+// Unlike a forcing lazy initializer, this permits a nonblocking cache peek
+// before deciding whether asynchronous discovery is needed.
+static CONSOLE_ENCODING: std::sync::OnceLock<&'static Encoding> = std::sync::OnceLock::new();
+
+/// Coalesce async discovery while sharing the synchronous decoder's once cache.
+async fn console_encoding_async() -> Result<&'static Encoding, tokio::task::JoinError> {
+    #[cfg(windows)]
+    {
+        if let Some(encoding) = CONSOLE_ENCODING.get() {
+            return Ok(*encoding);
+        }
+        static ENCODING: tokio::sync::OnceCell<&'static Encoding> = tokio::sync::OnceCell::const_new();
+        return ENCODING
+            .get_or_try_init(|| async { tokio::task::spawn_blocking(console_encoding).await })
+            .await
+            .copied();
+    }
+    #[cfg(not(windows))]
+    Ok(encoding_rs::UTF_8)
+}
+
 /// The encoding console programs write in.
 #[cfg(windows)]
 pub fn console_encoding() -> &'static Encoding {
-    static ENCODING: std::sync::OnceLock<&'static Encoding> = std::sync::OnceLock::new();
-    *ENCODING.get_or_init(|| {
+    *CONSOLE_ENCODING.get_or_init(|| {
         console_code_page()
             .and_then(codepage::to_encoding)
             .unwrap_or(encoding_rs::UTF_8)
@@ -221,6 +293,39 @@ fn parse_chcp(stdout: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn async_decoding_preserves_mixed_segments_and_partial_characters() {
+        let bytes = b"ascii\n\xE4\xB8\xAD\n\xC2\xA9\xD6\xD0\r\xE4\xB8";
+        let mut expected_decoder = StreamDecoder::with_fallback(encoding_rs::GBK);
+        let expected = decode_in_reads(&mut expected_decoder, bytes, bytes.len());
+        for read in [1, 2, 3, 8192] {
+            let mut decoder = StreamDecoder::with_fallback(encoding_rs::GBK);
+            let mut actual = String::new();
+            for chunk in bytes.chunks(read) {
+                actual.push_str(&decoder.push_async(chunk).await.unwrap());
+            }
+            actual.push_str(&decoder.finish_async().await.unwrap());
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn ascii_and_valid_utf8_do_not_require_a_tokio_runtime() {
+        use futures::FutureExt;
+        let mut decoder = StreamDecoder {
+            fallback: None,
+            pending: Vec::new(),
+            legacy: None,
+        };
+        let output = async {
+            let mut output = decoder.push_async(b"ascii ").await.unwrap();
+            output.push_str(&decoder.push_async("中文\n".as_bytes()).await.unwrap());
+            output.push_str(&decoder.finish_async().await.unwrap());
+            output
+        }.now_or_never().expect("ASCII and valid UTF-8 must decode immediately");
+        assert_eq!(output, "ascii 中文\n");
+    }
 
     fn decode_in_reads(decoder: &mut StreamDecoder, bytes: &[u8], read: usize) -> String {
         let mut out = String::new();

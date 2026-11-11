@@ -227,6 +227,11 @@ impl TerminalState {
         self.shell.set_token(token);
     }
 
+    /// Disable unused raw block copies without disabling shell ownership markers.
+    pub fn set_capture_output(&mut self, enabled: bool) {
+        self.shell.set_capture_output(enabled);
+    }
+
     pub fn palette(&self) -> &ColorPalette {
         &self.palette
     }

@@ -266,11 +266,21 @@ pub(crate) struct ShellIntegrationScanner {
     /// back even when the command echo scrolled the grid.
     command_start: Option<(Point, usize)>,
     last_alt_screen: bool,
+    capture_disabled: bool,
 }
 
 impl ShellIntegrationScanner {
     pub(crate) fn set_token(&mut self, token: String) {
         self.markers.token = token;
+    }
+
+    pub(crate) fn set_capture_output(&mut self, enabled: bool) {
+        self.capture_disabled = !enabled;
+        if !enabled {
+            if let Some(capture) = self.capture.as_mut() {
+                capture.raw = Vec::new();
+            }
+        }
     }
 
     pub(crate) fn scan(&mut self, bytes: &[u8]) -> Vec<MarkerHit> {
@@ -279,6 +289,9 @@ impl ShellIntegrationScanner {
 
     /// Append parser-consumed bytes to the active capture.
     pub(crate) fn capture_bytes(&mut self, bytes: &[u8]) {
+        if self.capture_disabled {
+            return;
+        }
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
@@ -761,6 +774,29 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn capture_can_be_disabled_without_losing_command_status_or_live_output() {
+        let mut terminal = state(20, 4);
+        terminal.set_capture_output(false);
+        terminal.process_bytes(b"\x1b]133;C\x07hello\r\n");
+        let events = terminal.process_bytes(b"\x1b]133;D;7\x07");
+        match &events[0] {
+            ShellEvent::CommandFinished { exit_code, raw, .. } => {
+                assert_eq!(*exit_code, Some(7));
+                assert!(raw.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let snapshot = terminal.snapshot_buffer_lines(&ColorPalette::default(), false);
+        let text: String = snapshot.lines.iter()
+            .flat_map(|line| &line.runs).map(|run| run.text.as_str()).collect();
+        assert!(text.contains("hello"));
+        terminal.set_capture_output(true);
+        terminal.process_bytes(b"\x1b]133;C\x07captured\r\n");
+        let events = terminal.process_bytes(b"\x1b]133;D;0\x07");
+        assert!(matches!(&events[0], ShellEvent::CommandFinished { raw, .. } if raw.windows(8).any(|bytes| bytes == b"captured")));
     }
 
     #[test]

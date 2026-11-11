@@ -20,9 +20,10 @@
 
 use crate::AgentStatusReport;
 use crate::colors::ColorPalette;
-use crate::event::{GpuiEventProxy, PtyWriter, TerminalEvent, TerminalNotifier};
+use crate::event::{GpuiEventProxy, TerminalEvent, TerminalNotifier};
 use crate::hyperlink::{HyperlinkMatch, RegexSearches};
 use crate::input::keystroke_to_bytes;
+use crate::pty_writer::{QueuedWriter, WriteCompletion};
 use crate::render::{PaintContext, TerminalRenderer};
 use crate::search::SearchState;
 use crate::shell_integration::ShellEvent;
@@ -37,6 +38,7 @@ use alacritty_terminal::selection::{SelectionRange, SelectionType as GridSelecti
 use alacritty_terminal::term::search::Match as GridMatch;
 use alacritty_terminal::term::{TermMode, viewport_to_point};
 use alacritty_terminal::vi_mode::ViMotion;
+use gpui::prelude::FluentBuilder as _;
 use gpui::{Edges, *};
 use std::io::{Read, Write};
 use std::ops::RangeInclusive;
@@ -150,7 +152,10 @@ pub struct TerminalView {
     state: TerminalState,
     renderer: TerminalRenderer,
     focus_handle: FocusHandle,
-    stdin_writer: PtyWriter,
+    stdin_writer: QueuedWriter,
+    /// Independent of stdout: a failed input write must wake a silent terminal.
+    _input_error_task: Task<()>,
+    io_error: Option<String>,
     event_rx: mpsc::Receiver<TerminalEvent>,
     config: TerminalConfig,
 
@@ -247,6 +252,18 @@ const MAX_COALESCE_BYTES: usize = 128 * 1024;
 /// millisecond is below interactive perceptibility.
 const COALESCE_DELAY: Duration = Duration::from_millis(1);
 
+async fn yield_to_ui() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if std::mem::replace(&mut yielded, true) {
+            std::task::Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }).await;
+}
+
 impl TerminalView {
     pub fn new<W, R>(
         stdin_writer: W,
@@ -262,8 +279,8 @@ impl TerminalView {
     }
 
     /// Like [`Self::new`], but seeds the emulator with previously captured
-    /// output before the reader thread starts, so a restored pane shows its
-    /// old buffer above the fresh shell prompt.
+    /// output in bounded, yielding batches before parsing live stdout, so a
+    /// restored pane shows its old buffer above the fresh shell prompt.
     pub fn new_with_scrollback<W, R>(
         stdin_writer: W,
         stdout_reader: R,
@@ -290,10 +307,6 @@ impl TerminalView {
             TerminalState::with_config(config.cols, config.rows, alac_config, event_proxy);
         state.set_palette(config.colors.clone());
         state.set_shell_token(config.shell_token.clone());
-        if let Some(scrollback) = scrollback.filter(|text| !text.is_empty()) {
-            state.feed_raw(scrollback.as_bytes());
-            state.scroll_to_bottom();
-        }
 
         let renderer = TerminalRenderer::new(
             config.font_family.clone(),
@@ -304,9 +317,14 @@ impl TerminalView {
 
         let focus_handle = cx.focus_handle();
 
-        let stdin_writer: PtyWriter = Arc::new(parking_lot::Mutex::new(
-            Box::new(stdin_writer) as Box<dyn Write + Send>
-        ));
+        let (stdin_writer, input_errors) = QueuedWriter::new(stdin_writer, cx.background_executor());
+        let input_error_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            while let Ok(error) = input_errors.recv_async().await {
+                if this.update(cx, |view, cx| view.report_io_error(error, cx)).is_err() {
+                    break;
+                }
+            }
+        });
 
         let window_size = Arc::new(parking_lot::Mutex::new(PtyWindowSize {
             num_lines: config.rows as u16,
@@ -316,13 +334,13 @@ impl TerminalView {
         }));
         let palette_handle = Arc::new(parking_lot::Mutex::new(config.colors.clone()));
 
-        // Hand the PTY writer to the event proxy so terminal *queries* can be
-        // answered inline instead of being dropped on the floor.
-        *notifier_slot.lock() = Some(TerminalNotifier::new(
-            Arc::clone(&stdin_writer),
+        // Install only after restoration: old scrollback queries must not send
+        // replies into the new shell. Live queries then share the input FIFO.
+        let notifier = TerminalNotifier::queued(
+            stdin_writer.clone(),
             Arc::clone(&window_size),
             Arc::clone(&palette_handle),
-        ));
+        );
 
         // Bounded so a firehose process (`cat` a huge file) applies backpressure
         // to the reader thread — and through it to the PTY — instead of
@@ -334,8 +352,34 @@ impl TerminalView {
         });
 
         let reader_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            if let Some(scrollback) = scrollback.filter(|text| !text.is_empty()) {
+                for bytes in scrollback.as_bytes().chunks(MAX_COALESCE_BYTES) {
+                    if this.update(cx, |view, cx| {
+                        // Raw restoration deliberately bypasses shell markers,
+                        // agent OSC extraction and capture, like the old seed path.
+                        view.state.feed_raw(bytes);
+                        view.screen_revision.fetch_add(1, Ordering::Relaxed);
+                        cx.notify();
+                    }).is_err() {
+                        return;
+                    }
+                    yield_to_ui().await;
+                }
+                if this.update(cx, |view, cx| {
+                    view.state.scroll_to_bottom();
+                    cx.notify();
+                }).is_err() {
+                    return;
+                }
+            }
+            *notifier_slot.lock() = Some(notifier);
+            let mut pending = None;
             loop {
-                match bytes_rx.recv_async().await {
+                let next = match pending.take() {
+                    Some(bytes) => Ok(bytes),
+                    None => bytes_rx.recv_async().await,
+                };
+                match next {
                     Ok(mut bytes) => {
                         // Coalesce what already arrived so a firehose of output
                         // costs one parse + one repaint, not hundreds — but stop
@@ -355,8 +399,13 @@ impl TerminalView {
                             let Ok(more) = bytes_rx.try_recv() else {
                                 break;
                             };
-                            bytes.reserve(more.len());
-                            bytes.extend(more);
+                            if more.len() > MAX_COALESCE_BYTES - bytes.len() {
+                                // Keep the entire next chunk rather than overshoot
+                                // the parse budget or allocate/copy a split tail.
+                                pending = Some(more);
+                                break;
+                            }
+                            bytes.extend_from_slice(&more);
                         }
 
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
@@ -391,6 +440,9 @@ impl TerminalView {
                         if result.is_err() {
                             break;
                         }
+                        // recv_async can remain ready forever under a firehose.
+                        // Explicitly return to GPUI between bounded parse batches.
+                        yield_to_ui().await;
                     }
                     Err(_) => {
                         let _ = exit_event_tx.send(TerminalEvent::Exit);
@@ -409,6 +461,8 @@ impl TerminalView {
             renderer,
             focus_handle,
             stdin_writer,
+            _input_error_task: input_error_task,
+            io_error: None,
             event_rx,
             config,
             _reader_task: reader_task,
@@ -562,17 +616,10 @@ impl TerminalView {
         }
     }
 
-    /// Write bytes to the PTY.
-    ///
-    /// Never call this while holding the terminal lock.
+    /// Admit one whole frame without touching the physical PTY on GPUI.
     fn write_to_pty(&self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        // No `flush()`: the PTY writer is unbuffered, so flushing would only be
-        // a wasted syscall per keystroke, paste chunk, and mouse report.
-        let mut writer = self.stdin_writer.lock();
-        let _ = writer.write_all(bytes);
+        // Failures also go to the independently waking input-error task.
+        let _ = self.stdin_writer.send(bytes);
     }
 
     /// Send text to the shell as if the user had typed it.
@@ -584,6 +631,42 @@ impl TerminalView {
     pub fn send_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         self.scroll_to_bottom_on_input(cx);
         self.write_to_pty(bytes);
+    }
+
+    /// Send text and acknowledge only after its physical write completes.
+    pub fn send_text_with_completion(
+        &mut self,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<WriteCompletion, String> {
+        self.send_bytes_with_completion(text.as_bytes(), cx)
+    }
+
+    /// Refuse an entire frame on overflow; no prefix is admitted.
+    pub fn send_bytes_with_completion(
+        &mut self,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) -> Result<WriteCompletion, String> {
+        self.scroll_to_bottom_on_input(cx);
+        self.stdin_writer.send_with_completion(bytes)
+    }
+
+    /// Surface asynchronous session/input errors even when stdout is silent.
+    pub fn report_io_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.io_error = Some(error);
+        cx.notify();
+    }
+
+    /// Record the real child status; reader EOF remains a distinct event.
+    pub fn record_child_exit(&mut self, code: i32, cx: &mut Context<Self>) {
+        self.exit_status = Some(code);
+        cx.notify();
+    }
+
+    /// Disable raw command-output capture when the host only consumes markers.
+    pub fn set_capture_output(&mut self, enabled: bool) {
+        self.state.set_capture_output(enabled);
     }
 
     // -----------------------------------------------------------------------
@@ -792,6 +875,17 @@ impl TerminalView {
         self.scroll_to_bottom_on_input(cx);
         let payload = self.paste_payload(text);
         self.write_to_pty(&payload);
+    }
+
+    /// Paste framing is one atomic frame; the receipt covers its closing marker.
+    pub fn paste_text_from_app_with_completion(
+        &mut self,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<WriteCompletion, String> {
+        self.scroll_to_bottom_on_input(cx);
+        let payload = self.paste_payload(text);
+        self.stdin_writer.send_with_completion(&payload)
     }
 
     // -----------------------------------------------------------------------
@@ -1910,6 +2004,7 @@ impl Render for TerminalView {
         };
 
         div()
+            .relative()
             .size_full()
             .bg(background)
             .cursor(cursor_style)
@@ -1976,5 +2071,20 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .when_some(self.io_error.clone(), |view, error| {
+                view.child(
+                    div()
+                        .absolute()
+                        .bottom_0()
+                        .left_0()
+                        .right_0()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .bg(rgb(0x602020))
+                        .text_color(rgb(0xffffff))
+                        .text_size(px(12.0))
+                        .child(error),
+                )
+            })
     }
 }

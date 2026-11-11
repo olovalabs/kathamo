@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Reworked shell streaming with bounded asynchronous capture, complete sanitized logs, 16 ms quiet-period checkpoints, concurrent stdin/stdout/stderr/status handling, and reliable cancellation/drop cleanup. Removed redundant timeout padding and batched log appends.
+- Moved PTY setup, input, resize and teardown off GPUI; added bounded FIFO input with physical-write receipts, visible refusal/failure handling, real child exit status and cooperative parsing/restoration.
+- Bounded native/RPC event delivery, prompt admission and transcript persistence; coalesce identified snapshots before projection, preserve lifecycle events, resignal fair UI drains, and report persistence overload.
+- Replaced the embedded `grep` tool's custom matching loop and full-tree snapshot with ripgrep's Rust matcher/searcher: streaming native file reads, incremental ignore-aware traversal, early result/output limits, binary detection and merged context windows. No external `rg` executable is required.
 - Hide anonymous/keyless provider entries from the authentication list without removing their backend support.
 - Restyled model selection with compact rows, trailing selection checks, free-model badges, and a two-column provider card section matching the OpenCode reference. Model selection and provider authentication now share one narrower 520px modal with theme-derived backgrounds, text, borders, and hover colors, plus consistent close and back navigation.
 - Compact streamed OMP text, worker deltas and cumulative tool snapshots before enqueue with bounded backpressure, preserving tool lifecycle order and complete results.

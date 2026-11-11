@@ -98,6 +98,48 @@ every other test.
 The `rpi` CLI loads `read`, `write`, `edit` and `bash` by default — the
 Pi-compatible set — and exposes the rest through the `default_tools` setting.
 
+### Shell execution
+
+Bash and native PowerShell use `tokio::process::Command` with stdin, both output
+pipes, child status, deadlines and cancellation driven concurrently. The bounded
+`ShellExecOptions::output` channel must be consumed concurrently; synchronous
+stdout/stderr callbacks remain available. Idle streams do not reserve channel
+capacity. Dropped/aborted calls terminate their process groups; normally
+completed calls may intentionally leave background descendants alive.
+
+The capture layer maintains a bounded display tail and persists the complete
+sanitized stream after display truncation, batching existing backlogs up to
+64 KiB without delaying sparse writes. First progress is immediate; Bash and
+PowerShell coalesce later checkpoints with one 16 ms timer, including when
+output goes quiet. `RPI_BASH_UPDATE_THROTTLE_MS` overrides that window.
+`ShellCaptureOptions::update_interval = None` retains per-chunk callbacks for
+other capture consumers.
+
+Post-exit drain allows 100 ms plus at most 1 MiB of immediately ready bytes per
+pipe, not arbitrary future descendant output. Slow storage can delay final log
+delivery, but child termination remains independently driven. A failed spool is
+never advertised as a complete log.
+
+Native benchmark:
+`cargo run --manifest-path agent/Cargo.toml -p rpi-tools --example bench_shell -- 15`
+from the Kathamo root. See the root `SHELL_TOOL_AUDIT.md` for scope and results.
+
+### Content search
+
+`grep` uses ripgrep's embedded `grep-regex` and `grep-searcher` crates, not an
+external `rg` process or a separate custom matching loop. Native files stream
+through a reusable search buffer on a blocking worker. Directory discovery is
+incremental and stops at the match/output limit instead of snapshotting the
+entire tree. Virtual filesystems supply bytes to the same ripgrep engine.
+
+The existing pattern, literal, case, glob, context and limit arguments remain.
+Searches retain deterministic breadth-first file order and include hidden
+files while honoring ignore rules and excluding `.git` contents. As with
+ripgrep, NUL detection stops binary-file searches, CRLF line endings are
+supported, and overlapping context windows are merged. Match counts are
+global across files; trailing context is retained at the match limit. Output
+remains capped at 50 KiB with individual lines capped at 500 characters.
+
 ## Related crates
 
 | Crate | Role |

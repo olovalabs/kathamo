@@ -26,15 +26,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
     check_cancel_exec, check_cancel_file, ExecutionEnv, FileContent, FileInfo, FileKind,
-    FileSystem, Shell, ShellExecOptions, ShellOutput,
+    FileSystem, Shell, ShellExecOptions, ShellOutput, ShellOutputChunk,
 };
 use crate::error::{
     io_to_file_error, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,
@@ -48,6 +47,10 @@ const MAX_TIMEOUT_SECONDS: f64 = 2_147_483.647;
 /// Grace period after child exit for trailing stdio. Mirrors
 /// `EXIT_STDIO_GRACE_MS`.
 const EXIT_STDIO_GRACE_MS: u64 = 100;
+/// After grace, drain at most this many immediately ready bytes per stream.
+/// This preserves finite pipe backlog under spool backpressure without letting
+/// continuously-writing background descendants keep execution open forever.
+const EXIT_STDIO_READY_BYTES: usize = 1024 * 1024;
 
 /// How the command is fed to the shell. Mirrors `commandTransport`.
 #[derive(Clone, Copy)]
@@ -177,12 +180,9 @@ impl OsExecutionEnv {
     /// Detect + return the shell config, or `ShellUnavailable`. Mirrors
     /// `getShellConfig`.
     async fn get_shell_config(&self) -> Result<ShellConfig, ExecutionError> {
-        // Explicit override. Shell discovery happens on the hot path immediately
-        // before spawning a command. Keep this probe synchronous: putting a
-        // `tokio::fs` metadata future here can queue work on Tokio's blocking
-        // pool and leave a tool run waiting before it has even created a child.
+        // Spawn remains authoritative; avoid blocking metadata on the runtime.
         if let Some(sp) = &self.shell_path {
-            if sp.is_file() {
+            if tokio::fs::metadata(sp).await.is_ok_and(|m| m.is_file()) {
                 return Ok(bash_shell_config(sp.clone()));
             }
             return Err(ExecutionError::new(
@@ -204,7 +204,7 @@ impl OsExecutionEnv {
         // POSIX.
         #[cfg(not(windows))]
         {
-            if std::path::Path::new("/bin/bash").is_file() {
+            if tokio::fs::metadata("/bin/bash").await.is_ok_and(|m| m.is_file()) {
                 return Ok(ShellConfig {
                     shell: PathBuf::from("/bin/bash"),
                     args: vec!["-c".to_string()],
@@ -216,7 +216,7 @@ impl OsExecutionEnv {
                 run_command("which", &["bash"], std::time::Duration::from_millis(5000)).await
             {
                 let trimmed = found.trim();
-                if !trimmed.is_empty() && std::path::Path::new(trimmed).is_file() {
+                if !trimmed.is_empty() && tokio::fs::metadata(trimmed).await.is_ok_and(|m| m.is_file()) {
                     return Ok(ShellConfig {
                         shell: PathBuf::from(trimmed),
                         args: vec!["-c".to_string()],
@@ -294,8 +294,11 @@ fn bash_shell_config(shell: PathBuf) -> ShellConfig {
 
 fn is_legacy_wsl_bash_path(p: &Path) -> bool {
     let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
-    let re = regex::Regex::new(r"^[a-z]:\\windows\\(?:system32|sysnative)\\bash\.exe$").unwrap();
-    re.is_match(&s)
+    s.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && matches!(
+            s.get(1..),
+            Some(":\\windows\\system32\\bash.exe" | ":\\windows\\sysnative\\bash.exe")
+        )
 }
 
 #[cfg(windows)]
@@ -339,6 +342,9 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::null());
     command.stdin(std::process::Stdio::null());
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     #[cfg(windows)]
     {
         // Hide the console window for the probe.
@@ -346,6 +352,11 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
         command.creation_flags(CREATE_NO_WINDOW);
     }
     let child = command.spawn().ok()?;
+    let mut guard = ChildGroupGuard {
+        pid: child.id(),
+        active_pids: None,
+        armed: true,
+    };
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
         _ => return None,
@@ -354,10 +365,11 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
         return None;
     }
     // `where` prints paths in the console code page (e.g. a Chinese user name).
-    let s = crate::output_decode::decode_output(&out.stdout);
+    let s = crate::output_decode::decode_output_async(&out.stdout).await.ok()?;
     if s.trim().is_empty() {
         None
     } else {
+        guard.armed = false;
         Some(s)
     }
 }
@@ -440,6 +452,41 @@ async fn kill_process_tree(pid: u32) {
     #[cfg(not(any(windows, unix)))]
     {
         let _ = pid;
+    }
+}
+
+/// Kill only on interruption: successful commands may deliberately leave daemons.
+struct ChildGroupGuard {
+    pid: Option<u32>,
+    active_pids: Option<Arc<Mutex<HashSet<u32>>>>,
+    armed: bool,
+}
+
+impl Drop for ChildGroupGuard {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid else { return };
+        if let Some(pids) = &self.active_pids {
+            pids.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+        }
+        if self.armed {
+            #[cfg(unix)]
+            {
+                use nix::sys::signal::{kill, Signal};
+                use nix::unistd::Pid;
+                let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+            }
+            #[cfg(windows)]
+            if !shell_jobs::terminate(pid) {
+                // The fallback needs an async wait, but job termination above
+                // runs synchronously even while the execution future is dropped.
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(kill_process_tree(pid));
+                }
+            }
+        } else {
+            #[cfg(windows)]
+            shell_jobs::forget(pid);
+        }
     }
 }
 
@@ -723,39 +770,17 @@ impl FileSystem for OsExecutionEnv {
         Ok(out)
     }
 
-    async fn search_tree(
+    async fn search_contents(
         &self,
         path: &str,
+        search: crate::search::ContentSearch,
         cancel: Option<&CancellationToken>,
-    ) -> Result<Option<crate::env::SearchTree>, FileError> {
+    ) -> Result<crate::search::ContentSearchResult, FileError> {
         check_cancel_file(cancel, Some(path))?;
         let abs = Self::resolve_path(&self.cwd, path);
         let cancel = cancel.cloned();
         tokio::task::spawn_blocking(move || {
-            let mut tree = crate::env::SearchTree::new();
-            let walker = ignore::WalkBuilder::new(&abs)
-                .hidden(false)
-                .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
-                .build();
-            for entry in walker {
-                check_cancel_file(cancel.as_ref(), None)?;
-                let Ok(entry) = entry else { continue };
-                if entry.depth() == 0 {
-                    continue;
-                }
-                let kind = match entry.file_type() {
-                    Some(kind) if kind.is_file() => FileKind::File,
-                    Some(kind) if kind.is_dir() => FileKind::Directory,
-                    _ => continue,
-                };
-                let path = entry.into_path();
-                if let Some(parent) = path.parent() {
-                    tree.entry(parent.to_path_buf())
-                        .or_default()
-                        .push((path, kind));
-                }
-            }
-            Ok(Some(tree))
+            crate::search::search_native(&abs, search, cancel.as_ref())
         })
         .await
         .map_err(|error| io_to_file_error(std::io::Error::other(error), Some(path)))?
@@ -871,11 +896,11 @@ impl FileSystem for OsExecutionEnv {
     }
 
     async fn cleanup(&self) {
-        let pids: Vec<u32> = self.active_pids.lock().await.iter().copied().collect();
+        let pids: Vec<u32> = self.active_pids.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
         for pid in pids {
             kill_process_tree(pid).await;
         }
-        self.active_pids.lock().await.clear();
+        self.active_pids.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -955,21 +980,10 @@ impl Shell for OsExecutionEnv {
             },
             None => self.get_shell_config().await?,
         };
-        // Verify cwd exists.
-        if !cwd.exists() {
-            return Err(ExecutionError::new(
-                ExecutionErrorCode::SpawnError,
-                format!(
-                    "Working directory does not exist: {}\nCannot execute bash commands.",
-                    cwd.display()
-                ),
-            ));
-        }
 
         // Build the spawn.
         let mut cmd = tokio::process::Command::new(&shell_cfg.shell);
         cmd.current_dir(&cwd);
-        cmd.env_clear();
         // Environment: inherit + shell_env + per-call. The host's own private
         // plumbing (`HOST_PRIVATE_ENV`) is skipped: it describes *this* process,
         // not the shell or anything the shell runs, and inheriting it makes a
@@ -977,12 +991,13 @@ impl Shell for OsExecutionEnv {
         // value passed down can still set it explicitly through `env`/`shell_env`
         // below (those are applied after this loop and win).
         if options.inherit_env {
-            for (k, v) in std::env::vars() {
-                if is_host_private_env(&k) {
-                    continue;
-                }
-                cmd.env(k, v);
+            // Command already inherits the environment. Remove only private
+            // host keys instead of copying every inherited key/value twice.
+            for key in HOST_PRIVATE_ENV.iter().chain(rpi_plugin_sdk::SUBAGENT_PARENT_ENV.iter()) {
+                cmd.env_remove(*key);
             }
+        } else {
+            cmd.env_clear();
         }
         if let Some(base) = &self.shell_env {
             for (k, v) in base {
@@ -995,6 +1010,7 @@ impl Shell for OsExecutionEnv {
             }
         }
         // stdio.
+        cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -1026,6 +1042,11 @@ impl Shell for OsExecutionEnv {
             }
         };
         let pid = child.id();
+        let mut group_guard = ChildGroupGuard {
+            pid,
+            active_pids: Some(self.active_pids.clone()),
+            armed: true,
+        };
         #[cfg(windows)]
         {
             let started = match (pid, child.raw_handle()) {
@@ -1044,24 +1065,20 @@ impl Shell for OsExecutionEnv {
             }
         }
         if let Some(pid) = pid {
-            self.active_pids.lock().await.insert(pid);
+            self.active_pids.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
         }
 
-        // Stdin transport: write command then close. Closing happens on BOTH
-        // transports, and deliberately: anything that prompts (`npx` asking to
-        // install, `npm init`, a `read` in a script) must see EOF and fail fast,
-        // not block on a pipe that nothing will ever write to or close. tokio's
-        // `Child::wait` also drops stdin as a deadlock guard, but relying on that
-        // would make the guarantee a side effect of an implementation detail.
-        let mut stdin = child.stdin.take();
-        if matches!(transport, CommandTransport::Stdin) {
-            if let Some(stdin) = stdin.as_mut() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(command.as_bytes()).await;
-                let _ = stdin.flush().await;
+        // Drive legacy stdin concurrently with output, status and deadlines.
+        // Argv transport closes stdin immediately so prompts observe EOF.
+        let stdin = child.stdin.take();
+        let stdin_task = async move {
+            if let Some(mut stdin) = stdin {
+                if matches!(transport, CommandTransport::Stdin) {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(command.as_bytes()).await;
+                }
             }
-        }
-        drop(stdin);
+        };
 
         // Collect stdout/stderr via separate read tasks, firing callbacks.
         let mut stdout_buf = String::new();
@@ -1071,35 +1088,48 @@ impl Shell for OsExecutionEnv {
         let capture_output = options.capture_output;
         let cancel = options.cancel;
         let stop_readers = CancellationToken::new();
+        let stop_execution = CancellationToken::new();
         let mut on_stdout = options.on_stdout;
         let mut on_stderr = options.on_stderr;
+        let stdout_output = options.output.clone();
+        let stderr_output = options.output;
 
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
 
         let stdout_task = async {
             if let Some(s) = stdout.as_mut() {
-                let mut buf = vec![0u8; 8192];
+                let mut buf = [0u8; 8192];
                 let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
+                let mut post_grace_bytes = 0;
                 loop {
+                    if stop_readers.is_cancelled() && post_grace_bytes >= EXIT_STDIO_READY_BYTES {
+                        break;
+                    }
                     let read_result = tokio::select! {
                         biased;
-                        _ = stop_readers.cancelled() => break,
+                        _ = stop_execution.cancelled() => break,
                         _ = async {
                             match cancel {
                                 Some(token) => token.cancelled().await,
                                 None => std::future::pending::<()>().await,
                             }
                         } => break,
+                        // Once grace expires, consume only immediately ready
+                        // bytes. Slow spool backpressure is not descendant EOF.
                         result = s.read(&mut buf) => result,
+                        _ = stop_readers.cancelled() => break,
                     };
                     let n = match read_result {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(_) => break,
                     };
-                    let chunk = decoder.push(&buf[..n]);
+                    if stop_readers.is_cancelled() {
+                        post_grace_bytes += n;
+                    }
+                    let chunk = decoder.push_async(&buf[..n]).await?;
                     if chunk.is_empty() {
                         continue;
                     }
@@ -1111,8 +1141,18 @@ impl Shell for OsExecutionEnv {
                     if capture_output {
                         stdout_buf.push_str(&chunk);
                     }
+                    // Read before admission: an idle stderr stream must not
+                    // reserve the only slot needed by stdout (or vice versa).
+                    if let Some(output) = &stdout_output {
+                        tokio::select! {
+                            biased;
+                            _ = stop_execution.cancelled() => break,
+                            _ = async { if let Some(token) = cancel { token.cancelled().await } else { std::future::pending::<()>().await } } => break,
+                            _ = output.send(ShellOutputChunk::Stdout(chunk)) => {},
+                        }
+                    }
                 }
-                let tail = decoder.finish();
+                let tail = decoder.finish_async().await?;
                 if !tail.is_empty() {
                     if let Some(cb) = on_stdout.as_mut() {
                         cb(&tail);
@@ -1120,18 +1160,31 @@ impl Shell for OsExecutionEnv {
                     if capture_output {
                         stdout_buf.push_str(&tail);
                     }
+                    if let Some(output) = &stdout_output {
+                        tokio::select! {
+                            biased;
+                            _ = stop_execution.cancelled() => {},
+                            _ = async { if let Some(token) = cancel { token.cancelled().await } else { std::future::pending::<()>().await } } => {},
+                            _ = output.send(ShellOutputChunk::Stdout(tail)) => {},
+                        }
+                    }
                 }
             }
+            Ok::<(), tokio::task::JoinError>(())
         };
         let stderr_task = async {
             if let Some(s) = stderr.as_mut() {
-                let mut buf = vec![0u8; 8192];
+                let mut buf = [0u8; 8192];
                 let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
+                let mut post_grace_bytes = 0;
                 loop {
+                    if stop_readers.is_cancelled() && post_grace_bytes >= EXIT_STDIO_READY_BYTES {
+                        break;
+                    }
                     let read_result = tokio::select! {
                         biased;
-                        _ = stop_readers.cancelled() => break,
+                        _ = stop_execution.cancelled() => break,
                         _ = async {
                             match cancel {
                                 Some(token) => token.cancelled().await,
@@ -1139,13 +1192,17 @@ impl Shell for OsExecutionEnv {
                             }
                         } => break,
                         result = s.read(&mut buf) => result,
+                        _ = stop_readers.cancelled() => break,
                     };
                     let n = match read_result {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(_) => break,
                     };
-                    let chunk = decoder.push(&buf[..n]);
+                    if stop_readers.is_cancelled() {
+                        post_grace_bytes += n;
+                    }
+                    let chunk = decoder.push_async(&buf[..n]).await?;
                     if chunk.is_empty() {
                         continue;
                     }
@@ -1155,8 +1212,16 @@ impl Shell for OsExecutionEnv {
                     if capture_output {
                         stderr_buf.push_str(&chunk);
                     }
+                    if let Some(output) = &stderr_output {
+                        tokio::select! {
+                            biased;
+                            _ = stop_execution.cancelled() => break,
+                            _ = async { if let Some(token) = cancel { token.cancelled().await } else { std::future::pending::<()>().await } } => break,
+                            _ = output.send(ShellOutputChunk::Stderr(chunk)) => {},
+                        }
+                    }
                 }
-                let tail = decoder.finish();
+                let tail = decoder.finish_async().await?;
                 if !tail.is_empty() {
                     if let Some(cb) = on_stderr.as_mut() {
                         cb(&tail);
@@ -1164,60 +1229,51 @@ impl Shell for OsExecutionEnv {
                     if capture_output {
                         stderr_buf.push_str(&tail);
                     }
+                    if let Some(output) = &stderr_output {
+                        tokio::select! {
+                            biased;
+                            _ = stop_execution.cancelled() => {},
+                            _ = async { if let Some(token) = cancel { token.cancelled().await } else { std::future::pending::<()>().await } } => {},
+                            _ = output.send(ShellOutputChunk::Stderr(tail)) => {},
+                        }
+                    }
                 }
             }
+            Ok::<(), tokio::task::JoinError>(())
         };
 
         // Wait for the child, with timeout + cancellation.
         let mut timed_out = false;
+        let mut tree_killed = false;
+        let mut output_error = None;
         let exit_status = {
             // We pin stdout/stderr take handles + the wait future, then drive
             // them concurrently inside a single select! block. `child` is only
             // touched again AFTER the join completes (kill + reap), so the
             // borrow ends cleanly.
             let status_fut = async {
-                match (timeout, cancel) {
-                    (Some(to), Some(token)) => {
-                        tokio::select! {
-                            status = child.wait() => status,
-                            _ = tokio::time::sleep(to) => {
-                                timed_out = true;
-                                if let Some(pid) = child.id() {
-                                    kill_process_tree(pid).await;
-                                }
-                                child.wait().await
-                            }
-                            _ = token.cancelled() => {
-                                if let Some(pid) = child.id() {
-                                    kill_process_tree(pid).await;
-                                }
-                                child.wait().await
-                            }
+                tokio::select! {
+                    status = child.wait() => return status,
+                    _ = async {
+                        match timeout {
+                            Some(duration) => tokio::time::sleep(duration).await,
+                            None => std::future::pending::<()>().await,
                         }
-                    }
-                    (Some(to), None) => match tokio::time::timeout(to, child.wait()).await {
-                        Ok(status) => status,
-                        Err(_) => {
-                            timed_out = true;
-                            if let Some(pid) = child.id() {
-                                kill_process_tree(pid).await;
-                            }
-                            child.wait().await
+                    } => timed_out = true,
+                    _ = async {
+                        match cancel {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending::<()>().await,
                         }
-                    },
-                    (None, Some(token)) => {
-                        tokio::select! {
-                            status = child.wait() => status,
-                            _ = token.cancelled() => {
-                                if let Some(pid) = child.id() {
-                                    kill_process_tree(pid).await;
-                                }
-                                child.wait().await
-                            }
-                        }
-                    }
-                    (None, None) => child.wait().await,
+                    } => {},
+                    _ = stop_execution.cancelled() => {},
                 }
+                stop_execution.cancel();
+                if let Some(pid) = child.id() {
+                    kill_process_tree(pid).await;
+                    tree_killed = true;
+                }
+                child.wait().await
             };
             // Run stdio + status concurrently — but the CHILD is the driver:
             // once it is reaped the command is over, and the call has to end even
@@ -1233,13 +1289,26 @@ impl Shell for OsExecutionEnv {
             // more than the pipe buffer (64 KiB on Linux) blocks until someone
             // reads, so waiting for the child first would deadlock on any broad
             // `rg` or build log.
-            tokio::pin!(status_fut, stdout_task, stderr_task);
-            let (mut stdout_done, mut stderr_done) = (false, false);
+            tokio::pin!(status_fut, stdout_task, stderr_task, stdin_task);
+            let (mut stdout_done, mut stderr_done, mut stdin_done) = (false, false, false);
             let status_res = loop {
                 tokio::select! {
                     status = &mut status_fut => break status,
-                    () = &mut stdout_task, if !stdout_done => stdout_done = true,
-                    () = &mut stderr_task, if !stderr_done => stderr_done = true,
+                    result = &mut stdout_task, if !stdout_done => {
+                        stdout_done = true;
+                        if let Err(error) = result {
+                            output_error = Some(error);
+                            stop_execution.cancel();
+                        }
+                    },
+                    result = &mut stderr_task, if !stderr_done => {
+                        stderr_done = true;
+                        if let Err(error) = result {
+                            output_error = Some(error);
+                            stop_execution.cancel();
+                        }
+                    },
+                    () = &mut stdin_task, if !stdin_done => stdin_done = true,
                 }
             };
             // Drain what is already in the pipe — a completed write is already in
@@ -1249,45 +1318,42 @@ impl Shell for OsExecutionEnv {
             let drain = async {
                 tokio::join!(
                     async {
-                        if !stdout_done {
-                            (&mut stdout_task).await;
-                        }
+                        if stdout_done { Ok(()) } else { (&mut stdout_task).await }
                     },
                     async {
-                        if !stderr_done {
-                            (&mut stderr_task).await;
-                        }
+                        if stderr_done { Ok(()) } else { (&mut stderr_task).await }
                     },
-                );
+                )
             };
             tokio::pin!(drain);
-            if tokio::time::timeout(
+            let results = match tokio::time::timeout(
                 std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS),
                 &mut drain,
-            )
-            .await
-            .is_err()
-            {
-                // Stop reads, not their futures: both decoders must finish and
-                // deliver already-read tails to callbacks and captured output.
-                stop_readers.cancel();
-                drain.await;
+            ).await {
+                Ok(results) => results,
+                Err(_) => {
+                    // Stop idle reads, but finish already-read decoder tails.
+                    stop_readers.cancel();
+                    drain.await
+                }
+            };
+            for result in [results.0, results.1] {
+                if let Err(error) = result {
+                    output_error = Some(error);
+                }
             }
             status_res
         };
 
-        // Give trailing stdio a brief grace period. Only the timed-out and
-        // cancelled paths still owe a wait: on the normal path the drain above
-        // already capped it.
-        if timed_out {
-            let _ = tokio::time::sleep(std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS)).await;
-        }
-
-        // Remove from tracked pids.
-        if let Some(pid) = pid {
-            #[cfg(windows)]
-            shell_jobs::forget(pid);
-            self.active_pids.lock().await.remove(&pid);
+        // A cancellation can race successful reaping (including during drain).
+        // In that case the guard must still terminate surviving descendants.
+        group_guard.armed = !tree_killed && (exit_status.is_err() || output_error.is_some()
+            || cancel.map(|token| token.is_cancelled()).unwrap_or(false));
+        if let Some(error) = output_error {
+            return Err(ExecutionError::new(
+                ExecutionErrorCode::Unknown,
+                format!("shell output decoding failed: {error}"),
+            ));
         }
 
         // Resolution priority: timedOut → cancelled → status.

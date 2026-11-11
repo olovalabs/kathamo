@@ -21,6 +21,7 @@ pub mod in_memory;
 pub mod os_env;
 pub mod output_decode;
 pub mod path_utils;
+pub mod search;
 pub mod shell_output;
 pub mod truncate;
 
@@ -38,6 +39,7 @@ pub use tools::{
 
 pub use env::{
     ExecutionEnv, FileContent, FileInfo, FileKind, FileSystem, Shell, ShellExecOptions, ShellOutput,
+    ShellOutputChunk,
 };
 pub use error::{
     io_to_file_code, io_to_file_error, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,

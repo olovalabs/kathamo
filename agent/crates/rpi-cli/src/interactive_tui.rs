@@ -646,9 +646,7 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
                 + Send,
         > = Box::new(move |_chunk, get_progress| {
             // The capture layer reports the complete tail captured so far, not
-            // a delta; `append_output` replaces its snapshot accordingly. A
-            // `None` snapshot means the capture lock was busy; the next chunk or
-            // the final result covers it.
+            // a delta; `append_output` replaces its snapshot accordingly.
             if let Some(progress) = get_progress() {
                 comp_chunk.append_output(&progress.output);
                 tui_chunk.request_render(false);

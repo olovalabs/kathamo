@@ -262,3 +262,93 @@ async fn grep_native_walk_respects_ignore_rules_and_preserves_breadth_first_orde
     .unwrap();
     assert_eq!(text_output(&explicit), "output.txt:1: needle");
 }
+
+#[tokio::test]
+async fn grep_context_limit_keeps_trailing_lines_without_duplicate_windows() {
+    let contents = b"before\nneedle one\nneedle two\nneedle three\nafter\n";
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ctx.txt"), contents).unwrap();
+    let native = ExecutionToolContext::new(
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into())),
+        None,
+    );
+    let (env, memory) = fresh_context();
+    seed(&env, "ctx.txt", contents.to_vec()).await;
+    for ctx in [native, memory] {
+        let result = run_grep(
+            rpi_tools::create_grep_tool(&ctx, None),
+            serde_json::json!({"pattern": "needle", "context": 1, "limit": 2}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            text_output(&result).split("\n\n").next().unwrap(),
+            "ctx.txt-1- before\nctx.txt:2: needle one\nctx.txt:3: needle two\nctx.txt-4- needle three"
+        );
+        assert_eq!(result.details["match_limit_reached"], 2);
+    }
+}
+
+#[tokio::test]
+async fn grep_native_handles_crlf_anchors_and_skips_binary_data() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("text.txt"), b"other\r\nNEEDLE\r\nend\r\n").unwrap();
+    std::fs::write(dir.path().join("binary.bin"), b"\0header\nNEEDLE\n").unwrap();
+    let ctx = ExecutionToolContext::new(
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into())),
+        None,
+    );
+    let result = run_grep(
+        rpi_tools::create_grep_tool(&ctx, None),
+        serde_json::json!({"pattern": "^needle$", "ignoreCase": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(text_output(&result), "text.txt:2: NEEDLE");
+}
+
+#[tokio::test]
+async fn grep_cancelled_native_search_returns_an_error_not_empty_results() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("text.txt"), b"needle\n").unwrap();
+    let ctx = ExecutionToolContext::new(
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into())),
+        None,
+    );
+    let signal = CancellationToken::new();
+    signal.cancel();
+    let error = rpi_tools::create_grep_tool(&ctx, None)
+        .execute(
+            "cancelled",
+            serde_json::json!({"pattern": "needle"}),
+            signal,
+            Arc::new(|_| ()),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("aborted"), "{error}");
+}
+
+#[tokio::test]
+async fn grep_native_caps_output_bytes_even_with_a_large_match_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = format!("needle {}\n", "x".repeat(440));
+    std::fs::write(dir.path().join("output.txt"), line.repeat(200)).unwrap();
+    let ctx = ExecutionToolContext::new(
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into())),
+        None,
+    );
+    let result = run_grep(
+        rpi_tools::create_grep_tool(&ctx, None),
+        serde_json::json!({"pattern": "needle", "limit": 1000}),
+    )
+    .await
+    .unwrap();
+    let out = text_output(&result);
+    let body = out.split("\n\n").next().unwrap();
+    assert!(body.starts_with("output.txt:1: needle "));
+    assert!(body.len() <= rpi_tools::DEFAULT_MAX_BYTES);
+    assert!(!body.contains("output.txt:200:"));
+    assert_eq!(result.details["truncation"]["truncated"], true);
+    assert!(result.details.get("match_limit_reached").is_none());
+}

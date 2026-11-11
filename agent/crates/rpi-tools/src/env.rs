@@ -94,6 +94,13 @@ pub struct ShellOverride {
     pub args: Vec<String>,
 }
 
+/// A decoded output chunk. Bounded channels let streaming consumers apply
+/// asynchronous backpressure without blocking the runtime's pipe readers.
+pub enum ShellOutputChunk {
+    Stdout(String),
+    Stderr(String),
+}
+
 pub struct ShellExecOptions<'a> {
     /// Optional executable and fixed arguments. `None` keeps the environment's
     /// default shell (Bash on POSIX/Windows), while tools such as PowerShell
@@ -109,6 +116,10 @@ pub struct ShellExecOptions<'a> {
     pub cancel: Option<&'a CancellationToken>,
     pub on_stdout: Option<Box<dyn FnMut(&str) + Send + 'a>>,
     pub on_stderr: Option<Box<dyn FnMut(&str) + Send + 'a>>,
+    /// Optional bounded asynchronous output transport, in addition to callbacks.
+    /// Consumers must drain it concurrently, including final decoder tails.
+    /// Backpressure can delay final delivery but does not delay child-tree kills.
+    pub output: Option<tokio::sync::mpsc::Sender<ShellOutputChunk>>,
     /// Default `true`. Callers that already consume the stream through
     /// `on_stdout`/`on_stderr` (for example the bash capture layer, which keeps
     /// its own bounded tail) can set this to `false` to avoid retaining a second
@@ -127,6 +138,7 @@ impl<'a> Default for ShellExecOptions<'a> {
             cancel: None,
             on_stdout: None,
             on_stderr: None,
+            output: None,
             capture_output: true,
         }
     }
@@ -178,8 +190,6 @@ pub trait ReadFile: Send + Sync {
         Ok(None)
     }
 }
-
-pub type SearchTree = std::collections::HashMap<PathBuf, Vec<(PathBuf, FileKind)>>;
 
 /// Mirrors TS `FileSystem`. All methods async, never panic.
 /// Backends should check cancellation at entry and during long operations.
@@ -296,14 +306,15 @@ pub trait FileSystem: Send + Sync {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<FileInfo>, FileError>;
 
-    /// Native snapshot of recursive search entries grouped by parent directory.
-    /// Backends without a bulk walker can enumerate directories on demand.
-    async fn search_tree(
+    /// Search contents with ripgrep. Native backends stream files; virtual
+    /// backends feed their bytes to the same matcher and searcher.
+    async fn search_contents(
         &self,
-        _path: &str,
-        _cancel: Option<&CancellationToken>,
-    ) -> Result<Option<SearchTree>, FileError> {
-        Ok(None)
+        path: &str,
+        search: crate::search::ContentSearch,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<crate::search::ContentSearchResult, FileError> {
+        crate::search::search_env(self, path, search, cancel).await
     }
 
     /// Follows symlinks (`canonicalize`). Mirrors TS `canonicalPath`. Backends

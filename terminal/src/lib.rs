@@ -13,6 +13,8 @@ pub mod event;
 pub mod hyperlink;
 pub mod input;
 pub mod mouse;
+pub mod pty_session;
+mod pty_writer;
 pub mod render;
 pub mod search;
 pub mod shell_integration;
@@ -29,6 +31,7 @@ pub use event::{
     TerminalNotifierHandle,
 };
 pub use hyperlink::{HyperlinkKind, HyperlinkMatch, RegexSearches};
+pub use pty_writer::WriteCompletion;
 pub use render::{PaintContext, TerminalRenderer};
 pub use search::SearchState;
 pub use shell_integration::{

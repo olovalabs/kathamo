@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rpi_embedded::QueuedEvent;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -63,6 +63,31 @@ pub enum AgentEvent {
     Title(String),
     Done,
     Closed,
+}
+
+impl QueuedEvent for AgentEvent {
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Text(text) | Self::Thinking(text) | Self::Status(text) | Self::Tool(text) |
+            Self::Error(text) | Self::Title(text) => text.len(),
+            Self::ToolStart { id, name, input } => id.as_ref().map_or(0, String::len) + name.len() + input.len(),
+            Self::ToolUpdate { id, name, output } | Self::ToolEnd { id, name, output, .. } =>
+                id.as_ref().map_or(0, String::len) + name.len() + output.len(),
+            Self::Subagents { tool_id, workers } => tool_id.len() + workers.iter().map(|worker| {
+                worker.id.len() + worker.title.len() + worker.status.len() +
+                worker.result.as_ref().map_or(0, String::len) +
+                worker.transcript.as_ref().map_or(0, |path| path.as_os_str().len())
+            }).sum::<usize>(),
+            Self::Done | Self::Closed => 0,
+        }
+    }
+    fn is_snapshot(&self) -> bool { matches!(self, Self::ToolUpdate { .. }) }
+    fn supersedes(&self, previous: &Self) -> bool {
+        matches!((self, previous),
+            (Self::ToolUpdate { id: Some(id), name, .. },
+             Self::ToolUpdate { id: Some(old_id), name: old_name, .. })
+                if id == old_id && name == old_name)
+    }
 }
 
 /// One rpi conversation. The default backend is the in-process harness; set
@@ -220,6 +245,7 @@ impl EmbeddedBridge {
     ) -> Result<Self, String> {
         let request_trace = trace_id;
         let phase_trace = trace_id;
+        let delta_trace = trace_id;
         let resumed = session.is_some();
         let mut options = SessionOptions::new(cwd)
             .with_selector(model)
@@ -227,6 +253,13 @@ impl EmbeddedBridge {
             .with_append_system_prompt(crate::agent_ui::CATALOG_PROMPT)
             .with_provider_request_hook(Arc::new(move || {
                 crate::stream_timing::turn_provider_request(request_trace);
+            }))
+            .with_delta_arrival_hook(Arc::new(move |reasoning| {
+                crate::stream_timing::turn_delta_arrived(delta_trace, if reasoning {
+                    crate::stream_timing::DeltaKind::Reasoning
+                } else {
+                    crate::stream_timing::DeltaKind::Answer
+                });
             }))
             .with_phase_hook(Arc::new(
                 move |label: &'static str, elapsed: std::time::Duration| {
@@ -287,24 +320,8 @@ impl EmbeddedBridge {
         let mut events = Vec::new();
         for event in self.session.poll() {
             match event {
-                SessionEvent::Text(text) => {
-                    if !text.is_empty() {
-                        crate::stream_timing::turn_delta_arrived(
-                            self.trace_id,
-                            crate::stream_timing::DeltaKind::Answer,
-                        );
-                    }
-                    events.push(AgentEvent::Text(text))
-                }
-                SessionEvent::Thinking(text) => {
-                    if !text.is_empty() {
-                        crate::stream_timing::turn_delta_arrived(
-                            self.trace_id,
-                            crate::stream_timing::DeltaKind::Reasoning,
-                        );
-                    }
-                    events.push(AgentEvent::Thinking(text))
-                }
+                SessionEvent::Text(text) => events.push(AgentEvent::Text(text)),
+                SessionEvent::Thinking(text) => events.push(AgentEvent::Thinking(text)),
                 SessionEvent::Status(text) => events.push(AgentEvent::Status(text)),
                 SessionEvent::ToolStart { id, name, input } => {
                     events.push(AgentEvent::ToolStart { id, name, input })
@@ -391,38 +408,23 @@ pub(crate) const COALESCE_TEXT_LIMIT: usize = 16 * 1024;
 /// the same call. Tool starts, ends, statuses, errors and completion events are
 /// structural: they keep their order and are never merged away.
 pub(crate) fn coalesce_events(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
-    if events.len() <= 1 {
-        return events;
-    }
-    let mut last_update: HashMap<(Option<String>, String), usize> = HashMap::new();
-    for (index, event) in events.iter().enumerate() {
-        if let AgentEvent::ToolUpdate { id, name, .. } = event {
-            last_update.insert((id.clone(), name.clone()), index);
-        }
-    }
-
     let mut out: Vec<AgentEvent> = Vec::with_capacity(events.len());
-    for (index, event) in events.into_iter().enumerate() {
-        if let AgentEvent::ToolUpdate {
-            ref id, ref name, ..
-        } = event
-            && last_update
-                .get(&(id.clone(), name.clone()))
-                .is_some_and(|last| *last != index)
-        {
-            continue;
+    for event in events {
+        if event.is_snapshot() {
+            // Only identified calls may supersede snapshots. A structural
+            // boundary ends the replacement window, including for reused IDs.
+            if let Some(index) = out.iter().enumerate().rev()
+                .take_while(|(_, old)| old.is_snapshot())
+                .find_map(|(index, old)| event.supersedes(old).then_some(index))
+            {
+                out.remove(index);
+            }
         }
-        match (&mut out.last_mut(), event) {
+        match (out.last_mut(), event) {
             (Some(AgentEvent::Text(previous)), AgentEvent::Text(next))
-                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT =>
-            {
-                previous.push_str(&next);
-            }
+                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT => previous.push_str(&next),
             (Some(AgentEvent::Thinking(previous)), AgentEvent::Thinking(next))
-                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT =>
-            {
-                previous.push_str(&next);
-            }
+                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT => previous.push_str(&next),
             (_, event) => out.push(event),
         }
     }
@@ -678,5 +680,28 @@ mod tests {
         let half = "x".repeat(COALESCE_TEXT_LIMIT / 2 + 1);
         let out = coalesce_events(vec![AgentEvent::Text(half.clone()), AgentEvent::Text(half)]);
         assert_eq!(out.len(), 2, "merged text must stay under the entry cap");
+    }
+
+    #[test]
+    fn unidentified_snapshots_and_structural_boundaries_are_lossless() {
+        let update = |id: Option<&str>, output: &str| AgentEvent::ToolUpdate {
+            id: id.map(str::to_owned), name: "bash".into(), output: output.into(),
+        };
+        let out = coalesce_events(vec![
+            update(None, "first"), update(None, "second"),
+            update(Some("a"), "old"), update(Some("b"), "peer"),
+            update(Some("a"), "latest"), AgentEvent::Error("boundary".into()),
+            update(Some("a"), "after"),
+            AgentEvent::ToolEnd { id: Some("a".into()), name: "bash".into(),
+                output: "final".into(), failed: false },
+            AgentEvent::Done,
+        ]);
+        let snapshots: Vec<_> = out.iter().filter_map(|event| match event {
+            AgentEvent::ToolUpdate { output, .. } => Some(output.as_str()), _ => None,
+        }).collect();
+        assert_eq!(snapshots, ["first", "second", "peer", "latest", "after"]);
+        assert!(matches!(&out[4], AgentEvent::Error(text) if text == "boundary"));
+        assert!(matches!(&out[6], AgentEvent::ToolEnd { output, .. } if output == "final"));
+        assert!(matches!(out.last(), Some(AgentEvent::Done)));
     }
 }

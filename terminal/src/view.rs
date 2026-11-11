@@ -177,6 +177,8 @@ pub struct TerminalView {
     /// Increments whenever PTY output or a grid resize can change the visible
     /// screen. The status poller uses this to skip scraping unchanged panes.
     screen_revision: Arc<AtomicU64>,
+    /// Diagnostics only: oldest output not yet painted by this view.
+    pending_output: Arc<parking_lot::Mutex<Option<crate::diagnostics::PendingOutput>>>,
 
     resize_callback: Option<Arc<ResizeCallback>>,
     key_handler: Option<Arc<KeyHandler>>,
@@ -215,6 +217,8 @@ pub struct TerminalView {
     search_last_refresh: Option<std::time::Instant>,
     /// A throttled rescan is owed once the throttle interval has elapsed.
     search_refresh_pending: bool,
+    /// Wakes the owed trailing rescan even when no further output/frame arrives.
+    search_refresh_task: Option<Task<()>>,
     /// Last time this view rendered. Used to tell a visible terminal from a
     /// background one, which does not need live search matches.
     last_render: Option<std::time::Instant>,
@@ -262,6 +266,11 @@ async fn yield_to_ui() {
             std::task::Poll::Pending
         }
     }).await;
+}
+
+struct OutputChunk {
+    bytes: Vec<u8>,
+    read_at: Option<std::time::Instant>,
 }
 
 impl TerminalView {
@@ -345,7 +354,7 @@ impl TerminalView {
         // Bounded so a firehose process (`cat` a huge file) applies backpressure
         // to the reader thread — and through it to the PTY — instead of
         // queueing an unbounded number of byte chunks in memory.
-        let (bytes_tx, bytes_rx) = flume::bounded::<Vec<u8>>(256);
+        let (bytes_tx, bytes_rx) = flume::bounded::<OutputChunk>(256);
 
         thread::spawn(move || {
             Self::read_stdout_blocking(stdout_reader, bytes_tx);
@@ -380,7 +389,7 @@ impl TerminalView {
                     None => bytes_rx.recv_async().await,
                 };
                 match next {
-                    Ok(mut bytes) => {
+                    Ok(OutputChunk { mut bytes, read_at }) => {
                         // Coalesce what already arrived so a firehose of output
                         // costs one parse + one repaint, not hundreds — but stop
                         // at a budget so the parse, which runs on the UI thread,
@@ -399,19 +408,21 @@ impl TerminalView {
                             let Ok(more) = bytes_rx.try_recv() else {
                                 break;
                             };
-                            if more.len() > MAX_COALESCE_BYTES - bytes.len() {
+                            if more.bytes.len() > MAX_COALESCE_BYTES - bytes.len() {
                                 // Keep the entire next chunk rather than overshoot
                                 // the parse budget or allocate/copy a split tail.
                                 pending = Some(more);
                                 break;
                             }
-                            bytes.extend_from_slice(&more);
+                            bytes.extend_from_slice(&more.bytes);
                         }
 
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
+                            crate::diagnostics::output_queued(read_at, bytes_rx.len());
                             let diag_parse = crate::diagnostics::parse_start();
                             let shell_events = view.state.process_bytes(&bytes);
                             crate::diagnostics::parse_end(diag_parse, bytes.len());
+                            crate::diagnostics::output_parsed(&view.pending_output, read_at);
                             for event in shell_events {
                                 cx.emit(event);
                             }
@@ -421,19 +432,8 @@ impl TerminalView {
                             if view.search.is_active() && view.visible_recently() {
                                 // A full-scrollback rescan per batch would stall
                                 // the UI thread under streaming output; throttle
-                                // it and let `render` run the owed trailing pass.
-                                let now = std::time::Instant::now();
-                                let due = view
-                                    .search_last_refresh
-                                    .map(|t| now - t >= SEARCH_REFRESH_MIN_INTERVAL)
-                                    .unwrap_or(true);
-                                if due {
-                                    view.search.refresh(&view.state);
-                                    view.search_last_refresh = Some(now);
-                                    view.search_refresh_pending = false;
-                                } else {
-                                    view.search_refresh_pending = true;
-                                }
+                                // it and arm a timer for the owed trailing pass.
+                                view.refresh_streaming_search(cx);
                             }
                             cx.notify();
                         });
@@ -473,6 +473,7 @@ impl TerminalView {
             last_bounds: Arc::new(parking_lot::Mutex::new(Bounds::default())),
             last_grid_size: (0, 0),
             screen_revision: Arc::new(AtomicU64::new(0)),
+            pending_output: Arc::new(parking_lot::Mutex::new(None)),
             resize_callback: None,
             key_handler: None,
             bell_callback: None,
@@ -499,6 +500,7 @@ impl TerminalView {
             event_scratch: Vec::new(),
             search_last_refresh: None,
             search_refresh_pending: false,
+            search_refresh_task: None,
             last_render: None,
             read_only,
         }
@@ -599,7 +601,7 @@ impl TerminalView {
 
     fn read_stdout_blocking<R: Read + Send + 'static>(
         mut stdout_reader: R,
-        bytes_tx: flume::Sender<Vec<u8>>,
+        bytes_tx: flume::Sender<OutputChunk>,
     ) {
         let mut buffer = [0u8; 32768];
 
@@ -607,7 +609,12 @@ impl TerminalView {
             match stdout_reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if bytes_tx.send(buffer[..n].to_vec()).is_err() {
+                    let read_at = crate::diagnostics::output_received();
+                    let chunk = OutputChunk {
+                        bytes: buffer[..n].to_vec(),
+                        read_at,
+                    };
+                    if bytes_tx.send(chunk).is_err() {
                         break;
                     }
                 }
@@ -894,6 +901,9 @@ impl TerminalView {
 
     /// Set the search query. Pass an empty query to clear.
     pub fn search(&mut self, query: &str, use_regex: bool, cx: &mut Context<Self>) -> bool {
+        self.search_refresh_task = None;
+        self.search_refresh_pending = false;
+        self.search_last_refresh = Some(std::time::Instant::now());
         let ok = self.search.set_query(query, use_regex, &self.state);
         if ok && !query.is_empty() {
             // Focus the first match and scroll it into view.
@@ -915,12 +925,46 @@ impl TerminalView {
 
     pub fn clear_search(&mut self, cx: &mut Context<Self>) {
         self.search.clear();
+        self.search_refresh_task = None;
+        self.search_refresh_pending = false;
+        self.search_last_refresh = None;
         cx.notify();
     }
 
     /// `(current, total)` match counters for a search UI.
     pub fn search_status(&self) -> (Option<usize>, usize) {
         (self.search.current_index(), self.search.match_count())
+    }
+
+    fn refresh_streaming_search(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        let remaining = self.search_last_refresh.map_or(Duration::ZERO, |last| {
+            SEARCH_REFRESH_MIN_INTERVAL.saturating_sub(now.duration_since(last))
+        });
+        if remaining.is_zero() {
+            self.search.refresh(&self.state);
+            self.search_last_refresh = Some(now);
+            self.search_refresh_pending = false;
+            self.search_refresh_task = None;
+            return;
+        }
+
+        self.search_refresh_pending = true;
+        if self.search_refresh_task.is_some() {
+            return;
+        }
+        self.search_refresh_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            cx.background_executor().timer(remaining).await;
+            let _ = this.update(cx, |view, cx| {
+                view.search_refresh_task = None;
+                if view.search_refresh_pending && view.search.is_active() && view.visible_recently() {
+                    view.search.refresh(&view.state);
+                    view.search_last_refresh = Some(std::time::Instant::now());
+                    view.search_refresh_pending = false;
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     // -----------------------------------------------------------------------
@@ -1923,48 +1967,29 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_events(window, cx);
 
-        // Coming back on screen after being hidden: matches may have gone
-        // stale while output kept arriving, and no reader-side rescan was
-        // scheduled. Rebuild them once here.
+        // Hidden views and resized grids need fresh grid-coordinate matches.
+        // Combine these invalidations with an owed streaming rescan so a first
+        // render/resize never scans the full scrollback twice in one frame.
+        let now = std::time::Instant::now();
         let was_hidden = !self.visible_recently();
-        self.last_render = Some(std::time::Instant::now());
-        if was_hidden && self.search.is_active() {
+        self.last_render = Some(now);
+        let grid_size = self.dimensions();
+        let grid_changed = grid_size != self.last_grid_size;
+        self.last_grid_size = grid_size;
+        let search_due = self.search_refresh_pending
+            && self.search_last_refresh.is_none_or(|last| {
+                now.duration_since(last) >= SEARCH_REFRESH_MIN_INTERVAL
+            });
+        if self.search.is_active() && (was_hidden || grid_changed || search_due) {
             self.search.refresh(&self.state);
-            self.search_last_refresh = Some(std::time::Instant::now());
+            self.search_last_refresh = Some(now);
             self.search_refresh_pending = false;
-        }
-
-        // Trailing pass for a search rescan the reader task throttled: once the
-        // throttle interval has elapsed, refresh so matches never lag a burst
-        // by more than `SEARCH_REFRESH_MIN_INTERVAL`.
-        if self.search_refresh_pending && self.search.is_active() {
-            let now = std::time::Instant::now();
-            let due = self
-                .search_last_refresh
-                .map(|t| now - t >= SEARCH_REFRESH_MIN_INTERVAL)
-                .unwrap_or(true);
-            if due {
-                self.search.refresh(&self.state);
-                self.search_last_refresh = Some(now);
-                self.search_refresh_pending = false;
-            }
+            self.search_refresh_task = None;
         }
 
         if !self.cell_metrics_valid {
             self.renderer.measure_cell(window);
             self.cell_metrics_valid = true;
-        }
-
-        // Search matches are stored in grid coordinates, so a grid resize
-        // invalidates them. The resize itself happens in the paint pass, which
-        // makes this the only place that can notice it: compare the live grid
-        // against the size the last render saw.
-        let grid_size = self.dimensions();
-        if grid_size != self.last_grid_size {
-            self.last_grid_size = grid_size;
-            if self.search.is_active() {
-                self.search.refresh(&self.state);
-            }
         }
 
         let is_focused = self.focus_handle.is_focused(window);
@@ -1982,6 +2007,7 @@ impl Render for TerminalView {
         let last_bounds = self.last_bounds.clone();
         let window_size = self.window_size.clone();
         let screen_revision = Arc::clone(&self.screen_revision);
+        let pending_output = Arc::clone(&self.pending_output);
 
         let selection: Option<SelectionRange> = self.state.selection_range();
         let search_matches: Arc<[GridMatch]> = self.search.matches_arc();
@@ -2067,6 +2093,7 @@ impl Render for TerminalView {
                         };
 
                         renderer.paint(bounds, padding, &term, &paint_ctx, window, cx);
+                        crate::diagnostics::output_painted(&pending_output);
                     },
                 )
                 .size_full(),

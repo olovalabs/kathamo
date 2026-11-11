@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Moved initial Markdown/HTML parsing and syntax highlighting off GPUI; bounded pending documents/results with latest-state mailboxes and monotonic compatible-prefix publication during continuous streaming.
+- Coalesced embedded-session wake callbacks before mutex/channel work, scanned only unfinished Markdown boundaries, and removed per-cell snapshot strings and whole-match-list searches from terminal painting.
+- Added queue residence/backpressure, tool snapshot-to-paint and PTY read/parse-to-paint diagnostics, plus reproducible streaming performance benchmarks.
 - Reworked shell streaming with bounded asynchronous capture, complete sanitized logs, 16 ms quiet-period checkpoints, concurrent stdin/stdout/stderr/status handling, and reliable cancellation/drop cleanup. Removed redundant timeout padding and batched log appends.
 - Moved PTY setup, input, resize and teardown off GPUI; added bounded FIFO input with physical-write receipts, visible refusal/failure handling, real child exit status and cooperative parsing/restoration.
 - Bounded native/RPC event delivery, prompt admission and transcript persistence; coalesce identified snapshots before projection, preserve lifecycle events, resignal fair UI drains, and report persistence overload.
@@ -62,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the bottom input toggle; a previously saved `bottom_input` preference no longer disables the input.
 
 ### Fixed
+- Deliver the terminal's trailing throttled search refresh even when output stops; coalesce resize and visibility rescans.
 - Fix duplicate Antigravity model-route registration causing false ambiguous-model errors; host-declared transports now replace bundled routes for the same model identity.
 - Keep Markdown agent replies updating during continuous streams and reduce OMP streaming payloads.
 - Display streamed agent thinking text instead of leaving the chat blank while a model is reasoning.

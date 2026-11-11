@@ -84,6 +84,14 @@ fn accumulate_run<F: FnMut(usize, usize)>(
     }
 }
 
+/// RegexIter emits non-overlapping matches in grid order. Restrict a row's
+/// highlight walk without scanning the entire scrollback match list per row.
+fn row_match_range(matches: &[Match], line: i32) -> std::ops::Range<usize> {
+    let start = matches.partition_point(|m| m.end().line.0 < line);
+    let end = start + matches[start..].partition_point(|m| m.start().line.0 <= line);
+    start..end
+}
+
 #[derive(Debug, Clone)]
 pub struct BatchedTextRun {
     pub text: String,
@@ -474,8 +482,6 @@ struct PaintScratch {
     selection_rects: Vec<BlockElementRect>,
     match_rects: Vec<BlockElementRect>,
     decoration_rects: Vec<BlockElementRect>,
-    /// Indices into the sorted search match list that touch the current row.
-    row_match_indices: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -594,12 +600,6 @@ impl TerminalRenderer {
                 cell.c
             };
 
-            let mut cell_text = ch.to_string();
-            if let Some(zerowidth) = cell.zerowidth() {
-                for &zc in zerowidth {
-                    cell_text.push(zc);
-                }
-            }
             let cell_width_units = if cell.flags.contains(Flags::WIDE_CHAR) {
                 2
             } else {
@@ -620,42 +620,34 @@ impl TerminalRenderer {
                 current_bg = Some(BackgroundRect::new(col, col + 1, row, bg_color));
             }
 
-            let cell_char_count = cell_text.chars().count();
-            if let Some(ref mut run) = current_run {
-                if run.fg_color == fg_color
+            let zerowidth = cell.zerowidth().unwrap_or_default();
+            let cell_char_count = 1 + zerowidth.len();
+            let mergeable = current_run.as_ref().is_some_and(|run| {
+                run.fg_color == fg_color
                     && run.bg_color == bg_color
                     && run.bold == bold
                     && run.italic == italic
                     && run.underline == underline
                     && run.strikethrough == strikethrough
                     && run.start_col + run.cell_count == col
-                {
-                    run.text.push_str(&cell_text);
-                    run.char_count += cell_char_count;
-                    run.cell_count += cell_width_units;
-                } else {
-                    let finished = std::mem::replace(
-                        run,
-                        BatchedTextRun {
-                            text: cell_text,
-                            char_count: cell_char_count,
-                            cell_count: cell_width_units,
-                            start_col: col,
-                            row,
-                            fg_color,
-                            bg_color,
-                            bold,
-                            italic,
-                            underline,
-                            strikethrough,
-                            wavy_underline: false,
-                        },
-                    );
-                    text_runs.push(finished);
-                }
+            });
+            if mergeable {
+                let run = current_run.as_mut().unwrap();
+                run.text.push(ch);
+                run.text.extend(zerowidth.iter().copied());
+                run.char_count += cell_char_count;
+                run.cell_count += cell_width_units;
             } else {
+                if let Some(run) = current_run.take() {
+                    text_runs.push(run);
+                }
+                // Allocate once per styled run, not once per cell. Snapshotting
+                // a plain 120-column line previously allocated 120 tiny Strings.
+                let mut text = String::with_capacity(16);
+                text.push(ch);
+                text.extend(zerowidth.iter().copied());
                 current_run = Some(BatchedTextRun {
-                    text: cell_text,
+                    text,
                     char_count: cell_char_count,
                     cell_count: cell_width_units,
                     start_col: col,
@@ -891,7 +883,6 @@ impl TerminalRenderer {
             selection_rects,
             match_rects,
             decoration_rects,
-            row_match_indices,
         } = &mut *scratch;
         clear_for_reuse(row_backgrounds, cell_count);
         clear_for_reuse(batched_text_runs, cell_count);
@@ -899,26 +890,15 @@ impl TerminalRenderer {
         clear_for_reuse(selection_rects, cell_count);
         clear_for_reuse(match_rects, cell_count);
         clear_for_reuse(decoration_rects, cell_count);
-        clear_for_reuse(row_match_indices, ctx.search_matches.len());
 
         let underline_thickness = ((f32::from(self.font_size) * 0.07).round()).max(1.0);
 
         for line_idx in 0..num_lines {
             let buffer_line = (line_idx as i32) - (display_offset as i32);
 
-            // Narrow the sorted search matches to the ones touching this row.
-            // A moving cursor below then advances through them once as columns
-            // are painted, instead of rescanning the row's matches for every
-            // cell.
-            row_match_indices.clear();
-            if !ctx.search_matches.is_empty() {
-                row_match_indices.extend(ctx.search_matches.iter().enumerate().filter_map(
-                    |(index, m)| {
-                        (m.start().line.0 <= buffer_line && buffer_line <= m.end().line.0)
-                            .then_some(index)
-                    },
-                ));
-            }
+            // A binary-search range preserves multiline matches crossing this
+            // row, while ignoring thousands of offscreen scrollback matches.
+            let row_matches = &ctx.search_matches[row_match_range(ctx.search_matches, buffer_line)];
             let mut match_cursor = 0;
 
             let mut current_bg: Option<BackgroundRect> = None;
@@ -976,10 +956,9 @@ impl TerminalRenderer {
                 });
 
                 let matched = loop {
-                    let Some(&match_index) = row_match_indices.get(match_cursor) else {
+                    let Some(candidate) = row_matches.get(match_cursor) else {
                         break None;
                     };
-                    let candidate = &ctx.search_matches[match_index];
                     if candidate.contains(&point) {
                         break Some(candidate);
                     }
@@ -1613,6 +1592,87 @@ impl TerminalRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_match_ranges_preserve_multiline_and_scrollback_boundaries() {
+        let matches = vec![
+            GridPoint::new(GridLine(-10), GridColumn(2))..=GridPoint::new(GridLine(-8), GridColumn(4)),
+            GridPoint::new(GridLine(-8), GridColumn(8))..=GridPoint::new(GridLine(0), GridColumn(1)),
+            GridPoint::new(GridLine(0), GridColumn(3))..=GridPoint::new(GridLine(0), GridColumn(6)),
+            GridPoint::new(GridLine(3), GridColumn(0))..=GridPoint::new(GridLine(4), GridColumn(2)),
+        ];
+        for line in -12..7 {
+            let expected: Vec<_> = matches.iter().filter(|m| {
+                m.start().line.0 <= line && line <= m.end().line.0
+            }).collect();
+            let range = row_match_range(&matches, line);
+            assert_eq!(matches[range].iter().collect::<Vec<_>>(), expected, "line {line}");
+        }
+        assert_eq!(row_match_range(&[], 0), 0..0);
+    }
+
+    #[test]
+    fn snapshot_runs_preserve_combining_wide_and_styled_cells() {
+        let renderer = TerminalRenderer::new(
+            "monospace".into(), px(14.0), 1.2, ColorPalette::default(),
+        );
+        let colors = Colors::default();
+        let mut accent = Cell::default();
+        accent.c = 'e';
+        accent.push_zerowidth('\u{301}');
+        let mut wide = Cell::default();
+        wide.c = '界';
+        wide.flags = Flags::WIDE_CHAR;
+        let mut spacer = Cell::default();
+        spacer.flags = Flags::WIDE_CHAR_SPACER;
+        let mut styled = Cell::default();
+        styled.c = 'z';
+        styled.flags = Flags::BOLD | Flags::ITALIC | Flags::UNDERLINE | Flags::STRIKEOUT;
+        let cells = vec![accent, Cell::default(), wide, spacer, styled];
+        let (_, runs) = renderer.layout_row(0, cells.into_iter().enumerate(), &colors);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "e\u{301} 界");
+        assert_eq!(runs[0].char_count, 4);
+        assert_eq!(runs[0].cell_count, 4);
+        assert_eq!(runs[1].text, "z");
+        assert_eq!(runs[1].start_col, 4);
+        assert!(runs[1].bold && runs[1].italic && runs[1].underline && runs[1].strikethrough);
+    }
+
+    #[test]
+    #[ignore = "measurement; run with --release --ignored --nocapture"]
+    fn streaming_search_paint_index_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let matches: Vec<Match> = (0..5_000).map(|index| {
+            let line = GridLine(index / 4 - 1_200);
+            let col = GridColumn((index as usize % 4) * 10);
+            GridPoint::new(line, col)..=GridPoint::new(line, GridColumn(col.0 + 5))
+        }).collect();
+        let mut baseline = Vec::with_capacity(101);
+        let mut candidate = Vec::with_capacity(101);
+        for _ in 0..101 {
+            let start = Instant::now();
+            let mut old_count = 0;
+            for line in 0..48 {
+                old_count += black_box(&matches).iter().filter(|m| {
+                    m.start().line.0 <= line && line <= m.end().line.0
+                }).count();
+            }
+            baseline.push(start.elapsed().as_nanos());
+            let start = Instant::now();
+            let mut new_count = 0;
+            for line in 0..48 {
+                new_count += row_match_range(black_box(&matches), line).len();
+            }
+            candidate.push(start.elapsed().as_nanos());
+            assert_eq!(black_box(old_count), black_box(new_count));
+        }
+        baseline.sort_unstable();
+        candidate.sort_unstable();
+        eprintln!("search index 48 rows/5000 matches: baseline p50={}ns p95={}ns; candidate p50={}ns p95={}ns; baseline visited={} matches/frame",
+            baseline[50], baseline[95], candidate[50], candidate[95], 48 * matches.len());
+    }
 
     #[test]
     fn test_renderer_creation() {

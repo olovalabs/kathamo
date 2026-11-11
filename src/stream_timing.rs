@@ -11,11 +11,18 @@
 //! - `engine.*`       child process spawn and first RPC record
 //! - `bridge.*`       JSON decode and event projection on the reader thread
 //! - `ui.drain`       draining a bridge's channel on the UI thread
+//! - `queue.*`        raw/projected admission, mutex wait and queued residence;
+//!                    `.backpressure` counts only admissions that waited,
+//!                    `.snapshot_dropped` is a zero-duration event counter
 //! - `transcript.*`   serializing and enqueueing a history entry
 //! - `ui.apply`       applying one event to the visible transcript
 //! - `ui.render_rows` building chat rows in a frame
 //! - `markdown.*`     initial and update parses (components crate)
 //! - `tool.*`         event arrival → completion / UI apply / first card / first output
+//! - `tool.output_to_paint` first nonempty snapshot at host admission → frame
+//!
+//! Percentiles sample the first 4,096 observations per label/window; `n` and
+//! `max` include every observation. Timings perturb execution when enabled.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,6 +55,7 @@ pub fn enabled() -> bool {
 struct Stats {
     count: u64,
     samples: Vec<u64>,
+    max: u64,
 }
 
 static STATS: LazyLock<Mutex<HashMap<&'static str, Stats>>> =
@@ -69,6 +77,7 @@ pub fn record(label: &'static str, elapsed: Duration) {
     with_stats(|stats| {
         let entry = stats.entry(label).or_default();
         entry.count += 1;
+        entry.max = entry.max.max(micros);
         if entry.samples.len() < MAX_SAMPLES {
             entry.samples.push(micros);
         }
@@ -127,7 +136,7 @@ fn report() {
                 ((stats.samples.len() as f64 * fraction) as usize).min(stats.samples.len() - 1);
             stats.samples[index]
         };
-        let max = stats.samples.last().copied().unwrap_or(0);
+        let max = stats.max;
         eprintln!(
             "  {label:<26} n={:<6} p50={:<8} p95={:<8} max={}",
             stats.count,
@@ -141,6 +150,7 @@ fn report() {
 struct ToolTrace {
     arrived: Instant,
     ended: Option<Instant>,
+    output_arrived: Option<Instant>,
     card_painted: bool,
     output_painted: bool,
 }
@@ -166,10 +176,20 @@ pub fn tool_arrived(id: &str) {
         ToolTrace {
             arrived: Instant::now(),
             ended: None,
+            output_arrived: None,
             card_painted: false,
             output_painted: false,
         },
     );
+}
+
+/// First non-empty tool snapshot reached host transport admission, before
+/// queueing or projection. Final-only tool output uses the same marker.
+pub fn tool_output_arrived(id: &str) {
+    if !enabled() { return; }
+    if let Some(tool) = lock(&TOOLS).get_mut(id) {
+        tool.output_arrived.get_or_insert_with(Instant::now);
+    }
 }
 
 /// Time between the start and end events reaching the bridge. Includes agent
@@ -225,11 +245,23 @@ pub fn tool_card_painted(id: &str) {
     tool_painted(id, "tool.arrival_to_card", |trace| &mut trace.card_painted);
 }
 
-/// RPC arrival → the first non-empty output entered a frame.
+/// Tool start and first non-empty snapshot → the first output entered a frame.
 pub fn tool_output_painted(id: &str) {
-    tool_painted(id, "tool.arrival_to_output", |trace| {
-        &mut trace.output_painted
+    if !enabled() { return; }
+    let times = lock(&TOOLS).get_mut(id).and_then(|trace| {
+        if std::mem::replace(&mut trace.output_painted, true) {
+            None
+        } else {
+            Some((trace.arrived, trace.output_arrived))
+        }
     });
+    if let Some((arrived, output_arrived)) = times {
+        let painted = Instant::now();
+        record("tool.arrival_to_output", painted.saturating_duration_since(arrived));
+        if let Some(output_arrived) = output_arrived {
+            record("tool.output_to_paint", painted.saturating_duration_since(output_arrived));
+        }
+    }
 }
 
 fn tool_painted(id: &str, label: &'static str, flag: impl FnOnce(&mut ToolTrace) -> &mut bool) {
@@ -266,7 +298,7 @@ struct TurnTrace {
     provider_request: Option<Instant>,
     last_tool_end: Option<Instant>,
     first: [Option<Instant>; 2],
-    applied: [bool; 2],
+    applied: [Option<Instant>; 2],
     painted: [bool; 2],
     cancelled: Option<Instant>,
     settled: bool,
@@ -274,12 +306,19 @@ struct TurnTrace {
 
 impl TurnTrace {
     fn awaiting_paint(&self) -> bool {
-        (0..self.first.len()).any(|index| self.applied[index] && !self.painted[index])
+        (0..self.first.len()).any(|index| self.applied[index].is_some() && !self.painted[index])
     }
 }
 
 static TURNS: LazyLock<Mutex<HashMap<u64, TurnTrace>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Paint identity for the current turn, including a turn that settled before
+/// its first frame. A conversation trace is reused; its submit time is not.
+pub fn turn_started_at(trace: u64) -> Option<Instant> {
+    if !enabled() { return None; }
+    lock(&TURNS).get(&trace).map(|turn| turn.sent)
+}
 
 fn phase_label(warm: bool, suffix: &str) -> &'static str {
     match (warm, suffix) {
@@ -301,6 +340,10 @@ fn phase_label(warm: bool, suffix: &str) -> &'static str {
         (false, "reasoning.delta_to_paint") => "turn.cold.reasoning.delta_to_paint",
         (true, "answer.delta_to_paint") => "turn.warm.answer.delta_to_paint",
         (false, "answer.delta_to_paint") => "turn.cold.answer.delta_to_paint",
+        (true, "reasoning.apply_to_paint") => "turn.warm.reasoning.apply_to_paint",
+        (false, "reasoning.apply_to_paint") => "turn.cold.reasoning.apply_to_paint",
+        (true, "answer.apply_to_paint") => "turn.warm.answer.apply_to_paint",
+        (false, "answer.apply_to_paint") => "turn.cold.answer.apply_to_paint",
         _ => "turn.dropped",
     }
 }
@@ -329,7 +372,7 @@ pub fn turn_sent(trace: u64, warm: bool) {
             provider_request: None,
             last_tool_end: None,
             first: [None; 2],
-            applied: [false; 2],
+            applied: [None; 2],
             painted: [false; 2],
             cancelled: None,
             settled: false,
@@ -404,14 +447,14 @@ pub fn turn_delta_applied(trace: u64, kind: DeltaKind) {
     let Some(turn) = turns.get_mut(&trace) else {
         return;
     };
-    if turn.applied[index] {
+    if turn.applied[index].is_some() {
         return;
     }
     let Some(arrived) = turn.first[index] else {
         return;
     };
-    turn.applied[index] = true;
     let now = Instant::now();
+    turn.applied[index] = Some(now);
     let label = phase_label(
         turn.warm,
         match kind {
@@ -456,7 +499,7 @@ pub fn turn_painted(trace: u64, kind: DeltaKind) {
     let Some(arrived) = turn.first[index] else {
         return;
     };
-    if turn.cancelled.is_some() && !turn.applied[index] {
+    if turn.cancelled.is_some() && turn.applied[index].is_none() {
         // A cancelled turn can settle before the first row is laid out; keep
         // the turn's cancellation sample and drop the paint sample.
         return;
@@ -477,6 +520,14 @@ pub fn turn_painted(trace: u64, kind: DeltaKind) {
             DeltaKind::Answer => "answer.delta_to_paint",
         },
     );
+    let applied = turn.applied[index];
+    let apply_label = phase_label(
+        turn.warm,
+        match kind {
+            DeltaKind::Reasoning => "reasoning.apply_to_paint",
+            DeltaKind::Answer => "answer.apply_to_paint",
+        },
+    );
     let sent = turn.sent;
     if turn.settled && !turn.awaiting_paint() {
         turns.remove(&trace);
@@ -484,6 +535,9 @@ pub fn turn_painted(trace: u64, kind: DeltaKind) {
     drop(turns);
     record(sent_label, now.saturating_duration_since(sent));
     record(delta_label, now.saturating_duration_since(arrived));
+    if let Some(applied) = applied {
+        record(apply_label, now.saturating_duration_since(applied));
+    }
 }
 
 /// The user asked to stop the turn.

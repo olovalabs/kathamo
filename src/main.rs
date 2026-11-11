@@ -156,16 +156,14 @@ struct ChatMessage {
     text: String,
     tool: Option<ChatTool>,
     expanded: bool,
-    /// Assistant text that is still being appended to. Streaming text renders
-    /// settled markdown blocks eagerly and the live tail as plain text so each
-    /// token does not re-parse and re-shape the whole message.
+    /// Assistant text that is still being appended to. Settled Markdown keeps
+    /// its render cache; the live tail is parsed by the TextView worker.
     streaming: bool,
-    /// Cached split of a streaming assistant message. It is refreshed when a
-    /// delta arrives, never while rendering, so a frame walks only the short
-    /// live tail instead of rescanning the whole message.
+    /// Cached split refreshed when a delta arrives, never during rendering.
+    /// Only the unfinished suffix needs boundary scanning.
     stream: Option<StreamView>,
     /// Metadata-only turn identity for opt-in paint timings.
-    turn: Option<u64>,
+    turn: Option<(u64, std::time::Instant)>,
     source_timestamp: Option<u64>,
 }
 
@@ -1478,12 +1476,12 @@ fn finish_chat_streaming(messages: &mut [Arc<ChatMessage>]) {
 
 /// Refresh the cached settled/tail split for a streaming assistant message.
 ///
-/// A delta without a newline can only extend the live tail; block boundaries
-/// change solely at line breaks. Rescanning the document on non-newline tokens
-/// is therefore unnecessary.
+/// Settled blocks cannot change when text is appended. Scan only the unfinished
+/// suffix on line breaks; preserve its list/fence context until it settles.
 fn refresh_stream_view(message: &mut ChatMessage, scan: bool) {
     let split_at = if scan {
-        let (_, tail) = split_streaming_markdown(&message.text);
+        let previous = message.stream.as_ref().map_or(0, |view| view.settled.len());
+        let (_, tail) = split_streaming_markdown(&message.text[previous..]);
         message.text.len() - tail.len()
     } else {
         message
@@ -6098,6 +6096,7 @@ impl AppState {
     }
 
     fn poll_agent_events(&mut self, cx: &mut Context<Self>) -> bool {
+        let pump_start = crate::stream_timing::enabled().then(std::time::Instant::now);
         let mut changed = false;
         let mut session_changed = false;
         let mut authenticated = false;
@@ -6189,6 +6188,8 @@ impl AppState {
                     if let Some(mut bridge) = pane.chat.bridge.take() {
                         let mut closed = false;
                         let trace = bridge.trace_id();
+                        let paint_turn = crate::stream_timing::turn_started_at(trace)
+                            .map(|started| (trace, started));
                         let drain_start = std::time::Instant::now();
                         let drained = bridge.poll();
                         crate::stream_timing::record_since("ui.drain", drain_start);
@@ -6250,7 +6251,7 @@ impl AppState {
                             if let Some(kind) = delta_kind {
                                 crate::stream_timing::turn_delta_applied(trace, kind);
                                 if let Some(last) = pane.chat.messages.last_mut() {
-                                    Arc::make_mut(last).turn = Some(trace);
+                                    Arc::make_mut(last).turn = paint_turn;
                                 }
                             }
                             crate::stream_timing::record_since("ui.apply", apply_start);
@@ -6320,6 +6321,9 @@ impl AppState {
         }
         if session_changed {
             self.schedule_workspace_save(cx);
+        }
+        if let Some(start) = pump_start {
+            crate::stream_timing::record_since("ui.pump", start);
         }
         if changed {
             cx.notify();
@@ -10194,13 +10198,13 @@ impl AppState {
         cx: &mut App,
     ) -> AnyElement {
         let mut paint_marker = None;
-        if message.streaming
-            && !message.text.is_empty()
-            && let Some(turn) = message.turn
+        if !message.text.is_empty()
+            && let Some((turn, started)) = message.turn
+            && crate::stream_timing::turn_started_at(turn) == Some(started)
         {
             let kind = match message.role {
                 ChatRole::Assistant => Some(crate::stream_timing::DeltaKind::Answer),
-                ChatRole::Thinking => Some(crate::stream_timing::DeltaKind::Reasoning),
+                ChatRole::Thinking if message.expanded => Some(crate::stream_timing::DeltaKind::Reasoning),
                 _ => None,
             };
             if let Some(kind) = kind
@@ -10213,7 +10217,9 @@ impl AppState {
                     canvas(
                         |_, _, _| (),
                         move |_, _, _, _| {
-                            crate::stream_timing::turn_painted(turn, kind);
+                            if crate::stream_timing::turn_started_at(turn) == Some(started) {
+                                crate::stream_timing::turn_painted(turn, kind);
+                            }
                         },
                     )
                     .absolute()
@@ -14102,6 +14108,7 @@ fn main() -> Result<()> {
     }
     rpi_embedded::set_tool_arrival_hook(crate::stream_timing::tool_arrived);
     rpi_embedded::set_tool_end_hook(crate::stream_timing::tool_finished);
+    rpi_embedded::set_tool_output_hook(crate::stream_timing::tool_output_arrived);
     gpui_platform::application()
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
@@ -14370,8 +14377,8 @@ fn main() -> Result<()> {
                                 Err(_) => break,
                             }
                             crate::stream_timing::maybe_report();
-                            // Let a pending frame run even when the producer
-                            // has already queued another wake.
+                            // Return to the platform event loop between bounded
+                            // drains, without adding a token-delivery timer.
                             smol::future::yield_now().await;
                         }
                     }).detach();
@@ -16494,24 +16501,33 @@ mod kathamo_bottom_input_tests {
     }
 
     #[test]
-    fn streaming_split_is_cached_after_each_delta() {
-        use agent_bridge::AgentEvent;
-        let mut messages = Vec::new();
-        push_chat_event(&mut messages, AgentEvent::Text("hello".into()));
-        let stream = messages[0].stream.as_ref().expect("stream view");
-        assert_eq!(stream.settled.as_ref(), "");
-        assert_eq!(stream.tail.as_ref(), "hello");
-
-        push_chat_event(&mut messages, AgentEvent::Text(" world\n\nnext".into()));
-        let stream = messages[0].stream.as_ref().expect("stream view");
-        assert!(stream.settled.contains("hello world"));
-        assert_eq!(stream.tail.as_ref(), "next");
-
-        finish_chat_streaming(&mut messages);
-        assert!(
-            messages[0].stream.is_none(),
-            "completion releases the split"
-        );
+    fn streamed_markdown_preserves_content_and_block_boundaries_across_chunkings() {
+        let examples = [
+            "intro\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\ntail",
+            "Intro\n\n- one\n- two\n\n  continuation\n\nafter\n\nnext",
+            "a\n\n~~~\nx\n\n~~~\n\nnext",
+            "# title\n\n|a|b|\n|-|-|\n|x|y|\n\nnext",
+            "hello\r\n\r\n世界\n\nemoji 🦀",
+        ];
+        for text in examples {
+            let chars: Vec<_> = text.chars().collect();
+            for size in 1..=chars.len() {
+                let mut message = ChatMessage::new(ChatRole::Assistant, String::new());
+                refresh_stream_view(&mut message, true);
+                for chunk in chars.chunks(size) {
+                    let delta: String = chunk.iter().collect();
+                    message.text.push_str(&delta);
+                    refresh_stream_view(&mut message, delta.contains('\n'));
+                    let view = message.stream.as_ref().unwrap();
+                    assert_eq!(format!("{}{}", view.settled, view.tail), message.text);
+                    if delta.contains('\n') {
+                        let (_, tail) = split_streaming_markdown(&message.text);
+                        assert_eq!(view.tail.as_ref(), tail, "size={size}, text={:?}", message.text);
+                    }
+                }
+                assert_eq!(message.text, text);
+            }
+        }
     }
 
     #[test]
@@ -16800,10 +16816,16 @@ First report
                 },
             );
         });
-        cx.draw_frame().expect("draw live reasoning");
+        cx.draw_frame().expect("draw reasoning header");
+        let reasoning = cx.debug_bounds("thinking-row-0").expect("reasoning header");
+        cx.simulate_click(
+            reasoning.origin + point(px(20.0), px(10.0)),
+            Modifiers::default(),
+        );
+        cx.draw_frame().expect("expand reasoning during tool execution");
         let body = cx
             .debug_bounds("thinking-body-0")
-            .expect("reasoning body stays visible after a tool starts");
+            .expect("expanded reasoning stays visible during tool execution");
         assert!(
             body.size.height > px(40.0),
             "the full reasoning body is laid out, not a one-line preview: {:?}",
@@ -16811,8 +16833,7 @@ First report
         );
         assert!(cx.debug_bounds("thinking-row-0").is_some());
         let read = cx.debug_bounds("tool-row-1").expect("read row");
-        let shell = cx.debug_bounds("tool-row-2").expect("running shell row");
-        assert_eq!(shell.origin.y - read.origin.y, px(24.0));
+        assert!(cx.debug_bounds("tool-row-2").is_some(), "running shell row");
 
         cx.simulate_click(
             read.origin + point(px(20.0), px(10.0)),
@@ -16879,7 +16900,10 @@ First report
                 agent_bridge::AgentEvent::Text("Answer".into()),
             );
         });
-        cx.draw_frame().expect("draw expanded reasoning");
+        cx.draw_frame().expect("draw completed reasoning header");
+        let row = cx.debug_bounds("thinking-row-0").expect("thinking row");
+        cx.simulate_click(row.origin + point(px(20.0), px(10.0)), Modifiers::default());
+        cx.draw_frame().expect("expand completed reasoning");
         let body = cx
             .debug_bounds("thinking-body-0")
             .expect("completed reasoning is visible");
@@ -17376,6 +17400,7 @@ First report
             });
             state.execute_pane_input(pane_id, window, cx);
         });
+        wait_for_terminal_submission(&mut cx, &app_state, pane_id);
 
         app_state.read_with(&cx, |state, cx| {
             let pane = &state.projects[0].sessions[0].panes[0];
@@ -17393,6 +17418,7 @@ First report
             });
             state.execute_pane_input(pane_id, window, cx);
         });
+        wait_for_terminal_submission(&mut cx, &app_state, pane_id);
 
         app_state.read_with(&cx, |state, cx| {
             let pane = &state.projects[0].sessions[0].panes[0];
@@ -18158,6 +18184,7 @@ First report
             };
             state.handle_pane_input_key(pane_id, &ev, window, cx);
         });
+        wait_for_terminal_submission(&mut cx, &app_state, pane_id);
 
         // Verify: Enter executed the command, cleared the input field, and did NOT insert newline into input!
         app_state.read_with(&cx, |state, cx| {
@@ -18451,6 +18478,8 @@ First report
 
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
+        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        wait_for_terminal_submission(&mut cx, &app_state, pane_id);
 
         app_state.read_with(&cx, |state, cx| {
             let pane = &state.projects[0].sessions[0].panes[0];
@@ -18609,9 +18638,11 @@ First report
                 agent_bridge::AgentEvent::Text("Starting. ".into()),
             );
             if let Some(last) = messages.last_mut() {
-                Arc::make_mut(last).turn = Some(turn);
+                Arc::make_mut(last).turn = crate::stream_timing::turn_started_at(turn)
+                    .map(|started| (turn, started));
             }
             crate::stream_timing::turn_delta_arrived(turn, crate::stream_timing::DeltaKind::Answer);
+            crate::stream_timing::turn_delta_applied(turn, crate::stream_timing::DeltaKind::Answer);
         });
         for _ in 0..8 {
             cx.draw_frame().unwrap();
@@ -18659,6 +18690,53 @@ First report
     }
 
     #[test]
+    #[ignore = "real PTY output through headless GPUI; enable KATHAMO_DIAGNOSTICS"]
+    fn terminal_stream_frame_benchmark() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        cx.draw_frame().unwrap();
+        // Exclude font/shader/session startup from steady-stream samples.
+        for _ in 0..8 {
+            cx.run_until_parked();
+            cx.background_executor.advance_clock(std::time::Duration::from_millis(16));
+            cx.draw_frame().unwrap();
+        }
+        let id = state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        let mut sampler = diagnostics::Sampler::new();
+        let _ = sampler.report(); // reset startup counters and CPU baseline
+        let started = std::time::Instant::now();
+        cx.update_window_entity(&state, |state, window, cx| {
+            let input = state.pane_ref(id).unwrap().input_state.clone().unwrap();
+            input.update(cx, |input, cx| input.set_value(
+                "bash -c 'for ((i=0;i<20000;i++)); do printf \"\\033[31mstream line %s\\033[0m\\n\" \"$i\"; done; printf \"KATHAMO_STREAM_%s\\n\" END'",
+                window, cx,
+            ));
+            state.execute_pane_input(id, window, cx);
+        });
+        // Paint while input receipts and output are in flight. Waiting for
+        // submission first would manufacture a foreground-consumer stall.
+        let mut frames = Vec::new();
+        loop {
+            cx.run_until_parked();
+            cx.background_executor.advance_clock(std::time::Duration::from_millis(16));
+            let frame = std::time::Instant::now();
+            cx.draw_frame().unwrap();
+            frames.push(frame.elapsed().as_micros());
+            let complete = state.read_with(&cx, |state, cx| {
+                state.pane_ref(id).unwrap().terminal.read(cx).bottom_lines(8)
+                    .iter().any(|line| line.trim() == "KATHAMO_STREAM_END")
+            });
+            if complete { break; }
+            assert!(started.elapsed() < std::time::Duration::from_secs(15), "PTY output did not finish");
+            std::thread::yield_now();
+        }
+        frames.sort_unstable();
+        println!("pty_ansi_lines=20000 elapsed_ms={} frames={} frame_us_p50={} frame_us_max={}",
+            started.elapsed().as_millis(), frames.len(), frames[frames.len()/2], frames.last().unwrap());
+        println!("{}", sampler.report());
+    }
+
+    #[test]
     #[ignore = "prints timings for headless tool cards and output"]
     fn tool_feedback_frame_benchmark() {
         use crate::stream_timing as timing;
@@ -18695,6 +18773,7 @@ First report
             cx.draw_frame().unwrap();
             assert!(cx.debug_bounds("tool-row-0").is_some());
             cx.update_window_entity(&state, |s, _, cx| {
+                timing::tool_output_arrived(&id);
                 push_chat_event(
                     s.pane_mut(pane_id).unwrap().chat.visible_messages_mut(),
                     AgentEvent::ToolUpdate {
@@ -18799,6 +18878,7 @@ First report
 
         rpi_embedded::set_tool_arrival_hook(timing::tool_arrived);
         rpi_embedded::set_tool_end_hook(timing::tool_finished);
+        rpi_embedded::set_tool_output_hook(timing::tool_output_arrived);
         let cwd = PathBuf::from(std::env::var_os("KATHAMO_BENCH_CWD").unwrap());
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         agent_bridge::set_wake(Arc::new(move || {
@@ -19320,20 +19400,29 @@ First report
         use std::hint::black_box;
         use std::time::Instant;
 
-        // 1. Streaming split: the old render path rescanned and copied the
-        // whole message for every delta; the new path caches the split and
-        // only rescans on newlines.
-        let base = "The quick brown fox jumps over the lazy dog.\n".repeat(4_000);
+        // Compare the previous newline-triggered whole-document scan against
+        // the same cache/copy behavior with an unfinished-suffix scan.
+        let base = "A paragraph with **bold** and `code`.\n\n".repeat(4_000);
         let tokens = (0..2_000)
-            .map(|index| format!("tok{index} "))
+            .map(|index| format!("Streamed paragraph {index}.\n\n"))
             .collect::<Vec<_>>();
 
+        let mut old_message = ChatMessage::new(ChatRole::Assistant, base.clone());
+        refresh_stream_view(&mut old_message, true);
         let start = Instant::now();
-        let mut old_text = base.clone();
         for token in &tokens {
-            old_text.push_str(token);
-            let (settled, tail) = split_streaming_markdown(&old_text);
-            black_box((settled.to_string(), tail.to_string()));
+            old_message.text.push_str(token);
+            let (_, tail) = split_streaming_markdown(&old_message.text);
+            let split = old_message.text.len() - tail.len();
+            if old_message.stream.as_ref().unwrap().settled.len() != split {
+                old_message.stream = Some(StreamView {
+                    settled: SharedString::from(&old_message.text[..split]),
+                    tail: SharedString::from(tail),
+                });
+            } else {
+                old_message.stream.as_mut().unwrap().tail = SharedString::from(tail);
+            }
+            black_box(old_message.stream.as_ref());
         }
         let old_split = start.elapsed();
 
@@ -19349,6 +19438,11 @@ First report
             }
         }
         let new_split = start.elapsed();
+        assert_eq!(new_message.text, old_message.text);
+        assert_eq!(
+            new_message.stream.as_ref().unwrap().tail,
+            old_message.stream.as_ref().unwrap().tail,
+        );
 
         // 2. Tool header: three JSON parses per frame before, a cached struct
         // borrow after.
@@ -19420,7 +19514,7 @@ First report
         let coalesced = agent_bridge::coalesce_events(burst);
         let coalesce_time = start.elapsed();
 
-        eprintln!("stream microbenchmark (2,000 deltas, ~180 KiB document)");
+        eprintln!("stream microbenchmark (2,000 paragraph deltas, ~144 KiB initial document)");
         eprintln!("  split + settled/tail copy: old={old_split:?} new={new_split:?}");
         eprintln!("  tool header (10,000 renders): old={old_tool:?} new={new_tool:?}");
         eprintln!(

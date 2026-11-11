@@ -201,6 +201,7 @@ impl Sampler {
         let parse_bytes = parse_stats.bytes;
         let parse_max_bytes = parse_stats.max_bytes;
         let poll_ticks = take(&POLL_TICKS);
+        let output = terminal::diagnostics::take_output_stats();
         let poll_nanos = take(&POLL_NANOS);
         let poll_max = take(&POLL_MAX_NANOS);
         let poll_panes = take(&POLL_PANES);
@@ -243,6 +244,9 @@ impl Sampler {
              paint avg={paint_avg:.2}ms max={paint_max:.2}ms | \
              parse batches={parse_batches} avg={parse_avg:.2}ms max={parse_max:.2}ms \
              max batch={parse_max_kb:.0}KB ({parse_mbs:.0}MB/s) | \
+             pty queue max={output_queue_max:.2}ms chunks={output_backlog} \
+             read→paint avg={output_paint_avg:.2}ms max={output_paint_max:.2}ms \
+             parse→paint max={parse_paint_max:.2}ms | \
              poll ticks={poll_ticks} panes={poll_panes} avg={poll_avg:.3}ms max={poll_max:.3}ms \
              (scrape {scrape_avg:.3}ms, detect {detect_avg:.3}ms) | \
              fg {fg_ticks} avg={fg_avg:.3}ms max={fg_max:.3}ms | \
@@ -261,6 +265,11 @@ impl Sampler {
             } else {
                 0.0
             },
+            output_queue_max = output.queue_max_nanos as f64 / 1_000_000.0,
+            output_backlog = output.max_queued_chunks,
+            output_paint_avg = avg(output.read_to_paint_nanos, output.painted_batches),
+            output_paint_max = output.read_to_paint_max_nanos as f64 / 1_000_000.0,
+            parse_paint_max = output.parse_to_paint_max_nanos as f64 / 1_000_000.0,
             poll_avg = avg(poll_nanos, poll_ticks),
             poll_max = poll_max as f64 / 1_000_000.0,
             scrape_avg = avg(scrape_nanos, poll_ticks),

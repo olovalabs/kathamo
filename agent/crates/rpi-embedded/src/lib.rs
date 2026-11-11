@@ -179,17 +179,24 @@ pub fn providers() -> Result<Vec<ProviderState>, String> {
 
 static TOOL_ARRIVAL_HOOK: OnceLock<fn(&str)> = OnceLock::new();
 static TOOL_END_HOOK: OnceLock<fn(&str)> = OnceLock::new();
+static TOOL_OUTPUT_HOOK: OnceLock<fn(&str)> = OnceLock::new();
 
-/// Install a host callback invoked when a tool-start event reaches the embedded
-/// forwarder. Hosts use it to correlate RPC arrival with the first painted card.
+/// Install a host callback invoked before tool-start raw queue admission.
+/// Hosts use it to correlate transport arrival with the first painted card.
 /// It never changes agent behavior.
 pub fn set_tool_arrival_hook(hook: fn(&str)) {
     let _ = TOOL_ARRIVAL_HOOK.set(hook);
 }
 
-/// Install a host callback invoked when a tool-end event reaches the forwarder.
+/// Install a host callback invoked before tool-end raw queue admission.
 pub fn set_tool_end_hook(hook: fn(&str)) {
     let _ = TOOL_END_HOOK.set(hook);
+}
+
+/// Install metadata-only timing for the first nonempty tool snapshot before
+/// raw host-queue admission. Does not include tool-internal capture latency.
+pub fn set_tool_output_hook(hook: fn(&str)) {
+    let _ = TOOL_OUTPUT_HOOK.set(hook);
 }
 
 /// Events delivered to the host. This mirrors Kathamo's existing chat event
@@ -236,12 +243,25 @@ pub struct EventQueue<E> {
     ready: tokio::sync::Notify,
     available: tokio::sync::Notify,
     space: std::sync::Condvar,
+    timing: Option<QueueTiming>,
 }
 
 struct EventQueueState<E> {
     events: std::collections::VecDeque<E>,
     bytes: usize,
     closed: bool,
+    enqueued: Option<std::collections::VecDeque<std::time::Instant>>,
+}
+
+type PhaseHook = Arc<dyn Fn(&'static str, std::time::Duration) + Send + Sync>;
+
+struct QueueTiming {
+    hook: PhaseHook,
+    admission: &'static str,
+    lock: &'static str,
+    backpressure: &'static str,
+    residence: &'static str,
+    snapshot_dropped: &'static str,
 }
 
 pub const EVENT_QUEUE_RECORDS: usize = 256;
@@ -256,15 +276,51 @@ impl<E: QueuedEvent> Default for EventQueue<E> {
                 events: Default::default(),
                 bytes: 0,
                 closed: false,
+                enqueued: None,
             }),
             ready: tokio::sync::Notify::new(),
             available: tokio::sync::Notify::new(),
             space: std::sync::Condvar::new(),
+            timing: None,
         }
     }
 }
 
 impl<E: QueuedEvent> EventQueue<E> {
+    fn timed(hook: Option<&PhaseHook>, raw: bool) -> Self {
+        let mut queue = Self::default();
+        // Clock reads and timestamp storage are absent during normal operation.
+        if std::env::var_os("KATHAMO_STREAM_TIMINGS").is_some_and(|value| value != "0") {
+            if let Some(hook) = hook {
+                queue.timing = Some(QueueTiming {
+                    hook: Arc::clone(hook),
+                    admission: if raw { "queue.raw.admission" } else { "queue.projected.admission" },
+                    lock: if raw { "queue.raw.lock" } else { "queue.projected.lock" },
+                    backpressure: if raw { "queue.raw.backpressure" } else { "queue.projected.backpressure" },
+                    residence: if raw { "queue.raw.residence" } else { "queue.projected.residence" },
+                    snapshot_dropped: if raw { "queue.raw.snapshot_dropped" } else { "queue.projected.snapshot_dropped" },
+                });
+                queue.state.get_mut().unwrap_or_else(|e| e.into_inner()).enqueued = Some(Default::default());
+            }
+        }
+        queue
+    }
+
+    fn admission_finished(&self, started: Option<std::time::Instant>, blocked: bool, lock_wait: std::time::Duration) {
+        if let (Some(timing), Some(started)) = (&self.timing, started) {
+            let elapsed = started.elapsed();
+            (timing.hook)(timing.admission, elapsed);
+            (timing.hook)(timing.lock, lock_wait);
+            if blocked { (timing.hook)(timing.backpressure, elapsed); }
+        }
+    }
+
+    fn lock_state(&self) -> (std::sync::MutexGuard<'_, EventQueueState<E>>, std::time::Duration) {
+        let started = self.timing.as_ref().map(|_| std::time::Instant::now());
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        (guard, started.map_or(std::time::Duration::ZERO, |started| started.elapsed()))
+    }
+
     fn insert(state: &mut EventQueueState<E>, event: E) -> Result<(), E> {
         if state.closed {
             return Err(event);
@@ -286,47 +342,75 @@ impl<E: QueuedEvent> EventQueue<E> {
         }
         if let Some((index, _)) = replaced {
             state.events.remove(index);
+            if let Some(enqueued) = &mut state.enqueued { enqueued.remove(index); }
         }
         state.bytes = bytes.saturating_add(size);
         state.events.push_back(event);
+        if let Some(enqueued) = &mut state.enqueued { enqueued.push_back(std::time::Instant::now()); }
         Ok(())
     }
 
     pub async fn send(&self, mut event: E) -> Result<(), ()> {
+        let started = self.timing.as_ref().map(|_| std::time::Instant::now());
+        let mut blocked = false;
+        let mut lock_wait = std::time::Duration::ZERO;
         loop {
             let notified = self.ready.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             {
-                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let (mut state, elapsed) = self.lock_state();
+                lock_wait += elapsed;
                 if state.closed { return Err(()); }
                 match Self::insert(&mut state, event) {
-                    Ok(()) => { self.available.notify_one(); return Ok(()); }
+                    Ok(()) => {
+                        drop(state);
+                        self.available.notify_one();
+                        self.admission_finished(started, blocked, lock_wait);
+                        return Ok(());
+                    }
                     Err(pending) => event = pending,
+                    // The next wait yields without holding the queue mutex.
                 }
             }
+            blocked = true;
             notified.await;
         }
     }
 
     pub fn send_blocking(&self, mut event: E) -> Result<(), ()> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let started = self.timing.as_ref().map(|_| std::time::Instant::now());
+        let mut blocked = false;
+        let (mut state, lock_wait) = self.lock_state();
         loop {
             if state.closed { return Err(()); }
             match Self::insert(&mut state, event) {
-                Ok(()) => { self.available.notify_one(); return Ok(()); }
+                Ok(()) => {
+                    drop(state);
+                    self.available.notify_one();
+                    self.admission_finished(started, blocked, lock_wait);
+                    return Ok(());
+                }
                 Err(pending) => event = pending,
             }
+            blocked = true;
             state = self.space.wait(state).unwrap_or_else(|e| e.into_inner());
         }
     }
 
     /// Nonblocking admission for replaceable progress snapshots only.
     pub fn try_send(&self, event: E) -> Result<(), E> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        Self::insert(&mut state, event)?;
-        self.available.notify_one();
-        Ok(())
+        let started = self.timing.as_ref().map(|_| std::time::Instant::now());
+        let (mut state, lock_wait) = self.lock_state();
+        let result = Self::insert(&mut state, event);
+        drop(state);
+        self.admission_finished(started, false, lock_wait);
+        if result.is_ok() {
+            self.available.notify_one();
+        } else if let Some(timing) = &self.timing {
+            (timing.hook)(timing.snapshot_dropped, std::time::Duration::ZERO);
+        }
+        result
     }
 
     async fn recv(&self) -> Option<E> {
@@ -338,9 +422,13 @@ impl<E: QueuedEvent> EventQueue<E> {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(event) = state.events.pop_front() {
                     state.bytes -= event.queued_bytes();
+                    let enqueued = state.enqueued.as_mut().and_then(|times| times.pop_front());
                     drop(state);
                     self.ready.notify_waiters();
                     self.space.notify_all();
+                    if let (Some(timing), Some(enqueued)) = (&self.timing, enqueued) {
+                        (timing.hook)(timing.residence, enqueued.elapsed());
+                    }
                     return Some(event);
                 }
                 if state.closed { return None; }
@@ -355,6 +443,7 @@ impl<E: QueuedEvent> EventQueue<E> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut events = Vec::new();
         let mut bytes = 0usize;
+        let mut residence = Vec::new();
         while events.len() < POLL_RECORDS {
             let Some(front) = state.events.front() else { break };
             let size = front.queued_bytes();
@@ -362,11 +451,17 @@ impl<E: QueuedEvent> EventQueue<E> {
             bytes = bytes.saturating_add(size);
             state.bytes -= size;
             events.push(state.events.pop_front().expect("front exists"));
+            if let Some(enqueued) = state.enqueued.as_mut().and_then(|times| times.pop_front()) {
+                residence.push(enqueued.elapsed());
+            }
         }
         let more = !state.events.is_empty();
         drop(state);
         self.ready.notify_waiters();
         self.space.notify_all();
+        if let Some(timing) = &self.timing {
+            for elapsed in residence { (timing.hook)(timing.residence, elapsed); }
+        }
         (events, more)
     }
 
@@ -503,6 +598,11 @@ pub struct SessionOptions {
     /// host-queue admission rather than when the UI eventually polls.
     pub delta_arrival_hook: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     /// Host metadata hook for startup phases (resolve, session build, ready).
+    /// With `KATHAMO_STREAM_TIMINGS=1`, also records raw/projected queue
+    /// admission (including contention), mutex acquisition, residence, and
+    /// embedded projection durations. Backpressure labels count only admissions
+    /// that waited for capacity; snapshot-dropped labels are zero-duration counters.
+    /// Hooks run outside queue locks. They must remain lightweight.
     pub phase_hook: Option<Arc<dyn Fn(&'static str, std::time::Duration) + Send + Sync>>,
     pub before_tool_call: Option<BeforeToolCall>,
 }
@@ -587,23 +687,37 @@ struct QueuedCommand { command: Command, _charge: CommandCharge }
 /// Host wakeup callback shared with the worker and forwarder.
 ///
 /// The host uses this to be notified the moment an event is queued instead of
-/// discovering it on the next polling tick. Signals are coalesced by the host,
-/// so a burst of events only needs one wakeup.
+/// discovering it on the next polling tick. Coalesce before acquiring callback
+/// locks, rather than making every delta contend on the host's wake channel.
+/// The consumer acknowledges BEFORE draining so a racing enqueue cannot lose
+/// its wake. A bounded drain explicitly resignals any remaining backlog.
 #[derive(Clone, Default)]
-pub struct Wake(Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>);
+pub struct Wake(Arc<WakeState>);
+
+#[derive(Default)]
+struct WakeState {
+    callback: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    pending: AtomicBool,
+}
 
 impl Wake {
     pub fn set(&self, callback: Arc<dyn Fn() + Send + Sync>) {
-        if let Ok(mut slot) = self.0.lock() {
+        if let Ok(mut slot) = self.0.callback.lock() {
             *slot = Some(callback);
         }
+        self.acknowledge();
     }
 
     pub fn signal(&self) {
-        let callback = self.0.lock().ok().and_then(|slot| slot.clone());
+        if self.0.pending.swap(true, Ordering::AcqRel) { return; }
+        let callback = self.0.callback.lock().ok().and_then(|slot| slot.clone());
         if let Some(callback) = callback {
             callback();
         }
+    }
+
+    fn acknowledge(&self) {
+        self.0.pending.store(false, Ordering::Release);
     }
 }
 
@@ -624,7 +738,7 @@ impl EmbeddedSession {
     /// harness construction happen on the worker, and prompts sent meanwhile are
     /// queued.
     pub fn spawn(options: SessionOptions) -> Result<Self, String> {
-        let event_rx = Arc::new(EventQueue::default());
+        let event_rx = Arc::new(EventQueue::timed(options.phase_hook.as_ref(), false));
         let event_tx = Arc::clone(&event_rx);
         let (command_tx, command_rx) = tokio::sync::mpsc::channel(COMMAND_RECORDS);
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -658,8 +772,8 @@ impl EmbeddedSession {
         })
     }
 
-    /// Install the host's wakeup callback. It fires after each event (or
-    /// terminal status) reaches the session's event channel.
+    /// Install the host's wakeup callback. The first queued event wakes
+    /// immediately; further signals coalesce until the next bounded `poll`.
     pub fn set_wake(&mut self, callback: Arc<dyn Fn() + Send + Sync>) {
         self.wake.set(callback);
         self.wake.signal();
@@ -734,6 +848,7 @@ impl EmbeddedSession {
 
     /// Drain a bounded batch, rescheduling the host if more remains.
     pub fn poll(&mut self) -> Vec<SessionEvent> {
+        self.wake.acknowledge();
         let (events, more) = self.events.drain();
         if events.iter().any(|event| matches!(event, SessionEvent::Closed)) {
             self.closed = true;
@@ -904,7 +1019,7 @@ async fn run_session(
     // Embedded disables extensions. Replace only the unused CLI observer;
     // per-run durable/settling wrappers still wrap this host emitter.
     drop(broadcast_rx);
-    let pending = Arc::new(EventQueue::default());
+    let pending = Arc::new(EventQueue::timed(phase_hook.as_ref(), true));
     let emitter = Arc::new(HostEmitter {
         pending: Arc::clone(&pending), delta_arrival: delta_arrival_hook,
     });
@@ -951,6 +1066,9 @@ async fn run_session(
     let running = Arc::new(AtomicBool::new(false));
     let forward_running = Arc::clone(&running);
     let (finished, mut completions) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    let forward_timing = phase_hook.clone().filter(|_| {
+        std::env::var_os("KATHAMO_STREAM_TIMINGS").is_some_and(|value| value != "0")
+    });
     let forwarder = tokio::spawn(async move {
         let _reload = reload;
         loop {
@@ -959,7 +1077,12 @@ async fn run_session(
                 // must reach the UI before Done.
                 biased;
                 Some(event) = forward_pending.recv() => {
-                    if forward_tx.send(event.into_session()).await.is_err() {
+                    let started = forward_timing.as_ref().map(|_| std::time::Instant::now());
+                    let event = event.into_session();
+                    if let (Some(hook), Some(started)) = (&forward_timing, started) {
+                        hook("bridge.embedded.project", started.elapsed());
+                    }
+                    if forward_tx.send(event).await.is_err() {
                         forward_pending.close();
                         break;
                     }
@@ -1067,11 +1190,13 @@ fn pending_event(event: RpiEvent) -> Option<PendingEvent> {
             }
         }
         RpiEvent::ToolExecutionUpdate { tool_call_id, tool_name, partial_result, .. } => {
+            tool_output_arrived(&tool_call_id, &partial_result);
             let bytes = tool_call_id.len() + tool_name.len() + result_bytes(&partial_result);
             return Some(PendingEvent::Update { id: tool_call_id, name: tool_name, result: partial_result, bytes });
         }
         RpiEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
             if let Some(hook) = TOOL_END_HOOK.get() { hook(&tool_call_id); }
+            tool_output_arrived(&tool_call_id, &result);
             let bytes = tool_call_id.len() + tool_name.len() + result_bytes(&result);
             return Some(PendingEvent::End {
                 id: tool_call_id, name: tool_name, result, failed: is_error, bytes,
@@ -1086,6 +1211,23 @@ fn pending_event(event: RpiEvent) -> Option<PendingEvent> {
         _ => return None,
     };
     Some(PendingEvent::Ready(event))
+}
+
+fn tool_output_arrived(id: &str, result: &rpi_agent::AgentToolResult) {
+    if let Some(hook) = TOOL_OUTPUT_HOOK.get() {
+        // The rendered snapshot joins text blocks with newlines. Check without
+        // projecting/copying the cumulative tool result on the producer path.
+        let mut blocks = 0usize;
+        for content in &result.content {
+            if let rpi_agent::TextContentOrImage::Text(text) = content {
+                blocks += 1;
+                if !text.text.is_empty() || blocks > 1 {
+                    hook(id);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1422,6 +1564,109 @@ mod tests {
             admission: Mutex::new(()), shutting_down: Arc::new(AtomicBool::new(false)),
             session_id: Arc::new(Mutex::new(None)), wake: Wake::default(), closed: false,
         }, receiver)
+    }
+
+    #[test]
+    fn wake_coalesces_bursts_and_rearms_after_poll() {
+        let (mut session, _commands) = test_session(Arc::new(EventQueue::default()));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&wakes);
+        session.wake.set(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+        for _ in 0..10_000 { session.wake.signal(); }
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert!(session.poll().is_empty());
+        session.wake.signal();
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn wake_installation_and_replacement_rearm_preexisting_events() {
+        let queue = Arc::new(EventQueue::default());
+        let (mut session, _commands) = test_session(Arc::clone(&queue));
+        assert!(queue.try_send(SessionEvent::Text("before callback".into())).is_ok());
+        session.wake.signal(); // No callback yet; leaves a pending signal.
+        let first = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&first);
+        session.set_wake(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+        assert_eq!(first.load(Ordering::Relaxed), 1);
+        session.wake.signal();
+        assert_eq!(first.load(Ordering::Relaxed), 1);
+        let replacement = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&replacement);
+        session.set_wake(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+        assert_eq!(replacement.load(Ordering::Relaxed), 1);
+        assert_eq!(session.poll(), vec![SessionEvent::Text("before callback".into())]);
+        session.wake.signal();
+        assert_eq!(replacement.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn wake_callback_can_poll_and_reenter_without_holding_callback_lock() {
+        let queue = Arc::new(EventQueue::default());
+        let (session, _commands) = test_session(Arc::clone(&queue));
+        let session = Arc::new(Mutex::new(session));
+        let weak = Arc::downgrade(&session);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&wakes);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&received);
+        let callback = Arc::new(move || {
+            let index = count.fetch_add(1, Ordering::Relaxed);
+            let session = weak.upgrade().unwrap();
+            let wake = {
+                let mut session = session.lock().unwrap();
+                output.lock().unwrap().extend(session.poll());
+                session.wake.clone()
+            };
+            if index == 0 { wake.signal(); }
+        });
+        let wake = {
+            let session = session.lock().unwrap();
+            session.wake.set(callback);
+            session.wake.clone()
+        };
+        assert!(queue.try_send(SessionEvent::Text("first".into())).is_ok());
+        wake.signal();
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        assert!(queue.try_send(SessionEvent::Text("second".into())).is_ok());
+        wake.signal();
+        assert_eq!(wakes.load(Ordering::Relaxed), 3);
+        assert_eq!(*received.lock().unwrap(), vec![
+            SessionEvent::Text("first".into()), SessionEvent::Text("second".into()),
+        ]);
+    }
+
+    #[test]
+    fn enqueue_racing_poll_is_delivered_or_wakes_consumer() {
+        let queue = Arc::new(EventQueue::default());
+        let (mut session, _commands) = test_session(Arc::clone(&queue));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&wakes);
+        session.wake.set(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+        let boundary = Arc::new(std::sync::Barrier::new(2));
+        let producer_boundary = Arc::clone(&boundary);
+        let wake = session.wake.clone();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..2_000 {
+                producer_boundary.wait();
+                assert!(queue.try_send(SessionEvent::Text("delta".into())).is_ok());
+                wake.signal();
+                producer_boundary.wait();
+            }
+        });
+        for _ in 0..2_000 {
+            wakes.store(0, Ordering::Relaxed);
+            boundary.wait();
+            let events = session.poll();
+            boundary.wait();
+            if events.is_empty() {
+                assert!(wakes.load(Ordering::Relaxed) > 0, "queued delta lost its wake");
+                assert_eq!(session.poll(), vec![SessionEvent::Text("delta".into())]);
+            } else {
+                assert_eq!(events, vec![SessionEvent::Text("delta".into())]);
+            }
+        }
+        producer.join().unwrap();
     }
 
     #[tokio::test]

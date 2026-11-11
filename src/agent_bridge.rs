@@ -481,19 +481,29 @@ pub(crate) fn decode_tool_event(record: &Value) -> Option<AgentEvent> {
                 input: readable_value(&record["args"]),
             })
         }
-        "tool_execution_update" => Some(AgentEvent::ToolUpdate {
-            id,
-            name,
-            output: tool_output(&record["partialResult"]),
-        }),
+        "tool_execution_update" => {
+            let output = tool_output(&record["partialResult"]);
+            if !output.is_empty() {
+                if let Some(id) = id.as_deref() {
+                    crate::stream_timing::tool_output_arrived(id);
+                }
+            }
+            Some(AgentEvent::ToolUpdate { id, name, output })
+        }
         "tool_execution_end" => {
+            let output = tool_output(&record["result"]);
+            if !output.is_empty() {
+                if let Some(id) = id.as_deref() {
+                    crate::stream_timing::tool_output_arrived(id);
+                }
+            }
             if let Some(id) = id.as_deref() {
                 crate::stream_timing::tool_finished(id);
             }
             Some(AgentEvent::ToolEnd {
                 id,
                 name,
-                output: tool_output(&record["result"]),
+                output,
                 failed: record["isError"] == true,
             })
         }

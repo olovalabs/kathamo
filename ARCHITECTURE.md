@@ -233,6 +233,36 @@ Capability lookup is side-effect-free on the UI thread; extension capabilities
 are discovered in the background and cached per project. Cloud requests acquire
 AWS SDK credentials or Google ADC at request time, not during local discovery.
 
+### 2.9 Streaming presentation and diagnostics
+
+- Provider transports retain their existing immediate-first-delta behavior,
+  bounded event delivery and structural flushes. Embedded host wakes coalesce
+  per session before acquiring callback locks; polling acknowledges before a
+  bounded drain and resignals any backlog. No UI delivery timer is added.
+- Assistant boundary scanning starts at the unfinished Markdown suffix.
+  Conversation rows remain virtualized; measured row assembly did not justify
+  replacing that implementation.
+- `components/src/text/text_view.rs` parses Markdown/HTML and highlights code
+  on the background executor, including the first parse. Initial Markdown has
+  an immediate selectable native-text view. One desired document, one active
+  parse and one completed result bound pending work. Compatible append-only
+  completions publish monotonically; replacement/style/theme epochs prevent
+  stale content from another document from committing.
+- PTY parsing retains its 128 KiB cap and cooperative foreground scheduling.
+  Snapshot text groups cells into style runs without per-cell strings; search
+  painting selects row-local ranges from the ordered match list. One
+  cancellable timer delivers an owed throttled search refresh even if output
+  stops.
+- `KATHAMO_STREAM_TIMINGS=1` reports queue admission/lock/backpressure/residence,
+  projection, UI apply, Markdown parse/wait, first-token paint and first tool
+  snapshot-to-paint timings. `KATHAMO_DIAGNOSTICS=1` adds PTY read-to-parse,
+  queue depth, read-to-paint and parse-to-paint counters, CPU and RSS.
+  Paint timestamps end at CPU paint-command recording, not compositor scanout.
+
+See [STREAMING_PERFORMANCE.md](STREAMING_PERFORMANCE.md) for evidence,
+reproduction commands and measurement limitations.
+
+
 
 ---
 

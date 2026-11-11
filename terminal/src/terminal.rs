@@ -1,8 +1,8 @@
 //! Owner of the `alacritty_terminal` [`Term`] and the VTE [`Processor`].
 //!
-//! Everything that needs to touch the grid goes through [`TerminalState`], which
-//! keeps the terminal behind a `parking_lot::Mutex` so the PTY reader task and
-//! the UI thread can share it.
+//! Grid access goes through [`TerminalState`]'s `parking_lot::Mutex`, shared
+//! with deferred paint closures. The blocking PTY reader only queues raw bytes;
+//! the view's foreground task performs parsing and UI-state updates.
 
 use crate::agent_status::{AgentOscScanner, AgentStatusReport};
 use crate::colors::ColorPalette;
@@ -1021,5 +1021,80 @@ mod tests {
     fn buffer_text_of_an_empty_terminal_is_empty() {
         let terminal = state(20, 3);
         assert!(terminal.buffer_text(100).is_empty());
+    }
+
+    #[test]
+    fn streaming_chunks_preserve_ansi_unicode_modes_and_capture_order() {
+        let mut bytes = b"\x1b]133;B\x07echo sample\r\n\x1b]133;C\x07".to_vec();
+        for _ in 0..120 {
+            bytes.extend_from_slice("plain \u{754c} e\u{301} \x1b[1;31mred\x1b[0m\r\n".as_bytes());
+        }
+        bytes.extend_from_slice(b"\x1b[?1049h\x1b[Halternate\x1b[?1049l\x1b]133;D;0\x07");
+        let mut reference = state(80, 24);
+        let reference_events = reference.process_bytes(&bytes);
+        assert!(reference_events.iter().any(|event| matches!(event, ShellEvent::CommandFinished { .. })));
+        let reference_snapshot = reference.snapshot_buffer_lines(reference.palette(), false);
+        for chunk_size in [1, 7, 32_768, 131_072] {
+            let mut candidate = state(80, 24);
+            let mut events = Vec::new();
+            for chunk in bytes.chunks(chunk_size) {
+                events.extend(candidate.process_bytes(chunk));
+            }
+            assert_eq!(candidate.snapshot_buffer_lines(candidate.palette(), false), reference_snapshot);
+            assert_eq!(candidate.mode(), reference.mode());
+            assert_eq!(candidate.with_term(|term| term.grid().cursor.point),
+                reference.with_term(|term| term.grid().cursor.point));
+            let summarize = |events: Vec<ShellEvent>| {
+                events.into_iter().map(|mut event| {
+                    // Wall-clock duration differs with chunk size; every other
+                    // event field and its position in the sequence must agree.
+                    if let ShellEvent::CommandFinished { duration, .. } = &mut event {
+                        *duration = std::time::Duration::ZERO;
+                    }
+                    format!("{event:?}")
+                }).collect::<Vec<_>>()
+            };
+            assert_eq!(summarize(events), summarize(reference_events.clone()), "chunk size {chunk_size}");
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement; run with --release --ignored --nocapture"]
+    fn streaming_parse_batch_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for (name, seed, restore) in [
+            ("plain", b"ordinary streamed output with spaces\r\n".as_slice(), false),
+            ("ansi", b"\x1b[1;31mred\x1b[0m \x1b[4munderline\x1b[0m\r\n".as_slice(), false),
+            ("long_line", b"abcdefghij".as_slice(), false),
+            ("restoration", b"restored terminal output\r\n".as_slice(), true),
+        ] {
+            let bytes: Vec<_> = seed.iter().copied().cycle().take(128 * 1024).collect();
+            let mut terminal = state(120, 48);
+            let mut samples = Vec::with_capacity(101);
+            for index in 0..111 {
+                let start = Instant::now();
+                if restore {
+                    terminal.feed_raw(black_box(&bytes));
+                } else {
+                    black_box(terminal.process_bytes(black_box(&bytes)));
+                }
+                if index >= 10 {
+                    samples.push(start.elapsed().as_micros());
+                }
+            }
+            samples.sort_unstable();
+            eprintln!("{name} 128KiB batch: p50={}us p95={}us max={}us (101 samples, 10 warmups)",
+                samples[50], samples[95], samples[100]);
+            let mut reference = state(120, 48);
+            for _ in 0..111 {
+                for chunk in bytes.chunks(4_096) {
+                    reference.feed_raw(chunk);
+                }
+            }
+            assert_eq!(terminal.snapshot_buffer_lines(terminal.palette(), false),
+                reference.snapshot_buffer_lines(reference.palette(), false));
+            assert_eq!(terminal.mode(), reference.mode());
+        }
     }
 }

@@ -96,3 +96,89 @@ pub fn take_parse_stats() -> ParseStats {
         max_bytes: PARSE_MAX_BYTES.swap(0, Ordering::Relaxed),
     }
 }
+
+static QUEUED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static QUEUE_NANOS: AtomicU64 = AtomicU64::new(0);
+static QUEUE_MAX_NANOS: AtomicU64 = AtomicU64::new(0);
+static MAX_QUEUED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+static PAINTED_BATCHES: AtomicU64 = AtomicU64::new(0);
+static READ_TO_PAINT_NANOS: AtomicU64 = AtomicU64::new(0);
+static READ_TO_PAINT_MAX_NANOS: AtomicU64 = AtomicU64::new(0);
+static PARSE_TO_PAINT_NANOS: AtomicU64 = AtomicU64::new(0);
+static PARSE_TO_PAINT_MAX_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Oldest output awaiting a paint of this particular terminal, not another pane.
+pub(crate) struct PendingOutput {
+    read_at: Instant,
+    parsed_at: Instant,
+}
+
+#[inline]
+pub(crate) fn output_received() -> Option<Instant> {
+    enabled().then(Instant::now)
+}
+
+pub(crate) fn output_queued(read_at: Option<Instant>, queued_chunks: usize) {
+    let Some(read_at) = read_at else { return };
+    let nanos = read_at.elapsed().as_nanos() as u64;
+    QUEUED_BATCHES.fetch_add(1, Ordering::Relaxed);
+    QUEUE_NANOS.fetch_add(nanos, Ordering::Relaxed);
+    QUEUE_MAX_NANOS.fetch_max(nanos, Ordering::Relaxed);
+    MAX_QUEUED_CHUNKS.fetch_max(queued_chunks as u64, Ordering::Relaxed);
+}
+
+pub(crate) fn output_parsed(
+    pending: &parking_lot::Mutex<Option<PendingOutput>>,
+    read_at: Option<Instant>,
+) {
+    let Some(read_at) = read_at else { return };
+    pending.lock().get_or_insert_with(|| PendingOutput {
+        read_at,
+        parsed_at: Instant::now(),
+    });
+}
+
+pub(crate) fn output_painted(pending: &parking_lot::Mutex<Option<PendingOutput>>) {
+    if !enabled() {
+        return;
+    }
+    let Some(output) = pending.lock().take() else { return };
+    let now = Instant::now();
+    let read_nanos = now.duration_since(output.read_at).as_nanos() as u64;
+    let parse_nanos = now.duration_since(output.parsed_at).as_nanos() as u64;
+    PAINTED_BATCHES.fetch_add(1, Ordering::Relaxed);
+    READ_TO_PAINT_NANOS.fetch_add(read_nanos, Ordering::Relaxed);
+    READ_TO_PAINT_MAX_NANOS.fetch_max(read_nanos, Ordering::Relaxed);
+    PARSE_TO_PAINT_NANOS.fetch_add(parse_nanos, Ordering::Relaxed);
+    PARSE_TO_PAINT_MAX_NANOS.fetch_max(parse_nanos, Ordering::Relaxed);
+}
+
+/// Metadata-only output latency, aggregated across views. Queue time starts
+/// after Read completes, including bounded-channel backpressure and coalescing.
+/// Paint samples are the oldest pending output per painted view; hidden views
+/// intentionally retain that timestamp until they become visible again.
+pub struct OutputStats {
+    pub queued_batches: u64,
+    pub queue_nanos: u64,
+    pub queue_max_nanos: u64,
+    pub max_queued_chunks: u64,
+    pub painted_batches: u64,
+    pub read_to_paint_nanos: u64,
+    pub read_to_paint_max_nanos: u64,
+    pub parse_to_paint_nanos: u64,
+    pub parse_to_paint_max_nanos: u64,
+}
+
+pub fn take_output_stats() -> OutputStats {
+    OutputStats {
+        queued_batches: QUEUED_BATCHES.swap(0, Ordering::Relaxed),
+        queue_nanos: QUEUE_NANOS.swap(0, Ordering::Relaxed),
+        queue_max_nanos: QUEUE_MAX_NANOS.swap(0, Ordering::Relaxed),
+        max_queued_chunks: MAX_QUEUED_CHUNKS.swap(0, Ordering::Relaxed),
+        painted_batches: PAINTED_BATCHES.swap(0, Ordering::Relaxed),
+        read_to_paint_nanos: READ_TO_PAINT_NANOS.swap(0, Ordering::Relaxed),
+        read_to_paint_max_nanos: READ_TO_PAINT_MAX_NANOS.swap(0, Ordering::Relaxed),
+        parse_to_paint_nanos: PARSE_TO_PAINT_NANOS.swap(0, Ordering::Relaxed),
+        parse_to_paint_max_nanos: PARSE_TO_PAINT_MAX_NANOS.swap(0, Ordering::Relaxed),
+    }
+}

@@ -5959,7 +5959,11 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if provider == rpi_embedded::ANTIGRAVITY {
+        let Some(auth) = self.pane_ref(pane_id).and_then(|pane| pane.chat.auth.as_ref()) else {
+            return;
+        };
+        let methods = agent_auth::auth_methods(&provider, &auth.cwd);
+        if methods.oauth && !methods.api_key {
             self.start_agent_oauth(pane_id, provider, window, cx);
         } else {
             self.select_provider_for_auth(pane_id, provider, window, cx);
@@ -6162,7 +6166,7 @@ impl AppState {
                                 match event {
                                     agent_auth::LoginEvent::BrowserUrl(url) => {
                                         cx.open_url(&url);
-                                        auth.output.push_str("Complete Google sign-in in your browser.");
+                                        auth.output.push_str("Complete sign-in in your browser.");
                                     }
                                     agent_auth::LoginEvent::Output(text) => {
                                         auth.output.push_str(&text);
@@ -9909,8 +9913,9 @@ impl AppState {
                                     })
                                     .when_some(auth.selected.as_ref(), |view, selected| {
                                         let provider_name = selected;
-                                        let supports_oauth = selected != "google";
-                                        let supports_api_key = selected != rpi_embedded::ANTIGRAVITY;
+                                        let methods = agent_auth::auth_methods(selected, &auth.cwd);
+                                        let supports_oauth = methods.oauth;
+                                        let supports_api_key = methods.api_key;
                                         let primary_var = agent_auth::key_label(selected);
                                         let is_connected = auth.providers.iter().any(|p| p.id == *selected && p.ready);
 
@@ -10031,7 +10036,7 @@ impl AppState {
                                                             .flex()
                                                             .items_center()
                                                             .justify_center()
-                                                            .child(if is_connected { "Re-authenticate with OAuth" } else { "Connect with OAuth (Browser)" })
+                                                            .child(if is_connected { "Re-authenticate with OAuth" } else { "Connect with OAuth" })
                                                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
                                                                 cx.stop_propagation();
                                                                 this.start_agent_oauth(pane_id, login_id.clone(), window, cx);

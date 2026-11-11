@@ -31,29 +31,93 @@ impl ProviderFactory for ProtocolFactory {
             "https://api.openai.com/v1"
         };
         let http = provider_http_client(&models, fallback, settings, values)?;
-        let provider: Arc<dyn Provider> = match self.0 {
-            rpi_ai::Api::AnthropicMessages => Arc::new(
-                AnthropicProvider::with_models_without_env_api_key(None, http, models),
-            ),
-            rpi_ai::Api::OpenaiCompletions => {
-                Arc::new(OpenAiCompletionsProvider::with_models_without_env_api_key(
-                    provider_id,
-                    None,
-                    http,
-                    models,
-                ))
+        let requires_auth = crate::catalog::builtin_provider(provider_id)
+            .map(|provider| provider.requires_auth).unwrap_or(true);
+        let provider: Arc<dyn Provider> = match &self.0 {
+            rpi_ai::Api::AnthropicMessages => {
+                if !requires_auth {
+                    Arc::new(AnthropicProvider::with_models_without_auth(http.clone(), models))
+                } else {
+                    Arc::new(AnthropicProvider::with_models_without_env_api_key(None, http.clone(), models))
+                }
             }
-            rpi_ai::Api::OpenaiResponses => {
-                Arc::new(OpenAiResponsesProvider::with_models_without_env_api_key(
-                    provider_id,
-                    None,
-                    http,
-                    models,
-                ))
+            rpi_ai::Api::OpenaiCompletions => {
+                if !requires_auth {
+                    Arc::new(OpenAiCompletionsProvider::with_models_without_auth(
+                        provider_id, http.clone(), models,
+                    ))
+                } else {
+                    Arc::new(OpenAiCompletionsProvider::with_models_without_env_api_key(
+                        provider_id, None, http.clone(), models,
+                    ))
+                }
+            }
+            rpi_ai::Api::OpenaiResponses | rpi_ai::Api::OpenaiCodexResponses => {
+                if !requires_auth {
+                    Arc::new(OpenAiResponsesProvider::with_models_without_auth(
+                        provider_id, http.clone(), models,
+                    ))
+                } else {
+                    Arc::new(OpenAiResponsesProvider::with_models_without_env_api_key(
+                        provider_id, None, http.clone(), models,
+                    ))
+                }
+            }
+            rpi_ai::Api::AzureOpenaiResponses => Arc::new(
+                rpi_ai::providers::azure::AzureProvider::with_models_without_env_api_key(
+                    provider_id, None, http.clone(), models,
+                ),
+            ),
+            rpi_ai::Api::GoogleGenerativeAi | rpi_ai::Api::GoogleVertex => Arc::new(
+                rpi_ai::providers::google::GoogleProvider::with_models_without_env_api_key(
+                    provider_id, None, http.clone(), models,
+                ),
+            ),
+            rpi_ai::Api::BedrockConverseStream => Arc::new(
+                rpi_ai::providers::bedrock::BedrockProvider::with_models_without_env_api_key(
+                    provider_id, None, http.clone(), models,
+                ),
+            ),
+            rpi_ai::Api::Other(api) if api == "google-gemini-cli" => Arc::new(
+                rpi_ai::providers::google::GoogleProvider::with_models_without_env_api_key(
+                    provider_id, None, http.clone(), models,
+                ),
+            ),
+            rpi_ai::Api::Other(api) if api == "cursor-agent" => Arc::new(
+                rpi_ai::providers::cursor::CursorProvider::with_models_without_env_api_key(
+                    provider_id, None, http.clone(), models,
+                ),
+            ),
+            rpi_ai::Api::Other(api) if api == "devin-agent" => Arc::new(
+                rpi_ai::providers::devin::DevinProvider::with_models_without_env_api_key(
+                    provider_id, None, http.clone(), models,
+                ),
+            ),
+            rpi_ai::Api::Other(api) if api == "ollama-chat" => Arc::new(
+                rpi_ai::providers::openai_completions::ollama::OllamaProvider::with_models_without_env_api_key(
+                    provider_id, None, http.clone(), models,
+                ),
+            ),
+            rpi_ai::Api::Other(api) if api == "openrouter" => {
+                if !requires_auth {
+                    Arc::new(OpenAiCompletionsProvider::with_models_without_auth(
+                        provider_id, http.clone(), models,
+                    ))
+                } else {
+                    Arc::new(OpenAiCompletionsProvider::with_models_without_env_api_key(
+                        provider_id, None, http.clone(), models,
+                    ))
+                }
             }
             _ => unreachable!("only supported wire protocols are registered"),
         };
-        Ok(provider)
+        if matches!(provider_id, "github-copilot" | "gitlab-duo" | "cloudflare-ai-gateway" | "alibaba-coding-plan" | "alibaba-token-plan" | "coreweave" | "snowflake")
+            || self.0 == rpi_ai::Api::OpenaiCodexResponses
+        {
+            Ok(Arc::new(rpi_ai::providers::routed::RoutedProvider::new(provider, http)))
+        } else {
+            Ok(provider)
+        }
     }
 }
 
@@ -83,6 +147,16 @@ impl Default for RuntimeFactories {
             rpi_ai::Api::AnthropicMessages,
             rpi_ai::Api::OpenaiCompletions,
             rpi_ai::Api::OpenaiResponses,
+            rpi_ai::Api::OpenaiCodexResponses,
+            rpi_ai::Api::AzureOpenaiResponses,
+            rpi_ai::Api::GoogleGenerativeAi,
+            rpi_ai::Api::GoogleVertex,
+            rpi_ai::Api::BedrockConverseStream,
+            rpi_ai::Api::Other("google-gemini-cli".into()),
+            rpi_ai::Api::Other("cursor-agent".into()),
+            rpi_ai::Api::Other("devin-agent".into()),
+            rpi_ai::Api::Other("ollama-chat".into()),
+            rpi_ai::Api::Other("openrouter".into()),
         ]
         .into_iter()
         .map(|api| {
@@ -329,9 +403,28 @@ impl Provider for ConfiguredProvider {
             );
             return error_stream(model, id, message).await;
         }
-        let Some((model, options)) = self.binding.prepare(model, options) else {
+        let Some((model, mut options)) = self.binding.prepare(model, options) else {
             return unbound_model_error(model, &self.id).await;
         };
+        let explicit_auth = options.api_key.is_some()
+            || [model.headers.as_ref(), options.headers.as_ref()]
+                .into_iter().flatten().any(|headers| headers.keys().any(|name| {
+                    ["authorization", "x-api-key", "api-key", "x-omp-aws-access-key-id"]
+                        .iter().any(|auth| name.eq_ignore_ascii_case(auth))
+                }));
+        if !explicit_auth && (self.id == "google-vertex" || matches!(model.api, rpi_ai::Api::GoogleVertex | rpi_ai::Api::BedrockConverseStream)) {
+            match crate::cloud_auth::request_headers(&self.id).await {
+                Ok(mut headers) => {
+                    if let Some(overrides) = options.headers.take() {
+                        for (name, value) in overrides {
+                            rpi_ai::provider::set_http_header(&mut headers, &name, Some(&value));
+                        }
+                    }
+                    options.headers = Some(headers);
+                }
+                Err(error) => return error_stream(&model, &self.id, error).await,
+            }
+        }
         self.inner.stream_simple(&model, context, &options).await
     }
 }

@@ -230,6 +230,21 @@ async fn account(
     })
 }
 
+pub(crate) fn models() -> Vec<rpi_ai::Model> {
+    let mut models = antigravity::models();
+    if let Some(provider) = rpi_runtime::catalog::builtin_provider(ID) {
+        for model in &provider.models {
+            if !models.iter().any(|known| known.id == model.id) {
+                let mut model = model.clone();
+                model.api = rpi_ai::Api::GoogleGenerativeAi;
+                model.base_url = ENDPOINT.into();
+                models.push(model);
+            }
+        }
+    }
+    models
+}
+
 pub(crate) fn resolve(model: Option<&str>) -> Result<rpi_runtime::provider::ResolvedModel, String> {
     let path = auth_path()?;
     if read(&path)?.is_none() {
@@ -243,15 +258,16 @@ pub(crate) fn resolve(model: Option<&str>) -> Result<rpi_runtime::provider::Reso
         Box::pin(async move { account(&http, &path, rejected).await }) as _
     });
     let mut factories = rpi_runtime::provider::RuntimeFactories::default();
-    let descriptors = antigravity::models();
+    let descriptors = models();
     let api = descriptors[0].api.clone();
+    let provider = AntigravityProvider::with_models(http, source, descriptors.clone());
     factories.declare(rpi_runtime::ProviderDeclaration {
         id: ID.into(),
         models: descriptors,
         api_key_env: None,
         requires_auth: false,
     });
-    factories.register(Arc::new(AntigravityProvider::new(http, source)), api);
+    factories.register(Arc::new(provider), api);
     rpi_runtime::RuntimeConfig::default()
         .resolve(
             &rpi_runtime::ModelRequest {

@@ -34,7 +34,7 @@ pub const DEFAULT_MODEL_ID: &str = "claude-opus-4-8";
 /// Core provider defaults, checked before the first authenticated catalog entry.
 /// Other providers own their default catalog ordering through their package.
 const DEFAULT_MODELS_PER_PROVIDER: &[(&str, &str)] =
-    &[("anthropic", DEFAULT_MODEL_ID), ("openai", "gpt-5.5")];
+    &[("anthropic", DEFAULT_MODEL_ID), ("openai", "gpt-6-astra")];
 
 /// The default thinking level when neither `--thinking` nor a `:level` suffix
 /// is present. Mirrors the TS `DEFAULT_THINKING_LEVEL` (`"medium"`, clamped to
@@ -146,7 +146,7 @@ pub enum ResolveError {
 
 /// Validate configured endpoints and build a client whose proxy routing uses
 /// each request URL, including NO_PROXY and scheme-specific proxy settings.
-fn provider_http_client(
+pub(crate) fn provider_http_client(
     models: &[Model],
     default_base_url: &str,
     settings: &RuntimeSettings,
@@ -301,6 +301,9 @@ pub(crate) fn resolve_with_factories(
     // Snapshot the full (un-retained) catalog so auxiliary provider runtimes
     // for `/model` hot-switching can be built after the selected one.
     let mut full_catalog = catalog.clone();
+    if cli_model.is_none() {
+        catalog.retain(crate::catalog::is_chat_model);
+    }
 
     if let Some(api) = &request.api {
         catalog.retain(|model| &model.api == api);
@@ -510,6 +513,14 @@ pub(crate) fn resolve_with_factories(
     // ---- Provider build ----
     let selected_api = model.api.clone();
     let selected_provider = model.provider.clone();
+    if !crate::catalog::is_chat_model(&model) {
+        let kind = crate::catalog::model_metadata(&model.provider, &model.id)
+            .map(|metadata| metadata.kind.as_str()).unwrap_or("non-chat");
+        return Err(ResolveError::UnsupportedApi {
+            provider: selected_provider.clone(),
+            api: format!("{kind} task via {}", selected_api.as_str()),
+        });
+    }
     if let Some(base) = &cli_base_url_override {
         model.base_url = base.clone();
         for candidate in &mut full_catalog {
@@ -577,6 +588,9 @@ pub(crate) fn resolve_with_factories(
         let mut seen: Vec<(String, rpi_ai::Api)> =
             vec![(selected_provider.clone(), selected_api.clone())];
         for candidate in &full_catalog {
+            if !crate::catalog::is_chat_model(candidate) {
+                continue;
+            }
             let key = (candidate.provider.clone(), candidate.api.clone());
             if seen.contains(&key) {
                 continue;
@@ -620,7 +634,7 @@ pub(crate) fn resolve_with_factories(
             if !authed {
                 continue;
             }
-            let (runtime, _, _) = build_runtime(
+            match build_runtime(
                 &candidate.provider,
                 &candidate.api,
                 &full_catalog,
@@ -629,8 +643,14 @@ pub(crate) fn resolve_with_factories(
                 settings,
                 values,
                 factories,
-            )?;
-            providers.push(runtime);
+            ) {
+                Ok((runtime, _, _)) => providers.push(runtime),
+                // Metadata-only or host-extension APIs must not prevent an
+                // unrelated native provider from resolving. Direct selection
+                // still returns the factory's truthful UnsupportedApi error.
+                Err(ResolveError::UnsupportedApi { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -647,7 +667,7 @@ pub(crate) fn resolve_with_factories(
         .descriptors()
         .iter()
         .find(|candidate| {
-            candidate.api == model.api && candidate.id.eq_ignore_ascii_case(&model.id)
+            candidate.api == model.api && candidate.id == model.id
         })
         .expect("selected model is bound")
         .clone();
@@ -736,10 +756,11 @@ fn build_runtime(
     factories: &RuntimeFactories,
 ) -> Result<BoundRuntime, ResolveError> {
     let (anthropic_credential, openai_key) = credentials;
-    let anonymous = factories
-        .manifests
-        .iter()
-        .any(|manifest| manifest.id == provider_id && !manifest.requires_auth);
+    let anonymous = factories.manifests.iter().find(|manifest| manifest.id == provider_id)
+        .map(|manifest| !manifest.requires_auth)
+        .unwrap_or_else(|| crate::catalog::builtin_provider(provider_id)
+            .is_some_and(|provider| !provider.requires_auth))
+        || crate::cloud_auth::configured(provider_id, values).is_some();
     let provider_has_auth = anthropic_credential.is_some() || openai_key.is_some() || anonymous;
     let models = catalog
         .iter()
@@ -773,7 +794,7 @@ pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
         // and gateway providers can expose a broader catalog. The selector
         // must only offer models the current lane can actually route to.
         .filter(|m| m.api == *selected_api && m.provider == *selected_provider)
-        .filter(|m| seen.insert((m.api.clone(), m.provider.clone(), m.id.to_ascii_lowercase())))
+        .filter(|m| seen.insert((m.api.clone(), m.provider.clone(), m.id.clone())))
         .cloned()
         .collect()
 }
@@ -786,7 +807,7 @@ pub fn authenticated_catalog(resolved: &ResolvedModel) -> Vec<Model> {
         .providers
         .iter()
         .flat_map(|provider| provider.models())
-        .filter(|m| seen.insert((m.api.clone(), m.provider.clone(), m.id.to_ascii_lowercase())))
+        .filter(|m| seen.insert((m.api.clone(), m.provider.clone(), m.id.clone())))
         .cloned()
         .collect()
 }
@@ -829,7 +850,7 @@ fn apply_manifest_defaults(
             let first = manifest.models.first();
             let config = serde_json::from_value(serde_json::json!({
                 "api": first.map(|model| model.api.as_str()),
-                "baseUrl": first.map(|model| model.base_url.as_str()), "models":[]
+                "models":[]
             }))
             .expect("provider config defaults");
             models_cfg.providers.insert(manifest.id.clone(), config);
@@ -841,11 +862,9 @@ fn apply_manifest_defaults(
             config
                 .api
                 .get_or_insert_with(|| default.api.as_str().to_string());
-            config
-                .base_url
-                .get_or_insert_with(|| default.base_url.clone());
         }
     }
+    crate::catalog::apply_defaults(models_cfg);
 }
 
 pub(crate) fn builtin_catalog() -> Vec<Model> {
@@ -873,6 +892,22 @@ pub(crate) fn builtin_catalog() -> Vec<Model> {
         config::provider_to_models("google", &google, &BTreeMap::new())
             .expect("Gemini uses the OpenAI completions protocol"),
     );
+    let mut known: std::collections::BTreeSet<_> = catalog.iter()
+        .map(|model| (model.provider.clone(), model.id.clone()))
+        .collect();
+    for provider in crate::catalog::builtin_providers() {
+        for model in &provider.models {
+            if known.insert((model.provider.clone(), model.id.clone())) {
+                let mut model = model.clone();
+                let overrides = model.headers.take().unwrap_or_default();
+                if !provider.headers.is_empty() {
+                    model.headers = Some(provider.headers.clone());
+                }
+                merge_auth_headers(&mut model, &overrides);
+                catalog.push(model);
+            }
+        }
+    }
     catalog
 }
 
@@ -903,6 +938,21 @@ fn build_catalog(
     values: &dyn ValueSource,
 ) -> Vec<Model> {
     let mut catalog = builtin_catalog();
+    for model in &mut catalog {
+        if let Some(provider) = crate::catalog::builtin_provider(&model.provider) {
+            if cfg.providers.get(&model.provider).is_some_and(|config| config.base_url.is_some())
+                || provider.base_url_env.as_ref().and_then(|name| values.env(name)).is_some()
+            {
+                model.base_url = crate::catalog::configured_base_url(provider, cfg, values);
+            }
+        }
+        if let Some(headers) = cfg.providers.get(&model.provider).and_then(|config| config.headers.as_ref()) {
+            merge_auth_headers(model, &crate::values::resolve_headers(headers, None, values));
+        }
+    }
+    let mut positions: BTreeMap<_, _> = catalog.iter().enumerate()
+        .map(|(index, model)| ((model.provider.clone(), model.id.clone(), model.api.as_str().to_owned()), index))
+        .collect();
     for manifest in manifests {
         let config = cfg.providers.get(&manifest.id);
         for mut model in manifest.models.clone() {
@@ -915,17 +965,25 @@ fn build_catalog(
                     &crate::values::resolve_headers(headers, None, values),
                 );
             }
-            catalog.push(model);
+            let key = (model.provider.clone(), model.id.clone(), model.api.as_str().to_owned());
+            if let Some(index) = positions.get(&key) {
+                catalog[*index] = model;
+            } else {
+                positions.insert(key, catalog.len());
+                catalog.push(model);
+            }
         }
     }
     merge_user_catalog(&mut catalog, cfg, values);
+    let endpoint_defaults = crate::catalog::EndpointDefaults::new(values);
+    for model in &mut catalog { endpoint_defaults.apply(model, cfg); }
     catalog
 }
 
 /// Merge `~/.rpi/models.json` providers into the built-in catalog. Models from
-/// the same runtime provider and API replace entries with the same id; models
-/// with the same id under different OpenAI-compatible providers remain
-/// distinct so `provider/id` can select the intended endpoint.
+/// the same runtime provider replace entries with the same id, including an
+/// explicitly changed wire API. Models from different providers stay distinct
+/// so `provider/id` continues selecting the intended endpoint.
 fn merge_user_catalog(
     catalog: &mut Vec<Model>,
     cfg: &config::ModelsConfig,
@@ -938,9 +996,7 @@ fn merge_user_catalog(
         };
         for m in models {
             if let Some(existing) = catalog.iter_mut().find(|candidate| {
-                candidate.api == m.api
-                    && candidate.provider == m.provider
-                    && candidate.id.eq_ignore_ascii_case(&m.id)
+                candidate.provider == m.provider && candidate.id.eq_ignore_ascii_case(&m.id)
             }) {
                 *existing = m;
             } else {
@@ -987,10 +1043,22 @@ fn resolve_anthropic_credentials_with(
 ) -> AnthropicCredentials {
     let mut provider_ids = vec![DEFAULT_PROVIDER_ID.to_string()];
     for (provider_id, provider_cfg) in &cfg.providers {
-        if config::provider_is_anthropic_compatible(provider_cfg)
+        if (config::provider_is_anthropic_compatible(provider_cfg)
+            || crate::catalog::builtin_provider(provider_id).is_some_and(|provider| {
+                provider.models.iter().any(|model| model.api == rpi_ai::Api::AnthropicMessages)
+            })
+            || manifests.iter().filter(|manifest| manifest.id == *provider_id)
+                .any(|manifest| manifest.models.iter().any(|model| model.api == rpi_ai::Api::AnthropicMessages)))
             && !provider_ids.iter().any(|known| known == provider_id)
         {
             provider_ids.push(provider_id.clone());
+        }
+    }
+    for manifest in manifests {
+        if manifest.models.iter().any(|model| model.api == rpi_ai::Api::AnthropicMessages)
+            && !provider_ids.contains(&manifest.id)
+        {
+            provider_ids.push(manifest.id.clone());
         }
     }
 
@@ -1052,11 +1120,8 @@ fn resolve_openai_credentials_with(
     refreshable: &dyn Fn(&str) -> bool,
 ) -> OpenAiCredentials {
     let mut provider_ids = vec!["openai".to_string()];
-    for (provider_id, provider_cfg) in &cfg.providers {
-        if (config::provider_is_openai_completions(provider_cfg)
-            || config::provider_is_openai_responses(provider_cfg))
-            && !provider_ids.contains(provider_id)
-        {
+    for provider_id in cfg.providers.keys() {
+        if !provider_ids.contains(provider_id) {
             provider_ids.push(provider_id.clone());
         }
     }
@@ -1079,7 +1144,10 @@ fn resolve_openai_credentials_with(
         );
         // Anthropic keys are represented by their own map, preserving bearer vs
         // x-api-key semantics. Anonymous declarations apply to every protocol.
-        if provider_cfg.is_some_and(config::provider_is_anthropic_compatible) {
+        let has_non_anthropic_models = crate::catalog::builtin_provider(&provider_id)
+            .is_some_and(|provider| provider.models.iter().any(|model| model.api != rpi_ai::Api::AnthropicMessages))
+            || manifest.is_some_and(|manifest| manifest.models.iter().any(|model| model.api != rpi_ai::Api::AnthropicMessages));
+        if provider_cfg.is_some_and(config::provider_is_anthropic_compatible) && !has_non_anthropic_models {
             if matches!(
                 resolved.source,
                 crate::credentials::CredentialSource::Anonymous
@@ -1091,7 +1159,7 @@ fn resolve_openai_credentials_with(
         } else if matches!(
             resolved.source,
             crate::credentials::CredentialSource::Anonymous
-        ) {
+        ) || crate::cloud_auth::configured(&provider_id, values).is_some() {
             credentials.insert(provider_id, OpenAiCredential::Anonymous);
         }
     }
@@ -1197,19 +1265,18 @@ fn split_model_pattern(
     })
 }
 
-/// Case-insensitive exact id match, optionally scoped to a provider.
+/// Prefer an exact wire id, with case-insensitive lookup as a typing convenience.
 fn find_model(
     pattern: &str,
     provider: Option<&str>,
     catalog: &[Model],
     cfg: &config::ModelsConfig,
 ) -> Option<Model> {
-    catalog
-        .iter()
-        .find(|model| {
-            model.id.eq_ignore_ascii_case(pattern)
-                && provider.map_or(true, |requested| provider_matches(model, requested, cfg))
-        })
+    let belongs = |model: &&Model| {
+        provider.is_none_or(|requested| provider_matches(model, requested, cfg))
+    };
+    catalog.iter().filter(belongs).find(|model| model.id == pattern)
+        .or_else(|| catalog.iter().filter(belongs).find(|model| model.id.eq_ignore_ascii_case(pattern)))
         .cloned()
 }
 
@@ -1225,13 +1292,16 @@ fn find_cli_model(
     anthropic_credentials: &AnthropicCredentials,
     openai_credentials: &OpenAiCredentials,
 ) -> Result<Option<Model>, ResolveError> {
-    let exact_matches: Vec<&Model> = catalog
+    let mut exact_matches: Vec<&Model> = catalog
         .iter()
         .filter(|model| {
             model.id.eq_ignore_ascii_case(pattern)
                 && provider.map_or(true, |requested| provider_matches(model, requested, cfg))
         })
         .collect();
+    if exact_matches.iter().any(|model| model.id == pattern) {
+        exact_matches.retain(|model| model.id == pattern);
+    }
 
     match exact_matches.as_slice() {
         [] => Ok(None),
@@ -1433,6 +1503,22 @@ fn pick_default_model(
                 )
         }) {
             return model.clone();
+        }
+    }
+
+    // Explicit model lists retain their declaration order even when a newly
+    // bundled provider introduces other models under the same identity.
+    for (provider, config) in &models_cfg.providers {
+        for declared in &config.models {
+            if let Some(model) = catalog.iter().find(|model| {
+                model.provider == *provider
+                    && model.id.eq_ignore_ascii_case(&declared.id)
+                    && model_is_authed_for_resolution(
+                        model, anthropic_credentials, openai_credentials, has_cli_key,
+                    )
+            }) {
+                return model.clone();
+            }
         }
     }
 

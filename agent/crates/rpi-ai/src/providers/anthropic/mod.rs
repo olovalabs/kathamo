@@ -6,10 +6,8 @@
 //! stream are optional deps). The smoke test behind the `smoke` feature drives
 //! a live request against `ANTHROPIC_API_KEY`.
 //!
-//! v1 scope is API-key auth only; OAuth/Copilot identity headers and the
-//! Claude-Code system-prompt stealth prefix are TODO (see plan §5.16). The
-//! `is_oauth` flag flows through `build_params` so enabling them later is a
-//! localized change, not a re-plumb of the stream path.
+//! API-key and subscription OAuth authentication share the Messages transport.
+//! OAuth adds the required bearer, beta, CLI identity, and system identity.
 
 pub mod build_params;
 pub mod cache_control;
@@ -173,9 +171,8 @@ impl Drop for ProviderRequestDiagnostics {
 /// surface in `api/anthropic-messages.ts` (`stream` + `streamSimple`) +
 /// `providers/anthropic.ts`.
 ///
-/// v1 is API-key auth only: the resolved key is sent as `x-api-key`. OAuth
-/// (`sk-ant-oat*` bearer tokens, Claude Code identity headers) and Copilot
-/// (`github-copilot` provider, bearer + dynamic headers) paths are TODO.
+/// Supports API keys, subscription OAuth bearer tokens, and gateway-owned
+/// authentication headers.
 /// Construct via [`AnthropicProvider::new`] or [`AnthropicProvider::from_env`].
 pub struct AnthropicProvider {
     /// Default API key, used when `SimpleStreamOptions::api_key` is `None`.
@@ -185,6 +182,7 @@ pub struct AnthropicProvider {
     /// Anthropic environment variable. Custom provider identities must disable
     /// this or an official Anthropic key could be sent to their endpoint.
     allow_env_api_key: bool,
+    require_auth: bool,
     http: reqwest::Client,
     models: Vec<Model>,
 }
@@ -197,6 +195,7 @@ impl AnthropicProvider {
         Self {
             api_key,
             allow_env_api_key: true,
+            require_auth: true,
             http,
             models: anthropic_models(),
         }
@@ -207,6 +206,7 @@ impl AnthropicProvider {
         Self {
             api_key,
             allow_env_api_key: true,
+            require_auth: true,
             http,
             models,
         }
@@ -226,9 +226,17 @@ impl AnthropicProvider {
         Self {
             api_key,
             allow_env_api_key: false,
+            require_auth: true,
             http,
             models,
         }
+    }
+
+    /// Explicit anonymous authentication for catalog-approved gateway routes.
+    pub fn with_models_without_auth(http: reqwest::Client, models: Vec<Model>) -> Self {
+        let mut provider = Self::with_models_without_env_api_key(None, http, models);
+        provider.require_auth = false;
+        provider
     }
 
     /// Convenience: build with a default `reqwest::Client`, deferring API-key
@@ -272,7 +280,7 @@ impl Provider for AnthropicProvider {
 
         let http = self.http.clone();
         let params_started = provider_diagnostics_enabled().then(Instant::now);
-        let params = prepare_params(model, ctx, opts, &self.api_key, self.allow_env_api_key);
+        let params = prepare_params(model, ctx, opts, &self.api_key, self.allow_env_api_key, self.require_auth);
         let params_build_ns = params_started
             .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
             .unwrap_or_default();
@@ -317,9 +325,16 @@ fn prepare_params(
     opts: &SimpleStreamOptions,
     provider_key: &Option<String>,
     allow_env_api_key: bool,
+    require_auth: bool,
 ) -> Result<PreparedParams, String> {
     // ---- resolve auth (assertRequestAuth) ----
     let resolved_key = resolve_api_key(provider_key, opts, allow_env_api_key);
+    let is_oauth = resolved_key.as_deref().is_some_and(|key| key.starts_with("sk-ant-oat"))
+        || [model.headers.as_ref(), opts.headers.as_ref()].into_iter().flatten()
+            .any(|headers| headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization")
+                    && value.strip_prefix("Bearer ").is_some_and(|key| key.starts_with("sk-ant-oat"))
+            }));
     // TS `assertRequestAuth(model.provider, options?.apiKey, options?.headers)`
     // checks `options.headers` alone — but upstream the model-resolution layer
     // has *already merged* `model.headers` into `options.headers` (models.ts
@@ -333,20 +348,22 @@ fn prepare_params(
     let api_key_for_header = match (resolved_key, header_owned_auth) {
         (Some(k), _) => Some(k),
         (None, true) => None, // headers carry auth; do not send x-api-key.
+        (None, false) if !require_auth => None,
         (None, false) => {
             // Mirrors `assertRequestAuth`'s `throw new Error("No API key for…")`.
             return Err(format!("No API key for provider: {}", model.provider));
         }
     };
 
-    // ---- build params (is_oauth = false in v1) ----
+    // Subscription OAuth uses the same Messages stream, with its required identity.
     Ok(PreparedParams {
         built: build_params_prepared(
             model,
             ctx,
-            false,
+            is_oauth,
             opts,
-            std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() != Some("1"),
+            !is_vertex_anthropic(model)
+                && std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() != Some("1"),
         ),
         api_key_for_header,
     })
@@ -406,21 +423,36 @@ async fn run_anthropic_stream(
             built.request.messages.len()
         };
     }
-    let preencoded_body = if non_stream {
+    let vertex_anthropic = is_vertex_anthropic(model);
+    let preencoded_body = if non_stream || vertex_anthropic {
         None
     } else {
         built.preencoded_body.take()
     };
 
     // ---- assemble headers (createClient, API-key arm) ----
-    let headers = assemble_headers(
+    let mut headers = assemble_headers(
         model,
         opts,
         built.beta_header.as_deref(),
         api_key_for_header.as_deref(),
     );
 
-    let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
+    let url = if vertex_anthropic {
+        match vertex_anthropic_url(model, opts) {
+            Ok(url) => url,
+            Err(error) => {
+                emit_terminal_error(prod, &mut state, error, false).await;
+                return;
+            }
+        }
+    } else {
+        anthropic_messages_url(&model.base_url)
+    };
+    if vertex_anthropic {
+        headers.retain(|(name, _)| !matches!(name.to_ascii_lowercase().as_str(),
+            "x-omp-google-project" | "x-goog-location" | "anthropic-beta"));
+    }
     let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
     let has_content_type = headers
@@ -435,7 +467,17 @@ async fn run_anthropic_stream(
     // a mutable JSON tree before the single encoding.
     let encode_started = diagnostics.enabled.then(Instant::now);
     let mut request_parts = super::request::PreparedJsonRequestDiagnostics::default();
-    let prepared = if let Some(body) = preencoded_body {
+    let prepared = if vertex_anthropic {
+        serde_json::to_value(&built.request)
+            .map_err(|error| error.to_string())
+            .and_then(|mut body| {
+                shape_vertex_anthropic_body(&mut body, built.beta_header.as_deref());
+                if non_stream { body["stream"] = serde_json::Value::Bool(false); }
+                super::request::PreparedJsonRequest::new_with_diagnostics(
+                    builder, &body, diagnostics.enabled.then_some(&mut request_parts),
+                ).map_err(|error| error.to_string())
+            })
+    } else if let Some(body) = preencoded_body {
         super::request::PreparedJsonRequest::new_body(builder, body, !has_content_type)
             .map_err(|error| error.to_string())
     } else if non_stream {
@@ -842,9 +884,33 @@ fn assemble_headers(
     // only the resolved key is sent. Header-owned-auth callers pass
     // `api_key = None` here and rely on their own `x-api-key` / `authorization`
     // header surviving the merges above.
-    if let Some(key) = api_key {
+    let oauth_key = api_key.filter(|key| key.starts_with("sk-ant-oat"));
+    if let Some(key) = oauth_key {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("x-api-key"));
+        merge_header(&mut headers, "authorization".into(), format!("Bearer {key}"));
+    } else if let Some(key) = api_key.filter(|_| is_vertex_anthropic(model)) {
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("x-api-key"));
+        merge_header(&mut headers, "authorization".into(), format!("Bearer {key}"));
+    } else if let Some(key) = api_key {
         headers.retain(|(k, _)| k.to_ascii_lowercase() != "x-api-key");
         headers.push(("x-api-key".into(), key.into()));
+    }
+    let is_oauth = oauth_key.is_some() || headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("authorization") && value.starts_with("Bearer sk-ant-oat")
+    });
+    if is_oauth {
+        let existing = headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("anthropic-beta"))
+            .map(|(_, value)| value.clone()).unwrap_or_default();
+        let mut betas: Vec<&str> = existing.split(',').filter(|value| !value.is_empty()).collect();
+        for beta in ["oauth-2025-04-20", "claude-code-20250219", "interleaved-thinking-2025-05-14"] {
+            if !betas.contains(&beta) { betas.push(beta); }
+        }
+        merge_header(&mut headers, "anthropic-beta".into(), betas.join(","));
+        merge_header(&mut headers, "user-agent".into(), "claude-cli/2.1.321 (external, cli)".into());
+        merge_header(&mut headers, "x-app".into(), "cli".into());
+        if let Some(session) = &opts.session_id {
+            merge_header(&mut headers, "x-claude-code-session-id".into(), session.clone());
+        }
     }
 
     headers
@@ -1141,5 +1207,116 @@ mod tests {
             !owned2,
             "non-auth headers on model.headers must not satisfy header-owned auth"
         );
+    }
+}
+
+#[cfg(test)]
+mod oauth_header_tests {
+    use super::*;
+
+    #[test]
+    fn subscription_oauth_uses_bearer_and_retains_feature_betas() {
+        let model = Model::new("claude-test", "Claude", crate::Api::AnthropicMessages, "anthropic", "https://api.anthropic.com");
+        let headers = assemble_headers(&model, &SimpleStreamOptions::default(), Some("prompt-caching-2024-07-31"), Some("sk-ant-oat-test"));
+        let value = |name: &str| headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str());
+        assert_eq!(value("authorization"), Some("Bearer sk-ant-oat-test"));
+        assert_eq!(value("x-api-key"), None);
+        assert!(value("anthropic-beta").unwrap().contains("oauth-2025-04-20"));
+        assert!(value("anthropic-beta").unwrap().contains("prompt-caching-2024-07-31"));
+        assert_eq!(value("x-app"), Some("cli"));
+    }
+}
+
+fn anthropic_messages_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/messages") {
+        base.to_owned()
+    } else if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::anthropic_messages_url;
+
+    #[test]
+    fn messages_endpoint_preserves_native_gateway_version_prefixes() {
+        assert_eq!(anthropic_messages_url("https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(anthropic_messages_url("https://api.kimi.com/coding/v1"), "https://api.kimi.com/coding/v1/messages");
+        assert_eq!(anthropic_messages_url("https://proxy.test/custom/v1/messages/"), "https://proxy.test/custom/v1/messages");
+    }
+}
+
+fn is_vertex_anthropic(model: &Model) -> bool {
+    model.provider == "google-vertex"
+        && model.base_url.contains("/publishers/anthropic/models/")
+}
+
+fn vertex_anthropic_url(model: &Model, options: &SimpleStreamOptions) -> Result<String, String> {
+    let header = |name: &str| options.headers.as_ref().and_then(|headers| headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.clone()))
+        .or_else(|| model.headers.as_ref().and_then(|headers| headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.clone())));
+    let mut url = model.base_url.clone();
+    if url.contains("{project}") {
+        let project = header("x-omp-google-project")
+            .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT").ok())
+            .or_else(|| std::env::var("GCLOUD_PROJECT").ok())
+            .ok_or("Google Vertex resource project is required")?;
+        url = url.replace("{project}", &project);
+    }
+    if url.contains("{location}") {
+        let location = header("x-goog-location")
+            .or_else(|| std::env::var("GOOGLE_CLOUD_LOCATION").ok()).unwrap_or_else(|| "global".into());
+        url = url.replace("{location}", &location);
+        if location == "global" { url = url.replace("global-aiplatform.googleapis.com", "aiplatform.googleapis.com"); }
+    }
+    if !url.ends_with(":streamRawPredict") && !url.ends_with(":rawPredict") {
+        return Err("Vertex Anthropic endpoint must end in :streamRawPredict or :rawPredict".into());
+    }
+    Ok(url)
+}
+
+fn shape_vertex_anthropic_body(body: &mut serde_json::Value, betas: Option<&str>) {
+    if let Some(object) = body.as_object_mut() {
+        object.remove("model");
+        object.insert("anthropic_version".into(), serde_json::json!("vertex-2023-10-16"));
+        if let Some(betas) = betas {
+            object.insert("anthropic_beta".into(), serde_json::json!(betas.split(',').filter(|beta| !beta.is_empty()).collect::<Vec<_>>()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod vertex_tests {
+    use super::*;
+    #[test]
+    fn vertex_anthropic_uses_publisher_endpoint_body_and_resource_project() {
+        let model = Model::new("claude-test", "Claude", crate::Api::AnthropicMessages, "google-vertex", "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-test:streamRawPredict");
+        let options = SimpleStreamOptions { headers: Some(std::collections::BTreeMap::from([
+            ("x-omp-google-project".into(), "resource-project".into()),
+            ("x-goog-user-project".into(), "quota-project".into()),
+            ("x-goog-location".into(), "global".into()),
+        ])), ..Default::default() };
+        assert_eq!(vertex_anthropic_url(&model, &options).unwrap(), "https://aiplatform.googleapis.com/v1/projects/resource-project/locations/global/publishers/anthropic/models/claude-test:streamRawPredict");
+        let mut body = serde_json::json!({"model":"claude-test","stream":true,"messages":[{"role":"user","content":"Hi"}]});
+        shape_vertex_anthropic_body(&mut body, Some("feature-one,feature-two"));
+        assert!(body.get("model").is_none());
+        assert_eq!(body["anthropic_version"], "vertex-2023-10-16");
+        assert_eq!(body["anthropic_beta"], serde_json::json!(["feature-one","feature-two"]));
+        assert_eq!(body["stream"], true);
+    }
+}
+
+#[cfg(test)]
+mod anonymous_gateway_tests {
+    use super::*;
+    #[test]
+    fn anonymous_auth_requires_explicit_transport_opt_in() {
+        let model = Model::new("claude-test", "Claude", crate::Api::AnthropicMessages, "gateway", "https://gateway.test");
+        assert!(prepare_params(&model, &Context::default(), &SimpleStreamOptions::default(), &None, false, true).is_err());
+        let prepared = prepare_params(&model, &Context::default(), &SimpleStreamOptions::default(), &None, false, false).unwrap();
+        assert!(prepared.api_key_for_header.is_none());
     }
 }

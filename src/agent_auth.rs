@@ -38,7 +38,7 @@ impl AgentModel {
 }
 
 pub fn available_models(_cwd: &Path) -> Result<Vec<AgentModel>, String> {
-    let mut models: Vec<_> = rpi_embedded::catalog()?
+    let mut models: Vec<_> = rpi_embedded::chat_catalog()?
         .into_iter()
         .map(|model| AgentModel {
             provider: model.provider,
@@ -51,7 +51,8 @@ pub fn available_models(_cwd: &Path) -> Result<Vec<AgentModel>, String> {
     Ok(models)
 }
 
-pub fn providers(_cwd: &Path) -> Result<Vec<Provider>, String> {
+pub fn providers(cwd: &Path) -> Result<Vec<Provider>, String> {
+    rpi_embedded::refresh_auth_methods(cwd)?;
     Ok(rpi_embedded::providers()?
         .into_iter()
         .map(|state| Provider {
@@ -62,7 +63,7 @@ pub fn providers(_cwd: &Path) -> Result<Vec<Provider>, String> {
         .collect())
 }
 
-pub use rpi_embedded::{Login, LoginEvent};
+pub use rpi_embedded::{Login, LoginEvent, cached_auth_methods as auth_methods};
 
 pub fn key_label(provider: &str) -> &'static str {
     if provider == "google" {

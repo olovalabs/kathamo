@@ -204,8 +204,14 @@ pub(crate) fn resolve_refreshable(
     {
         return credential(key, CredentialSource::ModelsJson, bearer);
     }
-    // A package declaration is authoritative even for a built-in identity.
-    if manifest.is_none() && provider == "anthropic" {
+    let builtin = crate::catalog::builtin_provider(provider);
+    // Discovery declarations repeat the built-in primary env name. Retain that
+    // provider's aliases; a different extension-owned policy remains authoritative.
+    let native_policy = manifest.is_none_or(|manifest| {
+        builtin.is_some_and(|builtin| manifest.api_key_env.as_deref()
+            == builtin.env_vars.first().map(String::as_str))
+    });
+    if native_policy && provider == "anthropic" {
         if let Some(key) = nonempty(values.env("ANTHROPIC_AUTH_TOKEN")) {
             return credential(
                 key,
@@ -214,18 +220,40 @@ pub(crate) fn resolve_refreshable(
             );
         }
     }
-    let env = match manifest {
-        Some(manifest) => manifest.api_key_env.as_deref(),
-        None => builtin_api_key_env(provider),
-    };
-    if let Some(name) = env {
-        if let Some(key) = nonempty(values.env(name)) {
-            return credential(key, CredentialSource::Environment(name.into()), bearer);
+    if let Some(manifest) = manifest {
+        if let Some(name) = manifest.api_key_env.as_deref() {
+            if let Some(key) = nonempty(values.env(name)) {
+                return credential(key, CredentialSource::Environment(name.into()), bearer);
+            }
         }
+    }
+    if native_policy {
+        if let Some(builtin) = builtin {
+            for name in &builtin.env_vars {
+                if manifest.and_then(|manifest| manifest.api_key_env.as_ref()) == Some(name) {
+                    continue;
+                }
+                if let Some(key) = nonempty(values.env(name)) {
+                    return credential(key, CredentialSource::Environment(name.clone()), bearer);
+                }
+            }
+        } else if let Some(name) = builtin_api_key_env(provider) {
+            if let Some(key) = nonempty(values.env(name)) {
+                return credential(key, CredentialSource::Environment(name.into()), bearer);
+            }
+        }
+    }
+    if let Some(source) = crate::cloud_auth::configured(provider, values) {
+        return ResolvedCredential {
+            key: None,
+            source: CredentialSource::Environment(source.into()),
+            bearer: false,
+        };
     }
     ResolvedCredential {
         key: None,
-        source: if manifest.is_some_and(|manifest| !manifest.requires_auth) {
+        source: if manifest.map(|manifest| !manifest.requires_auth)
+            .unwrap_or_else(|| crate::catalog::builtin_provider(provider).is_some_and(|provider| !provider.requires_auth)) {
             CredentialSource::Anonymous
         } else {
             CredentialSource::Missing
@@ -242,4 +270,39 @@ pub fn has_header_auth(headers: Option<&std::collections::BTreeMap<String, Strin
                 && !value.trim().is_empty()
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn discovered_native_declaration_keeps_environment_aliases() {
+        let builtin = crate::catalog::builtin_provider("charm-hyper").unwrap();
+        let manifest = crate::ProviderDeclaration {
+            id: builtin.id.clone(),
+            models: Vec::new(),
+            api_key_env: builtin.env_vars.first().cloned(),
+            requires_auth: true,
+        };
+        let values = BTreeMap::from([("HYPER_API_KEY".into(), "test-key".into())]);
+        let credential = resolve("charm-hyper", None, &AuthStore::new(), Some(&manifest), &values);
+        assert_eq!(credential.key.as_deref(), Some("test-key"));
+        assert_eq!(credential.source, CredentialSource::Environment("HYPER_API_KEY".into()));
+    }
+
+    #[test]
+    fn explicit_extension_environment_policy_remains_authoritative() {
+        let manifest = crate::ProviderDeclaration {
+            id: "charm-hyper".into(),
+            models: Vec::new(),
+            api_key_env: Some("PRIVATE_HYPER_KEY".into()),
+            requires_auth: true,
+        };
+        let values = BTreeMap::from([("HYPER_API_KEY".into(), "not-selected".into())]);
+        let credential = resolve("charm-hyper", None, &AuthStore::new(), Some(&manifest), &values);
+        assert!(credential.key.is_none());
+        assert_eq!(credential.source, CredentialSource::Missing);
+    }
 }

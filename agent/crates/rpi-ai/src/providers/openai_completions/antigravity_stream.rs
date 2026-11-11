@@ -28,6 +28,86 @@ pub(in crate::providers) fn stream_antigravity(
     stream
 }
 
+/// Google direct/Vertex and Cloud Code Assist share Gemini response parts,
+/// including opaque thought signatures, but not their HTTP envelopes.
+pub(crate) fn stream_google_native(
+    model: Model,
+    mut options: SimpleStreamOptions,
+    http: reqwest::Client,
+    url: String,
+    headers: BTreeMap<String, String>,
+    body: Value,
+    wrapped: bool,
+) -> AssistantMessageEventStream {
+    let (mut producer, stream) =
+        create_assistant_message_event_stream_with_cancellation(&options.signal);
+    options.signal = producer.cancellation_token();
+    tokio::spawn(async move {
+        let mut state = StreamState::new(&model);
+        let result: Result<(), String> = async {
+            let mut builder = http.post(url).timeout(options.request_timeout());
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+            let request = super::super::request::PreparedJsonRequest::new(builder, &body)
+                .map_err(|error| error.to_string())?;
+            let response = retry_provider_request(
+                || {
+                    let request = request.clone();
+                    let signal = options.signal.clone();
+                    async move {
+                        let response = tokio::select! {
+                            response = request.send() => response?,
+                            _ = signal.cancelled() => return Err(AiError::Abort { message: "Request aborted".into() }),
+                        };
+                        if response.status().is_success() {
+                            Ok(response)
+                        } else {
+                            Err(AiError::Http {
+                                status: Some(response.status().as_u16()),
+                                message: response.text().await.unwrap_or_default(),
+                            })
+                        }
+                    }
+                },
+                options.max_retries,
+                options.max_retry_delay,
+                &options.signal,
+            ).await.map_err(|error| error.to_string())?;
+            state.start(&mut producer).await;
+            let mut events = SseEventStream::new(response, options.signal.clone())
+                .with_idle_timeout(options.stream_idle_timeout());
+            loop {
+                let Some(next) = events.next_event_before(state.flush_deadline()).await else {
+                    state.flush_pending(&mut producer).await;
+                    continue;
+                };
+                let Some(event) = next.map_err(|error| error.to_string())? else { break };
+                if event.data.trim().is_empty() { continue; }
+                if event.data.trim() == "[DONE]" { break; }
+                let mut chunk: Value = serde_json::from_str(&event.data)
+                    .map_err(|error| format!("Invalid Gemini stream event: {error}"))?;
+                if let Some(error) = chunk.get("error") {
+                    return Err(format!("Gemini stream error: {error}"));
+                }
+                if !wrapped {
+                    chunk = json!({"response": chunk});
+                }
+                state.apply_antigravity_chunk(&mut producer, &chunk).await?;
+            }
+            if state.finish_reason.is_none() {
+                return Err("Gemini stream ended before a finish reason".into());
+            }
+            state.finish(&mut producer, &model).await;
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            state.error(&mut producer, error, options.signal.is_cancelled()).await;
+        }
+    });
+    stream
+}
+
 impl AntigravityStream {
     async fn response(&mut self) -> Result<reqwest::Response, String> {
         let mut account = (self.source)(None).await?;

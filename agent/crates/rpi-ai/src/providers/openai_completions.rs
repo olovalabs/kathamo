@@ -753,6 +753,7 @@ fn reasoning_effort(model: &Model, level: ThinkingLevel) -> Option<String> {
 fn has_auth_header(headers: &BTreeMap<String, String>) -> bool {
     headers.keys().any(|name| {
         name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+            || name.eq_ignore_ascii_case("cf-aig-authorization")
     })
 }
 
@@ -788,6 +789,8 @@ fn apply_api_key(headers: &mut BTreeMap<String, String>, api_key: Option<String>
 }
 
 pub(super) mod antigravity_stream;
+pub(crate) use antigravity_stream::stream_google_native;
+pub mod ollama;
 
 struct ToolState {
     content_index: usize,

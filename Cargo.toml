@@ -2,6 +2,7 @@
 name = "kathamo"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.94.1"
 description = "GPU-accelerated terminal emulator built for developers orchestrating AI coding agents"
 readme = "README.md"
 license = "MIT OR Apache-2.0"

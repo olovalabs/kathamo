@@ -5,10 +5,8 @@
 //! request-shaping layer that turns a pi `Context` + `SimpleStreamOptions`
 //! into the JSON body POSTed to `/v1/messages`.
 //!
-//! v1 scope (per plan §5.16): API-key auth only. The OAuth/Copilot Claude
-//! Code identity prefix and the Claude-Code tool-name rewriter are TODO; the
-//! `is_oauth` flag flows through the functions so enabling them later is a
-//! localized change, not a re-plumb.
+//! API-key and OAuth requests share serialization. Subscription OAuth adds the
+//! Claude Code system identity while transport authentication stays in mod.rs.
 
 use crate::model::{AnthropicMessagesCompat, Model, StreamingProtocolCompat};
 use crate::provider::SimpleStreamOptions;
@@ -1778,11 +1776,8 @@ pub struct BuiltParams {
 /// Build the full Anthropic request body + beta headers from a pi context.
 /// Mirrors `buildParams` + the beta-header assembly in `createClient`.
 ///
-/// `is_oauth` is always `false` in v1 (API-key auth only); it flows through so
-/// the OAuth Claude-Code system-prompt prefix can be slotted in later without
-/// touching this function's signature. When `is_oauth` is false the system
-/// prompt is emitted as a single text block (with cache control when present),
-/// matching the TS `else if (context.systemPrompt)` branch.
+/// OAuth requests prepend the Claude Code identity; API-key requests preserve
+/// the caller's system prompt directly.
 pub fn build_params(
     model: &Model,
     ctx: &crate::types::Context,
@@ -1938,10 +1933,8 @@ fn build_params_internal(
         }
     }
 
-    // System prompt. OAuth (TODO) prepends the Claude Code identity block; v1
-    // emits the caller's system_prompt as a single text block.
+    // Subscription OAuth requires a separate CLI identity system block.
     let system: Option<Vec<AnthropicSystemBlock>> = if is_oauth {
-        // v1 TODO: prepend "You are Claude Code, Anthropic's official CLI for Claude."
         let mut blocks = vec![AnthropicSystemBlock {
             kind: "text".into(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".into(),

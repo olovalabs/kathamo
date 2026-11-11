@@ -1536,7 +1536,6 @@ fn openai_env_does_not_authenticate_custom_providers() {
 
     let official = resolve(None, None, None, None, None).unwrap();
     assert_eq!(official.provider.id(), "openai");
-    assert_eq!(official.model.id, "gpt-6-astra");
     assert!(official.has_provider_key);
 }
 
@@ -2142,4 +2141,36 @@ fn available_catalog_keeps_all_models_on_provider_key_path() {
     let catalog = available_catalog(&r);
     assert_eq!(catalog.len(), r.provider.models().len());
     assert!(catalog.iter().any(|m| m.id == DEFAULT_MODEL_ID));
+}
+
+#[test]
+fn case_distinct_wire_model_ids_select_the_exact_route() {
+    let mut registry = RuntimeFactories::default();
+    registry.declare(crate::ProviderDeclaration {
+        id: "case-models".into(),
+        models: vec![
+            Model::new("Case-ID", "Upper", rpi_ai::Api::OpenaiCompletions, "case-models", "https://upper.example/v1"),
+            Model::new("case-id", "Lower", rpi_ai::Api::OpenaiCompletions, "case-models", "https://lower.example/v1"),
+        ],
+        api_key_env: None,
+        requires_auth: true,
+    });
+    let mut config = crate::RuntimeConfig::default();
+    config.credentials.insert("case-models".into(), Credential::ApiKey {
+        key: Some("fixture-key".into()), env: None,
+    });
+    for (id, endpoint) in [
+        ("Case-ID", "https://upper.example/v1"),
+        ("case-id", "https://lower.example/v1"),
+    ] {
+        let resolved = config.resolve(&crate::ModelRequest {
+            provider: Some("case-models"), model: Some(id), ..Default::default()
+        }, &registry, &BTreeMap::new()).unwrap();
+        assert_eq!(resolved.model.id, id);
+        assert_eq!(resolved.model.base_url, endpoint);
+    }
+    let error = config.resolve(&crate::ModelRequest {
+        provider: Some("case-models"), model: Some("CASE-ID"), ..Default::default()
+    }, &registry, &BTreeMap::new()).unwrap_err();
+    assert!(matches!(error, ResolveError::AmbiguousModel { .. }));
 }

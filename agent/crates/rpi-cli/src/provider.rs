@@ -49,14 +49,40 @@ fn resolve_with_factories(
     api_key: Option<&str>,
     base_url: Option<&str>,
     settings: settings::Settings,
-    factories: &RuntimeFactories,
+    factories: &mut RuntimeFactories,
 ) -> Result<ResolvedModel, ResolveError> {
-    rpi_runtime::RuntimeConfig {
-        models: config::load_models_config()?,
-        credentials: config::read_auth()?,
-        settings: runtime_settings(settings),
+    let models = config::load_models_config()?;
+    let credentials = config::read_auth()?;
+    let selected = provider.map(str::to_owned)
+        .or_else(|| model.and_then(|model| model.split_once('/'))
+            .filter(|(id, _)| rpi_runtime::catalog::builtin_providers().iter().any(|provider| provider.id.eq_ignore_ascii_case(id)))
+            .map(|(provider, _)| provider.to_owned()))
+        .or_else(|| settings.default_provider.clone())
+        .and_then(|id| rpi_runtime::catalog::builtin_providers().iter()
+            .find(|provider| provider.id.eq_ignore_ascii_case(&id))
+            .map(|provider| provider.id.clone()));
+    let mut discovery_warnings = Vec::new();
+    if let Some(selected) = selected.filter(|id| rpi_runtime::catalog::builtin_provider(id).is_some_and(|provider| provider.discovery)) {
+        let mut discovery_config = models.clone();
+        let mut discovery_credentials = credentials.clone();
+        let configured = discovery_config.providers.entry(selected.clone()).or_insert_with(|| {
+            serde_json::from_value(serde_json::json!({"models":[]})).expect("empty provider configuration")
+        });
+        if let Some(base) = base_url { configured.base_url = Some(base.to_owned()); }
+        if let Some(key) = api_key {
+            discovery_credentials.insert(selected.clone(), config::Credential::ApiKey { key: Some(key.to_owned()), env: None });
+        }
+        let (declarations, warnings) = discover_blocking(discovery_config, discovery_credentials, Some(selected));
+        discovery_warnings = warnings;
+        for declaration in declarations {
+            if !factories.manifests.iter().any(|known| known.id == declaration.id) {
+                factories.declare(declaration);
+            }
+        }
     }
-    .resolve(
+    let mut resolved = rpi_runtime::RuntimeConfig {
+        models, credentials, settings: runtime_settings(settings),
+    }.resolve(
         &rpi_runtime::ModelRequest {
             provider,
             model,
@@ -67,7 +93,9 @@ fn resolve_with_factories(
         },
         factories,
         &CliValues,
-    )
+    )?;
+    resolved.compat_warnings.extend(discovery_warnings);
+    Ok(resolved)
 }
 pub fn resolve(
     cli_provider: Option<&str>,
@@ -123,7 +151,7 @@ fn resolve_with_settings(
         cli_api_key,
         cli_base_url,
         settings,
-        &RuntimeFactories::default(),
+        &mut runtime_factories(None),
     )
 }
 
@@ -141,15 +169,17 @@ pub fn resolve_with_extensions(
         args.api_key.as_deref(),
         args.base_url.as_deref(),
         settings,
-        &factories_from_session(session),
+        &mut runtime_factories(Some(session)),
     )
 }
 
-fn factories_from_session(session: &rpi_extensions::ExtensionSession) -> RuntimeFactories {
+/// Build the same native OAuth/provider registry used by CLI and embedded hosts.
+pub fn runtime_factories(session: Option<&rpi_extensions::ExtensionSession>) -> RuntimeFactories {
     let mut factories = RuntimeFactories::default();
-    if let Some(refresher) = crate::auth::PackageOAuthRefresher::new(session) {
-        factories.set_oauth_refresher(Arc::new(refresher));
-    }
+    let extension = session.and_then(crate::auth::PackageOAuthRefresher::new)
+        .map(|refresher| Arc::new(refresher) as Arc<dyn rpi_runtime::credentials::OAuthRefresher>);
+    factories.set_oauth_refresher(crate::native_auth::refresher(extension));
+    let Some(session) = session else { return factories; };
     if let Some(snapshot) = session.snapshot() {
         for manifest in manifests_from_session(session) {
             factories.declare(declaration(&manifest));
@@ -195,12 +225,31 @@ pub fn catalog_with_manifests(
 pub(crate) fn catalog_with_diagnostics(
     manifests: &[rpi_extensions::ProviderManifest],
 ) -> Result<(Vec<Model>, Vec<String>), config::ConfigError> {
-    let declarations: Vec<_> = manifests.iter().map(declaration).collect();
-    Ok(rpi_runtime::provider::catalog_with_diagnostics(
-        config::load_models_config()?,
-        &declarations,
-        &CliValues,
-    ))
+    let models = config::load_models_config()?;
+    let (mut declarations, mut warnings) = discover_blocking(models.clone(), config::read_auth()?, None);
+    // Loaded extension declarations remain more specific than native discovery.
+    declarations.retain(|discovered| !manifests.iter().any(|manifest| manifest.id == discovered.id));
+    declarations.extend(manifests.iter().map(declaration));
+    let (catalog, diagnostics) = rpi_runtime::provider::catalog_with_diagnostics(models, &declarations, &CliValues);
+    warnings.extend(diagnostics);
+    Ok((catalog, warnings))
+}
+
+fn discover_blocking(
+    models: config::ModelsConfig,
+    credentials: config::AuthStore,
+    selected: Option<String>,
+) -> (Vec<rpi_runtime::ProviderDeclaration>, Vec<String>) {
+    // This adapter is called both outside Tokio and inside an embedded host's
+    // executor. A dedicated thread avoids nested-runtime/block_on panics.
+    std::thread::spawn(move || {
+        match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(runtime) => runtime.block_on(rpi_runtime::catalog::discover_models_for(
+                &models, &credentials, &CliValues, selected.as_deref(),
+            )),
+            Err(error) => (Vec::new(), vec![format!("Cannot initialize model discovery: {error}")]),
+        }
+    }).join().unwrap_or_else(|_| (Vec::new(), vec!["Model discovery worker panicked".to_owned()]))
 }
 
 #[cfg(test)]

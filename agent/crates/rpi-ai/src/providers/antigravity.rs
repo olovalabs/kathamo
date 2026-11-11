@@ -104,11 +104,15 @@ pub struct AntigravityProvider {
 
 impl AntigravityProvider {
     pub fn new(http: reqwest::Client, source: AccountSource) -> Self {
+        Self::with_models(http, source, models())
+    }
+
+    pub fn with_models(http: reqwest::Client, source: AccountSource, models: Vec<Model>) -> Self {
         let random = uuid::Uuid::new_v4().as_u128() as i64;
         Self {
             http,
             source,
-            model: models(),
+            model: models,
             trajectory: uuid::Uuid::new_v4(),
             session_id: random.to_string(),
         }

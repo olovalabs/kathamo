@@ -6,7 +6,7 @@ pub mod openai;
 
 pub use generic::GenericProvider;
 
-/// Get a provider interface for any of the 103 providers.
+/// Get a provider interface for any compiled provider identity.
 pub fn for_provider(id: &str) -> Option<GenericProvider> {
     GenericProvider::new(id)
 }

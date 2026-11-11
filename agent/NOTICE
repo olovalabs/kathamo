@@ -16,6 +16,20 @@ Rust. The license text in `LICENSE` therefore carries both the upstream
 copyright notice and the notice for the Rust port, as required by the MIT
 License's retention clause.
 
+Native provider catalog and wire-protocol adaptations
+----------------------------------------------------
+
+    Oh My Pi — https://github.com/can1357/oh-my-pi
+    Reference revision: 73d7521269a1212fc2b2790a2e8c08424496c953
+    Copyright (c) 2025 Mario Zechner
+    Copyright (c) 2025-2026 Can Bölük
+    Copyright (c) 2026 Stencil Labs, Inc.
+    Licensed under the MIT License; retained in LICENSE.
+
+The provider catalog data and native Rust protocol/authentication adaptations
+follow this MIT-licensed reference. No OMP executable, JavaScript runtime, or
+TypeScript provider implementation is loaded to execute these providers.
+
 Third-party dependencies
 ------------------------
 

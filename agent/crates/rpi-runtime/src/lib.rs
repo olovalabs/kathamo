@@ -3,6 +3,8 @@
 //! Hosts load their own configuration and credentials, supply a [`ValueSource`],
 //! and adapt any already-loaded extension providers through [`ProviderRegistry`].
 //! The library does not discover files, load plugins, or depend on a terminal.
+pub(crate) mod cloud_auth;
+pub mod catalog;
 pub mod config;
 pub mod credentials;
 pub mod provider;
@@ -67,6 +69,7 @@ impl RuntimeConfig {
             .into_iter()
             .map(|model| model.provider)
             .collect();
+        ids.extend(catalog::builtin_providers().iter().map(|provider| provider.id.clone()));
         ids.extend(self.models.providers.keys().cloned());
         ids.extend(self.credentials.keys().cloned());
         ids.extend(

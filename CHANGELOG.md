@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added native provider/model discovery for all 67 OMP README integrations while preserving existing provider/model identities: 104 catalog providers, 6,279 frozen model entries, and real local/account model discovery. Chat selection excludes non-chat task models without deleting their metadata.
+- Added native Rust API-key and browser/device OAuth flows, request-time renewal and vendor-specific inference transports; providers supporting both methods expose both. No OMP executable or runtime is required.
 - Added an auto-focused, theme-matched model search field with a search icon, clear button, case-insensitive model/provider filtering, and a no-results state.
 - Antigravity model catalog now exposes Claude Sonnet 4.6 and Gemini 3.5/3.1/2.5 Flash-Lite alongside Gemini 3.8 Flash, with the same Fast/Deep reasoning controls, so chat can use a responsive route while the 3.8 Cloud Code endpoint is congested.
 - Native OMP approval, selection, confirmation, text/editor and structured-question dialogs with cancellation, expiry and stale-session guards; interaction responses stay out of transcript persistence.

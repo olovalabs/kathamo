@@ -12,8 +12,8 @@
 //! - [`catalog`] and [`providers`] replace `rpi --list-models` and `rpi auth
 //!   check` with in-process reads of the same `models.json`, `auth.json`,
 //!   `settings.json` and environment sources.
-//! - [`Login`] replaces `rpi auth login` for API-key providers and drives
-//!   extension-owned OAuth actions in-process.
+//! - [`Login`] replaces `rpi auth login` with native API-key, PKCE browser and
+//!   device-code sign-in, while preserving extension-owned OAuth actions.
 //!
 //! Sessions run with `no_extensions` so several conversations can coexist in one
 //! process without sharing rpi's process-global plugin session identity. Model
@@ -33,10 +33,67 @@ use rpi_cli::args::{Args, Mode};
 use rpi_cli::session::BuildError;
 use rpi_harness::agent_harness::AgentLane;
 use rpi_runtime::config::Credential;
-use rpi_runtime::{ProviderRegistry, RuntimeConfig, RuntimeSettings, ValueSource};
+use rpi_runtime::{RuntimeConfig, RuntimeSettings, ValueSource};
 
 mod antigravity;
 pub const ANTIGRAVITY: &str = rpi_ai::providers::antigravity::ID;
+pub use rpi_cli::native_auth::{AuthMethod, AuthMethods};
+
+static EXTENSION_OAUTH_METHODS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::BTreeMap<PathBuf, Arc<std::collections::BTreeSet<String>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Cheap, side-effect-free native auth metadata without project-specific extensions.
+pub fn auth_methods(provider: &str) -> AuthMethods {
+    rpi_cli::native_auth::auth_methods(provider)
+}
+
+/// Pure cached metadata for a project path, including its discovered canonical alias.
+pub fn cached_auth_methods(provider: &str, cwd: &Path) -> AuthMethods {
+    let mut methods = auth_methods(provider);
+    methods.oauth |= EXTENSION_OAUTH_METHODS.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(cwd).is_some_and(|providers| providers.contains(provider));
+    methods
+}
+
+fn auth_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RUNTIME: std::sync::LazyLock<Result<tokio::runtime::Runtime, String>> =
+        std::sync::LazyLock::new(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("kathamo-auth-extensions")
+                .enable_all()
+                .build()
+                .map_err(|_| "Could not initialize extension authentication runtime".into())
+        });
+    RUNTIME.as_ref().map_err(Clone::clone)
+}
+
+/// Refresh extension metadata outside a UI render pass, for the selected project.
+pub fn refresh_auth_methods(cwd: &Path) -> Result<(), String> {
+    let canonical = cwd.canonicalize()
+        .map_err(|_| "Could not resolve authentication project directory".to_string())?;
+    let _runtime = auth_runtime()?.enter();
+    let prepared = rpi_cli::session::prepare_extensions(
+        &Args::default(), &canonical, project_trusted(&canonical),
+    ).map_err(|error| format!("Could not discover extension authentication: {error}"))?;
+    let providers = prepared.extension_session.snapshot()
+        .map(rpi_extensions::list_oauth_providers).unwrap_or_default();
+    let methods = Arc::new(providers.into_iter().map(|provider| provider.id).collect());
+    let mut cache = EXTENSION_OAUTH_METHODS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(canonical, Arc::clone(&methods));
+    cache.insert(cwd.to_path_buf(), methods);
+    Ok(())
+}
+
+/// Explicitly discover extension-owned OAuth for a project before selecting a method.
+pub fn auth_methods_for_cwd(provider: &str, cwd: &Path) -> AuthMethods {
+    if !rpi_cli::native_auth::supports(provider) && provider != ANTIGRAVITY {
+        let _ = refresh_auth_methods(cwd);
+    }
+    cached_auth_methods(provider, cwd)
+}
 
 /// One catalog row, matching the identity Kathamo shows in its model picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,10 +112,15 @@ pub struct ProviderState {
 
 /// Read the configured model catalog in-process (`models.json` + built-ins).
 pub fn catalog() -> Result<Vec<ModelInfo>, String> {
+    catalog_filtered(false)
+}
+
+fn catalog_filtered(chat_only: bool) -> Result<Vec<ModelInfo>, String> {
     rpi_cli::provider::catalog_all()
         .map(|models| {
             let mut rows: Vec<_> = models
                 .into_iter()
+                .filter(|model| !chat_only || rpi_runtime::catalog::is_chat_model(model))
                 .map(|model| ModelInfo {
                     provider: model.provider,
                     id: model.id,
@@ -66,7 +128,7 @@ pub fn catalog() -> Result<Vec<ModelInfo>, String> {
                 .collect();
             rows.retain(|model| model.provider != ANTIGRAVITY);
             rows.extend(
-                rpi_ai::providers::antigravity::models()
+                antigravity::models()
                     .into_iter()
                     .map(|model| ModelInfo {
                         provider: ANTIGRAVITY.into(),
@@ -78,6 +140,12 @@ pub fn catalog() -> Result<Vec<ModelInfo>, String> {
         .map_err(|error| error.to_string())
 }
 
+/// Chat-capable routes for an agent conversation. The full [`catalog`] keeps
+/// non-chat identities and their backend capability metadata discoverable.
+pub fn chat_catalog() -> Result<Vec<ModelInfo>, String> {
+    catalog_filtered(true)
+}
+
 /// Report local readiness for every provider known to the model/credential
 /// stores, using the same rules as execution.
 pub fn providers() -> Result<Vec<ProviderState>, String> {
@@ -87,7 +155,8 @@ pub fn providers() -> Result<Vec<ProviderState>, String> {
         settings: RuntimeSettings::default(),
     };
     let values = EnvironmentValues;
-    let states = config.auth_states(&ProviderRegistry::default(), &values);
+    let registry = rpi_cli::provider::runtime_factories(None);
+    let states = config.auth_states(&registry, &values);
     let mut rows: Vec<_> = states
         .into_iter()
         .map(|(id, state)| ProviderState {
@@ -772,11 +841,11 @@ pub enum LoginEvent {
 
 /// In-process replacement for `rpi auth login`.
 ///
-/// API-key providers read one line through [`Login::submit`] and persist it with
-/// the same `auth.json` writer the CLI uses. Providers that registered an OAuth
-/// extension are driven through their `begin`/`exchange` actions; display and
-/// instruction text is forwarded to the host, while the authorization value is
-/// only sent back to the extension. The value is never echoed.
+/// API keys and native browser/device grants use the CLI's atomic `auth.json`
+/// writer and the inference runtime's renewal binding. [`Login::start`] prefers
+/// sign-in when available; [`Login::start_with_method`] explicitly selects a
+/// method. Extension-owned `begin`/`exchange` actions remain supported.
+/// Authorization values are never echoed to the host event stream.
 pub struct Login {
     events: mpsc::Receiver<LoginEvent>,
     input: Option<mpsc::Sender<String>>,
@@ -785,13 +854,29 @@ pub struct Login {
 
 impl Login {
     pub fn start(provider: &str, cwd: &Path) -> Result<Self, String> {
+        Self::start_selected(provider, cwd, None)
+    }
+
+    /// Explicitly choose API-key, browser OAuth, or supported headless device OAuth.
+    pub fn start_with_method(provider: &str, cwd: &Path, method: AuthMethod) -> Result<Self, String> {
+        let methods = auth_methods_for_cwd(provider, cwd);
+        match method {
+            AuthMethod::ApiKey if !methods.api_key => return Err("This provider does not support API-key sign-in".into()),
+            AuthMethod::OAuth if !methods.oauth => return Err("This provider does not support OAuth sign-in".into()),
+            AuthMethod::DeviceCode if !matches!(provider, "openai-codex" | "openai-codex-device" | "github-copilot" | "kimi-code" | "factory-droid" | "muse-code" | "xai-oauth") => return Err("This provider does not support device-code sign-in".into()),
+            _ => {}
+        }
+        Self::start_selected(provider, cwd, Some(method))
+    }
+
+    fn start_selected(provider: &str, cwd: &Path, method: Option<AuthMethod>) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
         let (input_tx, input_rx) = mpsc::channel();
         let provider = provider.to_string();
         let cwd = cwd.to_path_buf();
         std::thread::Builder::new()
             .name("rpi-embedded-login".into())
-            .spawn(move || login_worker(provider, cwd, event_tx, input_rx))
+            .spawn(move || login_worker(provider, cwd, method, event_tx, input_rx))
             .map_err(|error| format!("Could not start in-process authentication: {error}"))?;
         Ok(Self {
             events: event_rx,
@@ -838,14 +923,27 @@ impl Drop for Login {
 fn login_worker(
     provider: String,
     cwd: PathBuf,
+    method: Option<AuthMethod>,
     events: mpsc::Sender<LoginEvent>,
     inputs: mpsc::Receiver<String>,
 ) {
+    if method == Some(AuthMethod::ApiKey) {
+        run_api_key(provider, events, inputs);
+        return;
+    }
     if provider == ANTIGRAVITY {
         let result = antigravity::login(&events, &inputs);
         let _ = events.send(LoginEvent::Finished(result));
         return;
     }
+    let runtime = match auth_runtime() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = events.send(LoginEvent::Finished(Err(error)));
+            return;
+        }
+    };
+    let _runtime = runtime.enter();
     let trusted = project_trusted(&cwd);
     let prepared = rpi_cli::session::prepare_extensions(&Args::default(), &cwd, trusted).ok();
     let snapshot = prepared
@@ -857,6 +955,22 @@ fn login_worker(
 
     if let Some(snapshot) = oauth {
         run_oauth(provider, Arc::clone(snapshot), events, inputs);
+    } else if rpi_cli::native_auth::supports(&provider) {
+        let emit = |event| {
+            let event = match event {
+                rpi_cli::native_auth::Event::BrowserUrl(url) => LoginEvent::BrowserUrl(url),
+                rpi_cli::native_auth::Event::Output(text) => LoginEvent::Output(text),
+            };
+            let _ = events.send(event);
+        };
+        let result = rpi_cli::native_auth::login(
+            &provider, &emit, &inputs, method == Some(AuthMethod::DeviceCode),
+        );
+        let _ = events.send(LoginEvent::Finished(result));
+    } else if method.is_some() {
+        let _ = events.send(LoginEvent::Finished(Err(
+            "This provider has no OAuth sign-in implementation".into(),
+        )));
     } else {
         run_api_key(provider, events, inputs);
     }
@@ -968,6 +1082,7 @@ fn run_oauth(
                     text.push('\n');
                 }
                 if let Some(url) = display.get("url").and_then(serde_json::Value::as_str) {
+                    let _ = events.send(LoginEvent::BrowserUrl(url.to_owned()));
                     text.push_str(url);
                     text.push('\n');
                 }
@@ -1007,6 +1122,19 @@ fn run_oauth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_extension_methods_are_project_scoped() {
+        let first = PathBuf::from(format!("/auth-cache-test/{}", uuid::Uuid::new_v4()));
+        let second = PathBuf::from(format!("/auth-cache-test/{}", uuid::Uuid::new_v4()));
+        let provider = "project-specific-oauth-test";
+        EXTENSION_OAUTH_METHODS.write().unwrap()
+            .insert(first.clone(), Arc::new([provider.to_owned()].into_iter().collect()));
+        assert!(cached_auth_methods(provider, &first).oauth);
+        assert!(!cached_auth_methods(provider, &second).oauth);
+        assert!(!auth_methods(provider).oauth);
+        EXTENSION_OAUTH_METHODS.write().unwrap().remove(&first);
+    }
 
     #[test]
     fn selector_splits_provider_from_a_model_that_contains_slashes() {

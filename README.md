@@ -83,7 +83,7 @@ Processes are not resurrected: a restored pane starts a fresh shell in the saved
 
 ### Prerequisites
 
-- **Rust**: Version 1.85+ (Edition 2024 support)
+- **Rust**: Version 1.94.1+ (native cloud credential SDKs)
 - **Linux Packages**:
   ```bash
   sudo apt install -y libwayland-dev libxkbcommon-dev libfontconfig1-dev libssl-dev cmake pkg-config
@@ -110,8 +110,12 @@ cargo build --release
 ### Native agent chat
 
 Kathamo's native agent view runs the embedded Rust [pi-rust](https://github.com/bigfish1913/pi-rust)
-backend in the app process. The model picker includes configured providers from
-`models.json` and built-in models, including Gemini 3.8 Flash.
+backend in the app process. Its native provider catalog includes all 67 integrations
+listed in the Oh My Pi README, without running or importing the OMP executable.
+The frozen catalog has 104 provider identities and 6,279 model entries, including
+5,995 chat models; existing Kathamo models and configured `models.json` providers
+are preserved. Non-chat entries retain their capability metadata but are not
+offered as agent chat models.
 
 In a terminal pane, select **Agent** in the bottom input bar to open a native
 chat view. Enter sends a prompt, Shift+Enter inserts a newline, and Stop or
@@ -131,14 +135,33 @@ Kathamo opens an embedded session when you enter Agent mode or choose a model.
 For Gemini 3.8 Flash, **Fast** uses low reasoning and **Deep** uses high reasoning.
 Use `/thinking low|medium|high` to set a per-pane override.
 
-Type `/auth` in agent mode to open the provider authentication dialog. Select an
-unauthenticated provider to start login, then follow its instructions; input is
-masked. The list includes rpi's model catalog and configured providers. If an installed
-authentication-only extension is not listed, enter its provider ID manually.
-Readiness reports local configuration, not whether a provider accepts the key.
-A ready provider is already authenticated; select it to choose a model, or use
-**Add account** to sign in again explicitly.
-Authenticating a provider does not switch the model of an existing agent session.
+Type `/auth` in agent mode to open provider authentication. API-key providers
+offer **Save Key & Connect**; providers with native browser/device sign-in also
+offer **Connect with OAuth**. Both methods remain available when supported.
+Credentials and renewed tokens use the embedded backend's private `auth.json`;
+existing Antigravity credentials retain their store. Input is masked. Installed
+authentication extensions remain supported, with project-scoped capability discovery.
+Readiness reports local configuration, not account entitlement or upstream acceptance.
+A ready provider can be selected without signing in again; **Add account** explicitly
+opens authentication. Signing in does not switch an existing conversation's model.
+
+Local Ollama, LM Studio, llama.cpp, vLLM and LiteLLM rosters are discovered from
+their running servers. SiliconFlow, Otari and Charm Hyper also discover the account/server
+roster instead of inventing model IDs. Override endpoints and models in
+`~/.rpi/agent/models.json` (`RPI_CODING_AGENT_DIR` overrides that directory).
+Existing explicit endpoints, headers and model definitions take precedence.
+
+Amazon Bedrock supports API bearer tokens and the native AWS credential chain
+(environment, profiles, SSO, web identity, assumed roles and container/instance roles).
+Set the intended `AWS_REGION` or configure the selected AWS profile's region.
+Vertex supports API keys or Google Application Default Credentials; configure
+`GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` for project-routed requests.
+Cloud-specific resource/deployment settings still need to match your account.
+
+Gemini CLI browser OAuth reads `KATHAMO_GEMINI_CLI_CLIENT_ID` and
+`KATHAMO_GEMINI_CLI_CLIENT_SECRET` from your local environment. Configure a desktop
+OAuth client with redirect `http://127.0.0.1:8085/oauth2callback`; client credentials
+are not embedded in the repository.
 
 Select **Models** in the agent input bar or enter `/model` to see the available
 rpi and Kathamo models. Select a row for the current pane, or

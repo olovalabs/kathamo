@@ -3,7 +3,7 @@ use crate::catalog::get_provider;
 use crate::types::{ModelSpec, ProviderSpec};
 use std::collections::HashMap;
 
-/// A generic wrapper around any provider in the 103-provider catalog.
+/// A generic wrapper around any provider in the compiled catalog.
 pub struct GenericProvider {
     pub spec: &'static ProviderSpec,
 }

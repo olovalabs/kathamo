@@ -187,6 +187,28 @@ redirect, discovers the account's project, and renews its credential from the
 local Antigravity auth store. The provider reuses the same event batching and
 tool approval path as the public Gemini API.
 
+### 2.8 Native provider catalog and authentication
+
+`rpi-runtime::catalog` embeds a frozen, MIT-licensed provider/model snapshot from
+Oh My Pi revision `73d7521269a1212fc2b2790a2e8c08424496c953`, unioned with
+Kathamo's existing identities. Provider endpoints, wire APIs, capabilities and
+credential environment aliases are native Rust metadata; no OMP code executes.
+Explicit `models.json` configuration retains precedence. Server/account model
+discovery supplies real model IDs for dynamic providers.
+
+`rpi-embedded::catalog()` exposes every catalog identity; `chat_catalog()` is the
+agent picker surface. Non-chat model metadata remains available through
+`rpi-runtime::catalog::model_metadata`. Unsupported non-chat/auxiliary protocols
+cannot block resolution of unrelated chat providers.
+
+`rpi-cli::native_auth` implements browser PKCE, device grants, provider-specific
+sign-in and token renewal using the same atomic `auth.json` store as inference.
+Native and extension OAuth refreshers compose without replacing extensions.
+Capability lookup is side-effect-free on the UI thread; extension capabilities
+are discovered in the background and cached per project. Cloud requests acquire
+AWS SDK credentials or Google ADC at request time, not during local discovery.
+
+
 ---
 
 ## 3. Data Flow: Agent Event to UI Update

@@ -17,7 +17,7 @@ All contributors and participants must adhere to our [Code of Conduct](CODE_OF_C
 Ensure your machine has the required toolchains and dependencies installed:
 
 1. **Rust Toolchain**:
-   - Rust 1.85+ (supporting the 2024 edition).
+   - Rust 1.94.1+ (required by the native cloud credential SDKs).
    - Install via [rustup](https://rustup.rs/):
      ```bash
      rustup update stable

@@ -20,6 +20,24 @@ pub mod openai_completions;
 pub mod openai_responses;
 
 #[cfg(feature = "providers")]
+pub mod google;
+
+#[cfg(feature = "providers")]
+pub mod bedrock;
+
+#[cfg(feature = "providers")]
+pub mod azure;
+
+#[cfg(feature = "providers")]
+pub mod cursor;
+
+#[cfg(feature = "providers")]
+pub mod devin;
+
+#[cfg(feature = "providers")]
+pub mod routed;
+
+#[cfg(feature = "providers")]
 mod request;
 
 // ---------------------------------------------------------------------------

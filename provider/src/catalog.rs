@@ -11,7 +11,7 @@ static PROVIDERS_BY_ID: LazyLock<HashMap<&'static str, &'static ProviderSpec>> =
             .collect()
     });
 
-/// Get a slice of all 103 compiled provider specifications from oh-my-pi.
+/// Get every compiled provider specification, including additive upstream updates.
 pub fn all_providers() -> &'static [ProviderSpec] {
     &ALL_PROVIDERS
 }
@@ -58,7 +58,7 @@ pub fn default_model_for(provider_id: &str) -> Option<&'static str> {
     get_provider(provider_id).and_then(|p| p.default_model.as_deref())
 }
 
-/// Return an iterator/vector of every model across all 103 providers.
+/// Return every model across all compiled providers.
 pub fn all_models() -> Vec<(&'static ProviderSpec, &'static ModelSpec)> {
     let mut result = Vec::new();
     for provider in ALL_PROVIDERS.iter() {

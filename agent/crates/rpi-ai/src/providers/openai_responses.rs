@@ -27,6 +27,7 @@ pub struct OpenAiResponsesProvider {
     id: String,
     api_key: Option<String>,
     allow_env_api_key: bool,
+    require_auth: bool,
     http: reqwest::Client,
     models: Vec<Model>,
 }
@@ -47,6 +48,7 @@ pub fn openai_responses_models() -> Vec<Model> {
             supports_long_cache_retention: Some(true),
             supports_strict_mode: Some(true),
             supports_openai_grammar_tools: Some(true),
+            ..Default::default()
         },
     ));
     vec![model]
@@ -64,6 +66,7 @@ impl OpenAiResponsesProvider {
             id,
             api_key,
             allow_env_api_key,
+            require_auth: true,
             http,
             models,
         }
@@ -81,15 +84,60 @@ impl OpenAiResponsesProvider {
             id: id.into(),
             api_key,
             allow_env_api_key: false,
+            require_auth: true,
             http,
             models,
         }
+    }
+
+    /// Explicit anonymous authentication for local/proxy Responses endpoints.
+    pub fn with_models_without_auth(
+        id: impl Into<String>,
+        http: reqwest::Client,
+        models: Vec<Model>,
+    ) -> Self {
+        let mut provider = Self::with_models_without_env_api_key(id, None, http, models);
+        provider.require_auth = false;
+        provider
+    }
+
+    /// Reuse Responses serialization and SSE handling for a provider-native
+    /// endpoint whose URL and authentication have already been resolved.
+    pub(crate) fn stream_simple_with_endpoint(
+        &self,
+        model: &Model,
+        ctx: &Context,
+        opts: &SimpleStreamOptions,
+        url: String,
+        mut headers: std::collections::BTreeMap<String, String>,
+    ) -> AssistantMessageEventStream {
+        let (mut producer, stream) =
+            create_assistant_message_event_stream_with_cancellation(&opts.signal);
+        let deployment_key = headers.keys().find(|name| name.eq_ignore_ascii_case("x-omp-azure-deployment")).cloned();
+        let deployment = deployment_key.and_then(|name| headers.remove(&name));
+        let mut body = build_request(model, ctx, opts);
+        if let Some(deployment) = deployment { body["model"] = json!(deployment); }
+        let preparation = Ok(PreparedRequest {
+            headers,
+            body,
+            custom_tool_properties: grammar_tool_properties(model, &ctx.tools),
+            url: Some(url),
+        });
+        let model = model.clone();
+        let http = self.http.clone();
+        let mut opts = opts.clone();
+        opts.signal = producer.cancellation_token();
+        tokio::spawn(async move {
+            run_stream(&mut producer, http, &model, preparation, &opts).await;
+        });
+        stream
     }
 }
 struct PreparedRequest {
     headers: std::collections::BTreeMap<String, String>,
     body: Value,
     custom_tool_properties: HashMap<String, String>,
+    url: Option<String>,
 }
 
 fn prepare_request<F>(
@@ -98,6 +146,7 @@ fn prepare_request<F>(
     opts: &SimpleStreamOptions,
     provider_key: &Option<String>,
     allow_env_api_key: bool,
+    require_auth: bool,
     build_body: F,
 ) -> Result<PreparedRequest, String>
 where
@@ -114,8 +163,9 @@ where
     }
     let key = resolve_api_key(provider_key, opts, allow_env_api_key);
     apply_api_key(&mut headers, key);
-    if !headers.keys().any(|name| {
+    if require_auth && !headers.keys().any(|name| {
         name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+            || name.eq_ignore_ascii_case("cf-aig-authorization")
     }) {
         return Err("No API key".to_string());
     }
@@ -126,6 +176,7 @@ where
         headers,
         body: build_body(model, ctx, opts),
         custom_tool_properties: grammar_tool_properties(model, &ctx.tools),
+        url: None,
     })
 }
 
@@ -151,7 +202,7 @@ impl Provider for OpenAiResponsesProvider {
         // Prepare headers while the caller's Context is borrowed. The helper
         // returns an error result for the producer task, so auth failure still
         // follows the original terminal Error event path without a dummy body.
-        let preparation = prepare_request(model, ctx, opts, &key, allow_env_api_key, build_request);
+        let preparation = prepare_request(model, ctx, opts, &key, allow_env_api_key, self.require_auth, build_request);
         let model = model.clone();
         let mut opts = opts.clone();
         opts.signal = producer.cancellation_token();
@@ -1254,7 +1305,7 @@ async fn run_stream(
     opts: &SimpleStreamOptions,
 ) {
     let mut out = AssistantMessage::empty(
-        Api::OpenaiResponses,
+        model.api.clone(),
         model.provider.clone(),
         model.id.clone(),
         now_ms(),
@@ -1263,6 +1314,7 @@ async fn run_stream(
         headers,
         body,
         custom_tool_properties,
+        url,
     } = match preparation {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -1270,7 +1322,7 @@ async fn run_stream(
             return;
         }
     };
-    let url = responses_url(&model.base_url);
+    let url = url.unwrap_or_else(|| responses_url(model));
     let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
     let mut builder = http.post(&url).timeout(timeout);
@@ -1949,7 +2001,48 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
             }
         }
     }
+    let xai = matches!(model.provider.as_str(), "xai" | "xai-oauth");
+    if xai {
+        if let Some(maximum) = body["max_output_tokens"].as_u64() {
+            body["max_output_tokens"] = json!(maximum.min(64_000));
+        }
+    }
+    let encrypted_reasoning = matches!(model.compat.as_ref(),
+        Some(StreamingProtocolCompat::OpenaiResponses(compat))
+            if compat.include_encrypted_reasoning == Some(true));
+    if encrypted_reasoning || (xai && model.reasoning) {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+    if model.api == Api::OpenaiCodexResponses {
+        shape_codex_request(&mut body);
+    }
     body
+}
+
+/// ChatGPT's Codex endpoint speaks Responses SSE, but rejects the public
+/// API's sampling/output limits and requires stateless encrypted reasoning.
+fn shape_codex_request(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else { return };
+    for name in [
+        "max_output_tokens", "max_completion_tokens", "temperature", "top_p",
+        "top_k", "min_p", "presence_penalty", "repetition_penalty",
+        "frequency_penalty", "stop", "prompt_cache_retention",
+    ] { object.remove(name); }
+    object.entry("instructions").or_insert_with(|| json!(""));
+    object.insert("store".into(), json!(false));
+    object.insert("stream".into(), json!(true));
+    object.insert("include".into(), json!(["reasoning.encrypted_content"]));
+    if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
+        reasoning.insert("summary".into(), json!("auto"));
+    }
+    if let Some(input) = object.get_mut("input").and_then(Value::as_array_mut) {
+        input.retain(|item| item["type"] != "item_reference");
+        for item in input {
+            if item["type"] != "computer_call" {
+                if let Some(item) = item.as_object_mut() { item.remove("id"); }
+            }
+        }
+    }
 }
 
 /// Build the Responses output-message shape used when replaying an assistant
@@ -2349,15 +2442,28 @@ fn response_incomplete_reason<'a>(response: &'a Value, event: &'a Value) -> Opti
                 .and_then(Value::as_str)
         })
 }
-fn responses_url(base: &str) -> String {
-    let b = base.trim_end_matches('/');
-    if b.ends_with("/v1") {
+fn responses_url(model: &Model) -> String {
+    let b = model.base_url.trim_end_matches('/');
+    if model.api == Api::OpenaiCodexResponses {
+        if b.ends_with("/codex/responses") {
+            b.to_owned()
+        } else if b.ends_with("/codex") {
+            format!("{b}/responses")
+        } else {
+            format!("{b}/codex/responses")
+        }
+    } else if b.ends_with("/v1") {
         format!("{b}/responses")
     } else {
         format!("{b}/v1/responses")
     }
 }
 fn reasoning_effort(model: &Model, l: ThinkingLevel) -> Option<String> {
+    if matches!(model.compat.as_ref(), Some(StreamingProtocolCompat::OpenaiResponses(compat))
+        if compat.supports_reasoning_effort == Some(false) || compat.omit_reasoning_effort == Some(true))
+    {
+        return None;
+    }
     if let Some(map) = &model.thinking_level_map {
         if let Some(mapped) = map.get(&l) {
             return mapped.clone();
@@ -2578,6 +2684,7 @@ mod tests {
             &opts,
             &None,
             false,
+            true,
             |_, _, _| panic!("missing credentials must not build the request"),
         );
         assert!(matches!(&prepared, Err(message) if message == "No API key"));
@@ -2616,6 +2723,7 @@ mod tests {
             &opts,
             &None,
             false,
+            true,
             build_request,
         )
         .unwrap();
@@ -2655,6 +2763,7 @@ mod tests {
                 &opts,
                 &Some("fixture-key".into()),
                 false,
+                true,
                 build_request,
             )
             .unwrap();
@@ -4209,5 +4318,27 @@ mod tests {
         assert_eq!(input[output_index]["call_id"], legacy_id);
 
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_compat_tests {
+    use super::*;
+
+    #[test]
+    fn supergrok_output_budget_and_reasoning_follow_native_limits() {
+        let mut model = Model::new("grok-build-0.1", "Grok Build", Api::OpenaiResponses, "xai-oauth", "https://api.x.ai/v1");
+        model.reasoning = true;
+        model.max_tokens = 1_000_000;
+        model.compat = Some(StreamingProtocolCompat::OpenaiResponses(crate::model::OpenaiResponsesCompat {
+            supports_reasoning_effort: Some(false),
+            include_encrypted_reasoning: Some(true),
+            ..Default::default()
+        }));
+        let options = SimpleStreamOptions { reasoning: Some(ThinkingLevel::High), ..Default::default() };
+        let request = build_request(&model, &Context::default(), &options);
+        assert_eq!(request["max_output_tokens"], 64_000);
+        assert!(request.get("reasoning").is_none());
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
     }
 }

@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the bottom input toggle; a previously saved `bottom_input` preference no longer disables the input.
 
 ### Fixed
+- Fix duplicate Antigravity model-route registration causing false ambiguous-model errors; host-declared transports now replace bundled routes for the same model identity.
 - Keep Markdown agent replies updating during continuous streams and reduce OMP streaming payloads.
 - Display streamed agent thinking text instead of leaving the chat blank while a model is reasoning.
 - `/model` opens model selection instead of authentication; selecting an already authenticated provider no longer starts another login.

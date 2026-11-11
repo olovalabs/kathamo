@@ -2174,3 +2174,78 @@ fn case_distinct_wire_model_ids_select_the_exact_route() {
     }, &registry, &BTreeMap::new()).unwrap_err();
     assert!(matches!(error, ResolveError::AmbiguousModel { .. }));
 }
+
+#[test]
+fn host_declaration_replaces_builtin_antigravity_route() {
+    use rpi_ai::providers::antigravity;
+
+    let models = antigravity::models();
+    let source: antigravity::AccountSource = Arc::new(|_| {
+        Box::pin(async { Err("Unexpected account lookup during model resolution".into()) })
+    });
+    let provider = antigravity::AntigravityProvider::with_models(
+        reqwest::Client::new(),
+        source,
+        models.clone(),
+    );
+    let mut registry = RuntimeFactories::default();
+    registry.declare(crate::ProviderDeclaration {
+        id: antigravity::ID.into(),
+        models,
+        api_key_env: None,
+        requires_auth: false,
+    });
+    registry.register(Arc::new(provider), rpi_ai::Api::GoogleGenerativeAi);
+    let resolved = crate::RuntimeConfig::default().resolve(
+        &crate::ModelRequest {
+            provider: Some(antigravity::ID),
+            model: Some("gemini-3.8-flash"),
+            ..Default::default()
+        },
+        &registry,
+        &BTreeMap::new(),
+    ).unwrap();
+
+    assert_eq!(resolved.model.api, rpi_ai::Api::GoogleGenerativeAi);
+    assert_eq!(resolved.model.base_url, antigravity::ENDPOINT);
+    assert_eq!(
+        resolved.provider.models().iter().filter(|model| model.id == "gemini-3.8-flash").count(),
+        1,
+        "the native host route must replace, not duplicate, the bundled route",
+    );
+}
+
+#[test]
+fn host_declaration_preserves_its_explicit_wire_variants() {
+    let mut registry = RuntimeFactories::default();
+    registry.declare(crate::ProviderDeclaration {
+        id: "openai".into(),
+        models: vec![
+            Model::new("gpt-6-astra", "Chat", rpi_ai::Api::OpenaiCompletions, "openai", "https://chat.example/v1"),
+            Model::new("gpt-6-astra", "Responses", rpi_ai::Api::OpenaiResponses, "openai", "https://responses.example/v1"),
+        ],
+        api_key_env: None,
+        requires_auth: true,
+    });
+    let mut config = crate::RuntimeConfig::default();
+    config.credentials.insert("openai".into(), Credential::ApiKey {
+        key: Some("fixture-key".into()), env: None,
+    });
+    for (api, endpoint) in [
+        (rpi_ai::Api::OpenaiCompletions, "https://chat.example/v1"),
+        (rpi_ai::Api::OpenaiResponses, "https://responses.example/v1"),
+    ] {
+        let resolved = config.resolve(
+            &crate::ModelRequest {
+                provider: Some("openai"),
+                model: Some("gpt-6-astra"),
+                api: Some(api.clone()),
+                ..Default::default()
+            },
+            &registry,
+            &BTreeMap::new(),
+        ).unwrap();
+        assert_eq!(resolved.model.api, api);
+        assert_eq!(resolved.model.base_url, endpoint);
+    }
+}

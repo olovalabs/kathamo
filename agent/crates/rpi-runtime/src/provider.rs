@@ -950,10 +950,14 @@ fn build_catalog(
             merge_auth_headers(model, &crate::values::resolve_headers(headers, None, values));
         }
     }
-    let mut positions: BTreeMap<_, _> = catalog.iter().enumerate()
-        .map(|(index, model)| ((model.provider.clone(), model.id.clone(), model.api.as_str().to_owned()), index))
-        .collect();
     for manifest in manifests {
+        // Host declarations own the wire routes for their model identities.
+        // Replace bundled routes before adding the declaration's API variants.
+        let declared: std::collections::HashSet<_> =
+            manifest.models.iter().map(|model| model.id.as_str()).collect();
+        catalog.retain(|model| {
+            model.provider != manifest.id || !declared.contains(model.id.as_str())
+        });
         let config = cfg.providers.get(&manifest.id);
         for mut model in manifest.models.clone() {
             if let Some(base) = config.and_then(|config| config.base_url.as_ref()) {
@@ -965,13 +969,7 @@ fn build_catalog(
                     &crate::values::resolve_headers(headers, None, values),
                 );
             }
-            let key = (model.provider.clone(), model.id.clone(), model.api.as_str().to_owned());
-            if let Some(index) = positions.get(&key) {
-                catalog[*index] = model;
-            } else {
-                positions.insert(key, catalog.len());
-                catalog.push(model);
-            }
+            catalog.push(model);
         }
     }
     merge_user_catalog(&mut catalog, cfg, values);

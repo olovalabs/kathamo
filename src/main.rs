@@ -1786,6 +1786,7 @@ fn supported_thinking_effort(level: &str) -> bool {
 struct PaneChat {
     worker_view: Option<WorkerView>,
     active: bool,
+    info_open: bool,
     bridge: Option<ModelBridge>,
     bridge_model: Option<agent_auth::AgentModel>,
 
@@ -1831,6 +1832,7 @@ impl Default for PaneChat {
     fn default() -> Self {
         Self {
             active: false,
+            info_open: false,
             worker_view: None,
             bridge: None,
             bridge_model: None,
@@ -8458,8 +8460,8 @@ impl AppState {
         let cwd_display = agent_cwd
             .map(|path| Self::format_path_display(path))
             .unwrap_or_else(|| self.pane_cwd_display(pane));
-        let git_branch = if let Some(cwd) = agent_cwd {
-            Self::detect_git_branch(cwd)
+        let git_branch = if pane.chat.active {
+            None
         } else {
             self.pane_git_branch(pane)
         };
@@ -8550,6 +8552,12 @@ impl AppState {
                         {
                             cx.stop_propagation();
                             this.close_agent_auth(pane_id, window, cx);
+                        } else if let Some(pane) = this.pane_mut(pane_id)
+                            && pane.chat.info_open
+                        {
+                            cx.stop_propagation();
+                            pane.chat.info_open = false;
+                            cx.notify();
                         }
                     },
                 ))
@@ -8885,8 +8893,8 @@ impl AppState {
                                 this.handle_pane_ctrl_c(pane_id, window, cx);
                             })),
                     ))
-                    // Badge 1: Directory
-                    .child(
+                    // Agent metadata lives in the right-side info drawer.
+                    .when(!pane.chat.active, |row| row.child(
                         div()
                             .id(("kathamo-badge-cwd", pane_id))
                             .flex()
@@ -8911,7 +8919,7 @@ impl AppState {
                                     .text_color(dir_text_color)
                                     .child(cwd_display),
                             ),
-                    )
+                    ))
                     // Badge 2: Git branch
                     .when_some(git_branch, |this, branch| {
                         this.child(
@@ -8940,6 +8948,42 @@ impl AppState {
                                         .child(branch),
                                 ),
                         )
+                    })
+                    .when(pane.chat.active, |row| {
+                        row.child(div().flex_1().min_w_0()).child(
+                            div()
+                                .id(("agent-info-toggle", pane_id))
+                                .debug_selector(|| "agent-info-toggle".into())
+                                .size(px(28.0))
+                                .flex_shrink_0()
+                                .rounded(px(7.0))
+                                .border_1()
+                                .border_color(tokens.border_subtle)
+                                .bg(tokens.pane_header_bg)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor(CursorStyle::PointingHand)
+                                .hover(|style| style.bg(tokens.pane_header_btn_hover))
+                                .tooltip(|window, cx| {
+                                    gpui_component::tooltip::Tooltip::new("Environment").build(window, cx)
+                                })
+                                .child(
+                                    svg().path("icons/info.svg").size(px(15.0))
+                                        .text_color(if pane.chat.info_open {
+                                            tokens.text_primary
+                                        } else {
+                                            tokens.text_muted
+                                        }),
+                                )
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(pane) = this.pane_mut(pane_id) {
+                                        pane.chat.info_open = !pane.chat.info_open;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
                     }),
             )
             // Row 2: Staged image attachments
@@ -8967,6 +9011,9 @@ impl AppState {
                         )
                     }),
             )
+            .when(pane.chat.active && pane.chat.info_open, |this| {
+                this.child(self.render_agent_info(pane, cx))
+            })
     }
 
     /// Kathamo-style completion popup, anchored above the input bar.
@@ -11211,6 +11258,98 @@ impl AppState {
             .child(inner)
             .into_any_element()
     }
+    fn render_agent_info(
+        &self,
+        pane: &TerminalPane,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let pane_id = pane.id;
+        let tokens = self.tokens(cx);
+        div()
+            .id(("agent-info", pane_id))
+            .absolute()
+            .bottom(gpui::relative(1.0))
+            .mb(px(8.0))
+            .right(px(12.0))
+            .max_w_full()
+            .flex()
+            .when(pane.chat.info_open, |this| {
+                let cwd_display = pane.chat.cwd.as_deref()
+                    .map(Self::format_path_display)
+                    .unwrap_or_else(|| self.pane_cwd_display(pane));
+                let branch = if let Some(cwd) = pane.chat.cwd.as_deref() {
+                    Self::detect_git_branch(cwd)
+                } else {
+                    self.pane_git_branch(pane)
+                };
+                this.child(
+                    div()
+                        .overflow_hidden()
+                        .flex_shrink(1.0)
+                        .min_w_0()
+                        .child(
+                            div()
+                                .id(("agent-info-panel", pane_id))
+                                .debug_selector(|| "agent-info-panel".into())
+                                .ml(px(8.0))
+                                .w(px(260.0))
+                                .rounded(px(12.0))
+                                .border_1()
+                                .border_color(tokens.card_border)
+                                .bg(tokens.pane_header_bg)
+                                .shadow_lg()
+                                .flex()
+                                .flex_col()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .child(
+                                    div()
+                                        .px(px(14.0))
+                                        .pt(px(12.0))
+                                        .pb(px(8.0))
+                                        .text_size(px(11.0))
+                                        .text_color(tokens.text_muted)
+                                        .child("Environment"),
+                                )
+                                .children([
+                                    ("Working directory", "icons/folder.svg", cwd_display),
+                                    ("Git branch", "icons/git-branch.svg",
+                                        branch.unwrap_or_else(|| "Not in a Git repository".into())),
+                                ].into_iter().enumerate().map(|(index, (label, icon, value))| {
+                                    div()
+                                        .id(("agent-info-section", index))
+                                        .px(px(14.0))
+                                        .py(px(12.0))
+                                        .when(index > 0, |row| row.border_t_1()
+                                            .border_color(tokens.border_subtle))
+                                        .flex()
+                                        .items_start()
+                                        .gap(px(10.0))
+                                        .child(svg().path(icon).size(px(15.0))
+                                            .flex_shrink_0().text_color(tokens.text_secondary))
+                                        .child(
+                                            div().flex_1().min_w_0().flex().flex_col().gap(px(5.0))
+                                                .child(div().text_size(px(11.0))
+                                                    .text_color(tokens.text_muted).child(label))
+                                                .child(div().text_size(px(12.0))
+                                                    .text_color(tokens.text_primary)
+                                                    .font_family(MONO_FONT)
+                                                    .whitespace_normal()
+                                                    .overflow_hidden()
+                                                    .child(value)),
+                                        )
+                                })),
+                        )
+                        .with_animation(
+                            ("agent-info-slide", pane_id),
+                            Animation::new(std::time::Duration::from_millis(180)),
+                            |element, delta| element.w(px(268.0 * delta)),
+                        ),
+                )
+            })
+    }
+
     fn render_terminal_pane(
         &self,
         pane: &TerminalPane,
@@ -14690,6 +14829,33 @@ mod resize_tests {
         let cx = VisualTestContext::from_window(*handle.deref(), cx);
         cx.run_until_parked();
         (cx, state)
+    }
+
+    #[test]
+    fn agent_info_toggle_stays_in_composer_toolbar() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        cx.draw_frame().unwrap();
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| s.set_chat_mode(id, true, window, cx));
+        cx.draw_frame().unwrap();
+        let input = cx.debug_bounds("kathamo-input-bar").unwrap();
+        let mode = cx.debug_bounds("input-mode-agent-pill").unwrap();
+        let toggle = cx.debug_bounds("agent-info-toggle").unwrap();
+        let editor = cx.debug_bounds("agent-composer-input").unwrap();
+        assert!((toggle.center().y - mode.center().y).abs() < px(1.0));
+        assert!(toggle.bottom() < editor.top());
+        assert!((input.right() - toggle.right() - px(12.0)).abs() < px(1.0));
+        cx.simulate_click(toggle.center(), Modifiers::none());
+        cx.draw_frame().unwrap();
+        cx.background_executor.advance_clock(std::time::Duration::from_millis(220));
+        cx.draw_frame().unwrap();
+        let panel = cx.debug_bounds("agent-info-panel").unwrap();
+        assert!(panel.bottom() < input.top());
+        assert!((panel.right() - toggle.right()).abs() < px(1.0));
+        cx.simulate_click(toggle.center(), Modifiers::none());
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-info-panel").is_none());
     }
 
     #[test]

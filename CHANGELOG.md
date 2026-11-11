@@ -47,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Moved the Agent composer's working-directory and Git-branch badges into a compact Environment panel. Click the info icon at the toolbar's top-right, on the same row as Agent and the model picker, to slide it open directly above the input, aligned to its right edge; click again or press Escape from the composer to close it. Terminal badges remain inline.
 - Moved initial Markdown/HTML parsing and syntax highlighting off GPUI; bounded pending documents/results with latest-state mailboxes and monotonic compatible-prefix publication during continuous streaming.
 - Coalesced embedded-session wake callbacks before mutex/channel work, scanned only unfinished Markdown boundaries, and removed per-cell snapshot strings and whole-match-list searches from terminal painting.
 - Added queue residence/backpressure, tool snapshot-to-paint and PTY read/parse-to-paint diagnostics, plus reproducible streaming performance benchmarks.

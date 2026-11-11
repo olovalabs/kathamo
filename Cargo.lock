@@ -5230,7 +5230,6 @@ dependencies = [
  "libc",
  "parking_lot",
  "portable-pty",
- "provider",
  "regex",
  "rfd",
  "rpi-embedded",
@@ -7222,21 +7221,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "provider"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "directories",
- "flate2",
- "rand 0.8.8",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
-]
-
-[[package]]
 name = "psm"
 version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7986,14 +7970,20 @@ dependencies = [
 name = "rpi-embedded"
 version = "0.21.0"
 dependencies = [
+ "base64 0.22.1",
+ "reqwest",
  "rpi-agent",
  "rpi-ai",
  "rpi-cli",
  "rpi-extensions",
  "rpi-harness",
  "rpi-runtime",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

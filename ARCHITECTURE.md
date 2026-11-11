@@ -131,7 +131,7 @@ Kathamo follows Zed's per-platform directory convention (`src/paths.rs`):
 - `settings.json` is user-editable and parsed as JSONC (comments allowed). It stores app appearance, window bounds/state, and the `restore` toggles.
 - `workspace.json` is auto-managed and debounced (300 ms) with an atomic temp+rename write and a generation guard. It records project paths, tab titles/logos, the split tree, per-pane cwd, input drafts, command history, and selected agent models/session ids.
 - Scrollback is written separately (on close, quit, and every 30 s while dirty) so the debounced hot path stays small. Restored panes spawn a fresh shell in the saved cwd and seed the previous buffer above the new prompt.
-- Agent transcripts are appended as raw events and replayed through `push_chat_event`, so the restored UI matches the previous session exactly. rpi conversations resume by reopening the durable session id through the embedded agent (below); OMP restores the transcript only.
+- Agent transcripts are appended as raw events and replayed through `push_chat_event`, so the restored UI matches the previous session exactly. Embedded sessions reopen their durable session id. Historical OMP sessions restore their transcript.
 - Window geometry is loaded synchronously before `open_window`, validated against the current displays, and saved on close/quit.
 - Legacy v1 `workspace.json` files (including the old `com.Markup.Markup` location) are backed up to `<data>/backups/` and migrated automatically.
 
@@ -160,8 +160,7 @@ from the upstream library crates.
   stale resumed session id falls back to a fresh durable session.
 - **Discovery and login.** Model catalogs and provider readiness are read
   in-process through `rpi_embedded::catalog`/`providers`. rpi-only API-key and
-  OAuth logins are driven in-process. The Kathamo provider uses its bundled
-  runtime for PTY login and RPC, with a private data directory.
+  OAuth logins are driven in-process through the embedded provider configuration.
 - **Baseline.** The old subprocess bridge is retained behind
   `KATHAMO_RPI_BACKEND=rpc` for before/after measurements. The default is the
   embedded backend. `KATHAMO_STREAM_TIMINGS=1` reports startup, UI drain/apply,
@@ -173,40 +172,18 @@ from the upstream library crates.
 See `EMBEDDED_AGENT.md` for the upstream commit, integration details, verification
 and remaining limitations.
 
-### 2.7 Bundled OMP backend (`src/omp_bridge.rs`)
+### 2.7 Native Gemini API
 
-The Kathamo provider uses a pinned OMP executable over RPC JSONL, not an
-in-process Rust embedding. The GPUI presentation and persisted `AgentEvent`
-contract remain shared with rpi.
-
-- **Execution.** Startup passes the chosen reasoning level and explicit
-  approval policy. System instructions favor independent read/search batches
-  and deterministic multi-step local scripts while retaining upstream's
-  shared/exclusive tool barriers, tools, extensions and context discovery.
-- **Backpressure.** `src/omp_bridge_queue.rs` holds at most 1,024 records.
-  Adjacent same-channel text/reasoning (including compatible worker deltas)
-  merges up to 16 KiB. New cumulative snapshots supersede the same call's old
-  snapshot only within an uninterrupted snapshot run. Structural boundaries
-  and full terminal results are never discarded. Producers wait for capacity;
-  UI drains use a nonblocking lock and retain the per-frame record budget.
-- **Interactions.** `src/omp_bridge_ui.rs` owns transient request IDs and
-  deadlines independently of transcript events. GPUI dialogs answer the pinned
-  select/confirm/input/editor/ask protocol. Stale, cancelled, expired and
-  mismatched responses cannot grant permission. Pane/backend replacement binds
-  callbacks to the originating bridge rather than a reusable dialog ID.
-- **Trust.** Canonical project paths are explicitly trusted in user settings,
-  never inferred from workspace content. Protected sessions use `write`;
-  confirmed trusted sessions use `yolo`. Working directories must remain
-  canonically inside the trusted project. This selects approval policy, not OS
-  confinement; active turns keep their authority until completion/cancellation.
-- **Timing.** Only `KATHAMO_STREAM_TIMINGS=1` installs the managed
-  `assets/integrations/omp-timing.mjs` extension. Native before-request and
-  after-response hooks emit elapsed time/status, never payload/header/secret
-  data. Reader observations distinguish argument completion from tool start,
-  and correlate completion with the next provider request/model delta. UI
-  markers retain arrival→apply/card/output measurements. Missing observations
-  are not replaced with inferred durations.
-
+The embedded model catalog registers `google/gemini-3.8-flash`. The Rust
+OpenAI-compatible HTTP transport sends requests to Google's Gemini API,
+streams text and reasoning, and carries Gemini thought signatures through
+tool calls and history. The host uses the embedded before-tool-call hook to
+ask for approval before running tools other than file reads and searches.
+The separate `google-antigravity/gemini-3.8-flash` provider uses Cloud Code
+Assist streaming. The embedded login worker performs OAuth with PKCE over a
+loopback redirect, discovers the account's project, and renews its credential
+from the local Antigravity auth store. The provider reuses the same event
+batching and tool approval path as the public Gemini API.
 
 ---
 

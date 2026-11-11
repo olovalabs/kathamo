@@ -44,30 +44,6 @@ pub fn enabled() -> bool {
     *ENABLED
 }
 
-/// A managed, metadata-only extension. It is never loaded in ordinary runs.
-pub(crate) fn omp_timing_extension() -> Result<std::path::PathBuf, String> {
-    static EXTENSION: LazyLock<Result<std::path::PathBuf, String>> = LazyLock::new(|| {
-        let directory = crate::provider::runtime::root().join("instrumentation");
-        std::fs::create_dir_all(&directory)
-            .map_err(|error| format!("Could not prepare provider timings: {error}"))?;
-        let path = directory.join("omp-timing.mjs");
-        let temporary = directory.join(format!("omp-timing-{}.tmp", std::process::id()));
-        let publish = || -> std::io::Result<()> {
-            std::fs::write(
-                &temporary,
-                include_str!("../assets/integrations/omp-timing.mjs"),
-            )?;
-            std::fs::rename(&temporary, &path)
-        };
-        if let Err(error) = publish() {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(format!("Could not install provider timings: {error}"));
-        }
-        Ok(path)
-    });
-    EXTENSION.clone()
-}
-
 #[derive(Default)]
 struct Stats {
     count: u64,
@@ -77,16 +53,6 @@ struct Stats {
 static STATS: LazyLock<Mutex<HashMap<&'static str, Stats>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static REPORT_ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
-static OMP_WORKER_FRAMES: AtomicU64 = AtomicU64::new(0);
-static OMP_WORKER_BYTES: AtomicU64 = AtomicU64::new(0);
-
-pub fn omp_worker_frame(bytes: usize) {
-    if enabled() {
-        OMP_WORKER_FRAMES.fetch_add(1, Ordering::Relaxed);
-        OMP_WORKER_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-}
-
 static NEXT_REPORT_MS: AtomicU64 = AtomicU64::new(0);
 
 fn with_stats<R>(f: impl FnOnce(&mut HashMap<&'static str, Stats>) -> R) -> R {
@@ -146,16 +112,11 @@ pub fn report_now() {
 
 fn report() {
     let mut entries: Vec<(&'static str, Stats)> = with_stats(|stats| stats.drain().collect());
-    let worker_frames = OMP_WORKER_FRAMES.swap(0, Ordering::Relaxed);
-    let worker_bytes = OMP_WORKER_BYTES.swap(0, Ordering::Relaxed);
-    if entries.is_empty() && worker_frames == 0 && worker_bytes == 0 {
+    if entries.is_empty() {
         return;
     }
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.1.count));
     eprintln!("kathamo stream timings (us, per report window):");
-    if worker_frames != 0 || worker_bytes != 0 {
-        eprintln!("  bridge.omp.worker_wire frames={worker_frames} bytes={worker_bytes}");
-    }
     for (label, mut stats) in entries {
         stats.samples.sort_unstable();
         let percentile = |fraction: f64| -> u64 {
@@ -309,16 +270,6 @@ struct TurnTrace {
     painted: [bool; 2],
     cancelled: Option<Instant>,
     settled: bool,
-    omp_request: Option<Instant>,
-    omp_last_tool_end: Option<Instant>,
-    omp_first_tool: bool,
-    omp_calls: HashMap<String, OmpCallTrace>,
-}
-
-#[derive(Clone, Copy)]
-struct OmpCallTrace {
-    request: Option<Instant>,
-    arguments_complete: Option<Instant>,
 }
 
 impl TurnTrace {
@@ -382,30 +333,8 @@ pub fn turn_sent(trace: u64, warm: bool) {
             painted: [false; 2],
             cancelled: None,
             settled: false,
-            omp_request: None,
-            omp_last_tool_end: None,
-            omp_first_tool: false,
-            omp_calls: HashMap::new(),
         },
     );
-}
-
-/// RPC acknowledged admission of the correlated OMP prompt.
-pub fn omp_prompt_admitted(trace: u64, received: Instant) {
-    if !enabled() {
-        return;
-    }
-    let phase = lock(&TURNS).get(&trace).map(|turn| {
-        let label = if turn.warm {
-            "turn.warm.omp.send_to_admission"
-        } else {
-            "turn.cold.omp.send_to_admission"
-        };
-        (label, turn.sent)
-    });
-    if let Some((label, sent)) = phase {
-        record(label, received.saturating_duration_since(sent));
-    }
 }
 
 /// The provider request was handed to the HTTP client. Fired from the
@@ -426,144 +355,6 @@ pub fn turn_provider_request(trace: u64) {
     let label = phase_label(turn.warm, "send_to_provider");
     drop(turns);
     record_since(label, sent);
-}
-
-/// A native OMP request hook reached the reader. This is an observation
-/// boundary, not a claim about server receipt or network-only duration.
-pub(crate) fn omp_provider_request(trace: u64, received: Instant) {
-    if !enabled() {
-        return;
-    }
-    let mut turns = lock(&TURNS);
-    let Some(turn) = turns.get_mut(&trace) else {
-        return;
-    };
-    let first = if turn.provider_request.is_none() {
-        turn.provider_request = Some(received);
-        Some((phase_label(turn.warm, "send_to_provider"), turn.sent))
-    } else {
-        None
-    };
-    turn.omp_request = Some(received);
-    let ended = turn.omp_last_tool_end.take();
-    drop(turns);
-    if let Some((label, sent)) = first {
-        record(label, received.saturating_duration_since(sent));
-    }
-    if let Some(ended) = ended {
-        record(
-            "tool.group_end_to_provider_request",
-            received.saturating_duration_since(ended),
-        );
-    }
-}
-
-/// Measured inside OMP with one monotonic clock, before request payload
-/// dispatch to response headers. Includes preparation and intervening retries.
-pub(crate) fn omp_http_headers(elapsed_ms: f64, status: Option<u16>) {
-    if !enabled() || !elapsed_ms.is_finite() || !(0.0..=86_400_000.0).contains(&elapsed_ms) {
-        return;
-    }
-    let elapsed = Duration::from_secs_f64(elapsed_ms / 1_000.0);
-    record("provider.request_to_headers", elapsed);
-    if status.is_some_and(|status| status >= 400) {
-        record("provider.headers_error", elapsed);
-    }
-}
-
-/// The provider finished a tool's arguments. Separate from execution admission:
-/// approval and scheduler waits must not be mislabeled as model generation.
-pub(crate) fn omp_tool_arguments_complete(trace: u64, id: &str, received: Instant) {
-    if !enabled() {
-        return;
-    }
-    let mut turns = lock(&TURNS);
-    let Some(turn) = turns.get_mut(&trace) else {
-        return;
-    };
-    if turn.omp_calls.len() >= MAX_TRACKED_TOOLS {
-        turn.omp_calls.clear();
-    }
-    let request = turn.omp_request;
-    turn.omp_calls.insert(
-        id.to_owned(),
-        OmpCallTrace {
-            request,
-            arguments_complete: Some(received),
-        },
-    );
-    drop(turns);
-    if let Some(request) = request {
-        record(
-            "tool.provider_request_to_arguments",
-            received.saturating_duration_since(request),
-        );
-    }
-}
-
-/// The tool-start record reached OMP's reader: execution admission, separate
-/// from argument completion so scheduler and approval waits remain visible.
-pub(crate) fn omp_tool_started(trace: u64, id: &str, received: Instant) {
-    if !enabled() {
-        return;
-    }
-    let mut turns = lock(&TURNS);
-    let Some(turn) = turns.get_mut(&trace) else {
-        return;
-    };
-    if turn.omp_calls.len() >= MAX_TRACKED_TOOLS && !turn.omp_calls.contains_key(id) {
-        turn.omp_calls.clear();
-    }
-    let request = turn.omp_request;
-    let call = *turn.omp_calls.entry(id.to_owned()).or_insert(OmpCallTrace {
-        request,
-        arguments_complete: None,
-    });
-    let first = if !turn.omp_first_tool {
-        turn.omp_first_tool = true;
-        Some(turn.sent)
-    } else {
-        None
-    };
-    drop(turns);
-    if let Some(request) = call.request {
-        record(
-            "tool.provider_request_to_start",
-            received.saturating_duration_since(request),
-        );
-    }
-    if let Some(arguments) = call.arguments_complete {
-        record(
-            "tool.arguments_to_start",
-            received.saturating_duration_since(arguments),
-        );
-    }
-    if let Some(sent) = first {
-        record(
-            "tool.send_to_first_start",
-            received.saturating_duration_since(sent),
-        );
-    }
-}
-
-pub(crate) fn omp_tool_cycle_end(trace: u64, id: &str, received: Instant) {
-    if !enabled() {
-        return;
-    }
-    let mut turns = lock(&TURNS);
-    let Some(turn) = turns.get_mut(&trace) else {
-        return;
-    };
-    let request = turn.omp_calls.remove(id).and_then(|call| call.request);
-    turn.omp_last_tool_end = Some(received);
-    turn.last_tool_end = Some(received);
-    drop(turns);
-    if let Some(request) = request {
-        record(
-            "tool.provider_request_to_end",
-            received.saturating_duration_since(request),
-        );
-    }
 }
 
 /// The first non-empty delta for `kind` reached the bridge.

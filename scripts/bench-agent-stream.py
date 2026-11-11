@@ -48,10 +48,20 @@ class Fixture(http.server.BaseHTTPRequestHandler):
         ][:1]
         burst = any(BURST_PROMPT in prompt for prompt in prompts)
         slow = any("Slow 200 tokens." in prompt for prompt in prompts)
+        gemini = body.get("model") == "gemini-3.8-flash"
         run_tools = any("Run two benchmark tools." in prompt for prompt in prompts)
         messages = body.get("messages", [])
         request_tools = run_tools and messages and messages[-1]["role"] != "tool"
         fail = any("Fail request." in prompt for prompt in prompts)
+        if gemini and run_tools:
+            fail = body.get("extra_body", {}).get("google", {}).get("thinking_config", {}).get("thinking_level") != "low"
+            if not request_tools:
+                assistant = next(message for message in reversed(messages) if message["role"] == "assistant")
+                signatures = [call["extra_content"]["google"]["thought_signature"] for call in assistant["tool_calls"]]
+                results = [message["content"] for message in messages[-2:] if message["role"] == "tool"]
+                fail |= signatures != ["fixture-0", "fixture-1"] or not all(
+                    any(value in result for result in results) for value in ("113", "127")
+                )
         if "Check switched provider history." in prompts:
             prior_turn = any(
                 message["role"] == "user" and message.get("content") == "Remember the switch fixture."
@@ -97,7 +107,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}],
         }
         if request_tools:
-            tools = [
+            tools = [("read", {"path": "alpha.txt"}), ("read", {"path": "beta.txt"})] if gemini else [
                 ("read", {"path": "fixture.txt"}),
                 ("bash", {"command": "printf ready"}),
             ]
@@ -110,6 +120,10 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                 }
                 for index, (name, arguments) in enumerate(tools)
             ]
+            if gemini:
+                for index, call in enumerate(calls):
+                    del call["index"]
+                    call["extra_content"] = {"google": {"thought_signature": f"fixture-{index}"}}
             token["choices"][0]["delta"] = {"tool_calls": calls}
             frame = ("data: " + json.dumps(token) + "\n\n").encode()
             end = (
@@ -200,6 +214,8 @@ def main():
         cwd = Path(tmp, "project")
         cwd.mkdir()
         (cwd / "fixture.txt").write_text("benchmark fixture\n")
+        (cwd / "alpha.txt").write_text("113\n")
+        (cwd / "beta.txt").write_text("127\n")
         providers = {
             name: {
                 "api": "openai-completions",
@@ -211,6 +227,12 @@ def main():
                 ("bench", "fixture", ""),
                 ("bench-second", "switched", "/second"),
             )
+        }
+        providers["google"] = {
+            "api": "openai-completions",
+            "baseUrl": f"http://127.0.0.1:{server.server_port}/google/v1",
+            "apiKey": "loopback",
+            "models": [{"id": "gemini-3.8-flash", "reasoning": True}],
         }
         (config / "models.json").write_text(json.dumps({"providers": providers}))
         env = dict(os.environ, RPI_CODING_AGENT_DIR=str(config),
@@ -244,6 +266,8 @@ def main():
         subprocess.run([args.test_executable, "loopback_tool_latency_benchmark",
                         "--ignored", "--nocapture"],
                        env=dict(env, KATHAMO_STREAM_TIMINGS="1"), check=True, timeout=60)
+        subprocess.run([args.test_executable, "loopback_gemini_tool_round_trip",
+                        "--ignored", "--nocapture"], env=env, check=True, timeout=60)
         subprocess.run([args.test_executable, "loopback_provider_switch_keeps_context",
                         "--ignored", "--nocapture"], env=env, check=True, timeout=60)
 

@@ -2263,15 +2263,20 @@ dependencies = [
 name = "rpi-embedded"
 version = "0.21.0"
 dependencies = [
+ "base64",
+ "reqwest",
  "rpi-agent",
  "rpi-ai",
  "rpi-cli",
  "rpi-extensions",
  "rpi-harness",
  "rpi-runtime",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

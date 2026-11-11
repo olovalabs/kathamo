@@ -27,12 +27,16 @@ use std::time::Duration;
 
 use rpi_agent::events::AgentEvent as RpiEvent;
 use rpi_agent::message::AgentMessage;
+pub use rpi_agent::{BeforeToolCall, BeforeToolCallResult};
 use rpi_ai::types::{AssistantMessageEvent, StopReason};
 use rpi_cli::args::{Args, Mode};
 use rpi_cli::session::BuildError;
 use rpi_harness::agent_harness::AgentLane;
 use rpi_runtime::config::Credential;
 use rpi_runtime::{ProviderRegistry, RuntimeConfig, RuntimeSettings, ValueSource};
+
+mod antigravity;
+pub const ANTIGRAVITY: &str = rpi_ai::providers::antigravity::ID;
 
 /// One catalog row, matching the identity Kathamo shows in its model picker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,13 +57,19 @@ pub struct ProviderState {
 pub fn catalog() -> Result<Vec<ModelInfo>, String> {
     rpi_cli::provider::catalog_all()
         .map(|models| {
-            models
+            let mut rows: Vec<_> = models
                 .into_iter()
                 .map(|model| ModelInfo {
                     provider: model.provider,
                     id: model.id,
                 })
-                .collect()
+                .collect();
+            rows.retain(|model| model.provider != ANTIGRAVITY);
+            rows.push(ModelInfo {
+                provider: ANTIGRAVITY.into(),
+                id: rpi_ai::providers::antigravity::MODEL.into(),
+            });
+            rows
         })
         .map_err(|error| error.to_string())
 }
@@ -74,14 +84,22 @@ pub fn providers() -> Result<Vec<ProviderState>, String> {
     };
     let values = EnvironmentValues;
     let states = config.auth_states(&ProviderRegistry::default(), &values);
-    Ok(states
+    let mut rows: Vec<_> = states
         .into_iter()
         .map(|(id, state)| ProviderState {
             id,
             ready: state.is_ready(),
             source: Some(state.source.as_json_str().to_string()),
         })
-        .collect())
+        .collect();
+    rows.retain(|provider| provider.id != ANTIGRAVITY);
+    let ready = antigravity::ready();
+    rows.push(ProviderState {
+        id: ANTIGRAVITY.into(),
+        ready,
+        source: ready.then(|| "Google OAuth".into()),
+    });
+    Ok(rows)
 }
 
 static TOOL_ARRIVAL_HOOK: OnceLock<fn(&str)> = OnceLock::new();
@@ -146,6 +164,7 @@ pub struct SessionOptions {
     pub provider_request_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Host metadata hook for startup phases (resolve, session build, ready).
     pub phase_hook: Option<Arc<dyn Fn(&'static str, std::time::Duration) + Send + Sync>>,
+    pub before_tool_call: Option<BeforeToolCall>,
 }
 
 impl SessionOptions {
@@ -158,6 +177,7 @@ impl SessionOptions {
             append_system_prompt: None,
             provider_request_hook: None,
             phase_hook: None,
+            before_tool_call: None,
         }
     }
 
@@ -205,6 +225,7 @@ enum Command {
         fallback: Option<(Option<String>, String)>,
     },
     Abort,
+    Thinking(rpi_ai::ThinkingLevel),
     Shutdown,
 }
 
@@ -318,6 +339,17 @@ impl EmbeddedSession {
             .map_err(|_| "The agent session has closed".to_string())
     }
 
+    pub fn set_thinking_level(&self, level: &str) -> Result<(), String> {
+        let level = match level {
+            "inherit" | "auto" => rpi_ai::ThinkingLevel::Medium,
+            other => serde_json::from_value(serde_json::Value::String(other.to_owned()))
+                .map_err(|_| format!("Unsupported thinking level: {other}"))?,
+        };
+        self.commands
+            .send(Command::Thinking(level))
+            .map_err(|_| "The agent session has closed".to_string())
+    }
+
     /// Drain everything that happened since the last poll.
     pub fn poll(&mut self) -> Vec<SessionEvent> {
         let mut events = Vec::new();
@@ -381,6 +413,7 @@ async fn run_session(
         append_system_prompt,
         provider_request_hook,
         phase_hook,
+        before_tool_call,
     } = options;
     let trusted = project_trusted(&cwd);
     let started = std::time::Instant::now();
@@ -392,6 +425,9 @@ async fn run_session(
     let resolve_provider = provider.clone();
     let resolve_model = model.clone();
     let resolved = match tokio::task::spawn_blocking(move || {
+        if resolve_provider.as_deref() == Some(ANTIGRAVITY) {
+            return antigravity::resolve(resolve_model.as_deref());
+        }
         rpi_cli::provider::resolve_for_cwd(
             resolve_provider.as_deref(),
             resolve_model.as_deref(),
@@ -401,6 +437,7 @@ async fn run_session(
             &resolve_cwd,
             trusted,
         )
+        .map_err(|error| error.to_string())
     })
     .await
     {
@@ -439,13 +476,28 @@ async fn run_session(
     }
 
     let build_started = std::time::Instant::now();
-    let mut built = rpi_cli::session::build(&resolved, &args, &cwd, trusted).await;
+    let mut built = rpi_cli::session::build_with_tool_hook(
+        &resolved,
+        &args,
+        &cwd,
+        trusted,
+        before_tool_call.clone(),
+    )
+    .await;
     if built.is_err() && resume.is_some() {
         // A stale id must not brick the pane; the host transcript is still on
         // screen, so start a fresh durable session and publish its new id.
         let mut fresh = args.clone();
         fresh.session = None;
-        if let Ok(retry) = rpi_cli::session::build(&resolved, &fresh, &cwd, trusted).await {
+        if let Ok(retry) = rpi_cli::session::build_with_tool_hook(
+            &resolved,
+            &fresh,
+            &cwd,
+            trusted,
+            before_tool_call,
+        )
+        .await
+        {
             built = Ok(retry);
         }
     }
@@ -559,6 +611,12 @@ async fn run_session(
                         let _ = events.send(SessionEvent::Error(error.to_string()));
                         wake.signal();
                     }
+                }
+            }
+            Command::Thinking(level) => {
+                if let Err(error) = harness.set_thinking_level(level).await {
+                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                    wake.signal();
                 }
             }
             Command::Shutdown => {
@@ -703,6 +761,7 @@ impl ValueSource for EnvironmentValues {
 /// Result of one in-process authentication step.
 #[derive(Clone, Debug)]
 pub enum LoginEvent {
+    BrowserUrl(String),
     Output(String),
     Finished(Result<(), String>),
 }
@@ -778,6 +837,11 @@ fn login_worker(
     events: mpsc::Sender<LoginEvent>,
     inputs: mpsc::Receiver<String>,
 ) {
+    if provider == ANTIGRAVITY {
+        let result = antigravity::login(&events, &inputs);
+        let _ = events.send(LoginEvent::Finished(result));
+        return;
+    }
     let trusted = project_trusted(&cwd);
     let prepared = rpi_cli::session::prepare_extensions(&Args::default(), &cwd, trusted).ok();
     let snapshot = prepared
@@ -807,20 +871,29 @@ fn run_api_key(provider: String, events: mpsc::Sender<LoginEvent>, inputs: mpsc:
             return;
         }
     };
+    let _ = events.send(LoginEvent::Finished(save_api_key(&provider, &key)));
+}
+
+pub fn save_api_key(provider: &str, key: &str) -> Result<(), String> {
     let key = key.trim();
-    if key.is_empty() {
-        let _ = events.send(LoginEvent::Finished(Err(
-            "An empty key was entered; nothing was saved.".into(),
-        )));
-        return;
+    if key.is_empty() || key.contains(['\r', '\n', '\0']) {
+        return Err("Enter a nonempty API key on one line.".into());
     }
     let credential = Credential::ApiKey {
         key: Some(key.to_string()),
         env: None,
     };
-    let result = rpi_cli::config::upsert_credential(&provider, credential)
-        .map_err(|error| format!("Could not save credentials: {error}"));
-    let _ = events.send(LoginEvent::Finished(result));
+    rpi_cli::config::upsert_credential(provider, credential)
+        .map_err(|error| format!("Could not save credentials: {error}"))
+}
+
+pub fn disconnect_provider(provider: &str) -> Result<(), String> {
+    if provider == ANTIGRAVITY {
+        return antigravity::disconnect();
+    }
+    rpi_cli::config::delete_credential(provider)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn run_oauth(
@@ -1140,6 +1213,7 @@ mod tests {
             append_system_prompt: None,
             provider_request_hook: None,
             phase_hook: None,
+            before_tool_call: None,
         })
         .expect("worker starts");
 

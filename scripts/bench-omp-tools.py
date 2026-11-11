@@ -81,7 +81,6 @@ def main():
     parser.add_argument("--samples", type=int, default=3, help="cold/warm pairs (1–20)")
     parser.add_argument("--approval-mode", choices=("write", "yolo"), default="write",
                         help="write exercises real approval round trips; yolo is confined to the disposable fixture")
-    parser.add_argument("--bridge-test", type=Path, help="also exercise the real Kathamo adapter with this test executable")
     args = parser.parse_args()
     runtime = args.runtime.resolve()
     if not runtime.is_file() or not 1 <= args.samples <= 20:
@@ -178,18 +177,6 @@ def main():
                     and not cycle.failed for cycle in turn.tools.values())
             for turn in turns
         ) for turns in samples.values())
-        if args.bridge_test:
-            # The compiled adapter owns its private data namespace. Populate only
-            # synthetic models and files; never copy the user's credentials.
-            bridge_root = root / "app"
-            bridge_agent = bridge_root / "provider" / "agent"
-            bridge_agent.mkdir(parents=True)
-            (bridge_agent / "models.yml").write_text(json.dumps(config))
-            env = dict(environment, KATHAMO_DATA_DIR=str(bridge_root),
-                       KATHAMO_BENCH_CWD=str(project), KATHAMO_STREAM_TIMINGS="1")
-            subprocess.run([str(args.bridge_test.resolve()), "loopback_omp_tool_latency_benchmark",
-                            "--ignored", "--nocapture", "--test-threads=1"], env=env, cwd=project, check=True, timeout=90)
-            print(json.dumps({"adapter_fixture_peer_cancellations": server.cancelled_responses}))
         server.shutdown()
         return int(not valid)
 

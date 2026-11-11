@@ -851,6 +851,28 @@ fn apply_manifest_defaults(
 pub(crate) fn builtin_catalog() -> Vec<Model> {
     let mut catalog = anthropic_models();
     catalog.extend(openai_responses_models());
+    let google = serde_json::from_value(serde_json::json!({
+        "api": "openai-completions",
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "models": [{
+            "id": "gemini-3.8-flash",
+            "name": "Gemini 3.8 Flash",
+            "reasoning": true,
+            "thinkingLevelMap": {
+                "off": "low", "minimal": "low", "low": "low",
+                "medium": "medium", "high": "high", "xhigh": "high", "max": "high"
+            },
+            "contextWindow": 1048576,
+            "maxTokens": 65536,
+            "input": ["text", "image"],
+            "compat": { "supportsReasoningEffort": true, "maxTokensField": "max_tokens" }
+        }]
+    }))
+    .expect("valid built-in Gemini model configuration");
+    catalog.extend(
+        config::provider_to_models("google", &google, &BTreeMap::new())
+            .expect("Gemini uses the OpenAI completions protocol"),
+    );
     catalog
 }
 
@@ -1254,6 +1276,7 @@ fn provider_is_known(requested: &str, cfg: &config::ModelsConfig) -> bool {
     cfg.providers.contains_key(requested)
         || requested.eq_ignore_ascii_case("anthropic")
         || requested.eq_ignore_ascii_case("openai")
+        || requested.eq_ignore_ascii_case("google")
         || requested.eq_ignore_ascii_case("openai-completions")
         || requested.eq_ignore_ascii_case("openai-responses")
 }
@@ -1273,6 +1296,7 @@ fn canonicalize_cli_provider(
     const BUILTIN_PROVIDER_IDS: &[&str] = &[
         "anthropic",
         "openai",
+        "google",
         "openai-completions",
         "openai-responses",
     ];

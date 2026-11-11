@@ -21,7 +21,7 @@ use crate::providers::anthropic::retry::retry_provider_request;
 use crate::providers::anthropic::sse::SseEventStream;
 use crate::providers::{DELTA_FLUSH_BYTES, DELTA_FLUSH_INTERVAL};
 use crate::types::{
-    Api, AssistantMessage, AssistantMessageEvent, Content, Context, DoneReason, ErrorReason,
+    AssistantMessage, AssistantMessageEvent, Content, Context, DoneReason, ErrorReason,
     InputModality, Message, StopReason, ThinkingContent, ThinkingContentType, ThinkingLevel,
     ToolCall, ToolCallType, Usage, UserContent,
 };
@@ -371,14 +371,26 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                     .content
                     .iter()
                     .filter_map(|content| match content {
-                        Content::ToolCall(call) => Some(json!({
+                        Content::ToolCall(call) => {
+                            let mut value = json!({
                             "id": call.id,
                             "type": "function",
                             "function": {
                                 "name": call.name,
                                 "arguments": call.arguments.to_string(),
                             }
-                        })),
+                            });
+                            if model.provider == "google"
+                                && message.provider == model.provider
+                                && message.model == model.id
+                            {
+                                if let Some(signature) = &call.thought_signature {
+                                    value["extra_content"] =
+                                        json!({"google": {"thought_signature": signature}});
+                                }
+                            }
+                            Some(value)
+                        }
                         _ => None,
                     })
                     .collect();
@@ -396,6 +408,19 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                 });
                 if !tool_calls.is_empty() {
                     value["tool_calls"] = Value::Array(tool_calls);
+                }
+                if model.provider == "google"
+                    && message.provider == model.provider
+                    && message.model == model.id
+                {
+                    let signature = message.content.iter().rev().find_map(|part| match part {
+                        Content::Text(text) => text.text_signature.as_deref(),
+                        _ => None,
+                    });
+                    if let Some(signature) = signature {
+                        value["extra_content"] =
+                            json!({"google": {"thought_signature": signature}});
+                    }
                 }
                 if compat(model).and_then(|compat| compat.requires_reasoning_content) == Some(true)
                 {
@@ -487,7 +512,13 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
             );
         }
     }
-    if model.reasoning && supports_reasoning_effort(model) {
+    if model.provider == "google" && model.id == "gemini-3.8-flash" && model.reasoning {
+        if let Some(level) = reasoning_effort(model, opts.reasoning_level()) {
+            body.insert("extra_body".into(), json!({
+                "google": { "thinking_config": { "thinking_level": level, "include_thoughts": true } }
+            }));
+        }
+    } else if model.reasoning && supports_reasoning_effort(model) {
         if let Some(effort) = reasoning_effort(model, opts.reasoning_level()) {
             body.insert("reasoning_effort".into(), Value::String(effort));
         }
@@ -756,11 +787,14 @@ fn apply_api_key(headers: &mut BTreeMap<String, String>, api_key: Option<String>
     }
 }
 
+pub(super) mod antigravity_stream;
+
 struct ToolState {
     content_index: usize,
     id: String,
     name: String,
     arguments: String,
+    thought_signature: Option<String>,
 }
 
 struct StreamState {
@@ -782,7 +816,7 @@ impl StreamState {
     fn new(model: &Model) -> Self {
         Self {
             output: AssistantMessage::empty(
-                Api::OpenaiCompletions,
+                model.api.clone(),
                 model.provider.clone(),
                 model.id.clone(),
                 now_ms(),
@@ -908,6 +942,17 @@ impl StreamState {
         {
             self.push_text(producer, text).await;
         }
+        if let ("google", Some(index), Some(signature)) = (
+            self.output.provider.as_str(),
+            self.text_index,
+            delta
+                .pointer("/extra_content/google/thought_signature")
+                .and_then(Value::as_str),
+        ) {
+            if let Some(Content::Text(text)) = self.output.content.get_mut(index) {
+                text.text_signature = Some(signature.to_owned());
+            }
+        }
         let thinking = delta
             .get("reasoning_content")
             .or_else(|| delta.get("reasoning"))
@@ -918,13 +963,16 @@ impl StreamState {
             self.push_thinking(producer, thinking).await;
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for tool in tool_calls {
-                self.push_tool_delta(producer, tool).await;
+            for (position, tool) in tool_calls.iter().enumerate() {
+                self.push_tool_delta(producer, tool, position).await;
             }
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.output.raw_stop_reason = Some(reason.to_string());
             match reason {
+                "stop" | "end" if self.output.provider == "google" && !self.tools.is_empty() => {
+                    self.finish_reason = Some(DoneReason::ToolUse)
+                }
                 "stop" | "end" => self.finish_reason = Some(DoneReason::Stop),
                 "length" => self.finish_reason = Some(DoneReason::Length),
                 "tool_calls" | "function_call" => self.finish_reason = Some(DoneReason::ToolUse),
@@ -1008,11 +1056,27 @@ impl StreamState {
         &mut self,
         producer: &mut AssistantMessageEventStreamProducer,
         value: &Value,
+        position: usize,
     ) {
         // A tool-call block starts a new channel; flush what is batched so the
         // consumer never sees tool events before the text that preceded them.
         self.flush_pending(producer).await;
-        let wire_index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let wire_index = value
+            .get("index")
+            .and_then(Value::as_u64)
+            .map(|index| index as usize)
+            .unwrap_or_else(|| {
+                if self.output.provider != "google" {
+                    return 0;
+                }
+                value["id"].as_str().map_or(position, |id| {
+                    self.tools
+                        .iter()
+                        .find_map(|(index, tool)| (tool.id == id).then_some(*index))
+                        .or_else(|| self.tools.keys().next_back().map(|index| index + 1))
+                        .unwrap_or(position)
+                })
+            });
         if !self.tools.contains_key(&wire_index) {
             let content_index = self.output.content.len();
             self.output
@@ -1025,6 +1089,7 @@ impl StreamState {
                     id: String::new(),
                     name: String::new(),
                     arguments: String::new(),
+                    thought_signature: None,
                 },
             );
             producer
@@ -1044,7 +1109,9 @@ impl StreamState {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            tool.id.push_str(id);
+            if self.output.provider != "google" || tool.id != id {
+                tool.id.push_str(id);
+            }
         }
         if let Some(name) = value
             .get("function")
@@ -1052,7 +1119,9 @@ impl StreamState {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            tool.name.push_str(name);
+            if self.output.provider != "google" || tool.name != name {
+                tool.name.push_str(name);
+            }
         }
         let arguments = value
             .get("function")
@@ -1060,10 +1129,22 @@ impl StreamState {
             .and_then(Value::as_str)
             .unwrap_or_default();
         tool.arguments.push_str(arguments);
+        if matches!(
+            self.output.provider.as_str(),
+            "google" | super::antigravity::ID
+        ) {
+            if let Some(signature) = value
+                .pointer("/extra_content/google/thought_signature")
+                .and_then(Value::as_str)
+            {
+                tool.thought_signature = Some(signature.to_owned());
+            }
+        }
         if let Some(Content::ToolCall(call)) = self.output.content.get_mut(tool.content_index) {
             call.id = tool.id.clone();
             call.name = tool.name.clone();
             call.arguments = parse_streaming_json(Some(&tool.arguments));
+            call.thought_signature = tool.thought_signature.clone();
         }
         if !arguments.is_empty() {
             producer
@@ -1113,7 +1194,7 @@ impl StreamState {
                 id: tool.id.clone(),
                 name: tool.name.clone(),
                 arguments: parse_streaming_json(Some(&tool.arguments)),
-                thought_signature: None,
+                thought_signature: tool.thought_signature.clone(),
                 namespace: None,
                 recorded: None,
             };
@@ -1241,6 +1322,7 @@ mod tests {
         AssistantMessage, AssistantMessageEvent, ImageContent, ImageContentType, Message,
         StopReason, Tool, ToolResultMessage, ToolResultRole, UserMessage,
     };
+    use crate::Api;
 
     /// Drive `apply_chunk` with a plain content delta, the shape the SSE mapper
     /// produces for a mid-stream text chunk.
@@ -1944,6 +2026,48 @@ mod tests {
         assert!(matches!(&state.output.content[0], Content::Text(text) if text.text == "hello"));
         assert!(
             matches!(&state.output.content[1], Content::ToolCall(call) if call.name == "read" && call.arguments["path"] == "a")
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_tool_calls_retain_their_signatures_and_distinct_ids() {
+        let mut model = model();
+        model.provider = "google".into();
+        model.id = "gemini-3.8-flash".into();
+        let (mut producer, _stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer).await;
+        for (id, path, signature) in [("one", "alpha.txt", "first"), ("two", "beta.txt", "second")]
+        {
+            let arguments = json!({"path": path}).to_string();
+            state
+                .apply_chunk(
+                    &mut producer,
+                    &json!({
+                        "choices": [{"delta": {"tool_calls": [{
+                            "id": id,
+                            "function": {"name": "read", "arguments": arguments},
+                            "extra_content": {"google": {"thought_signature": signature}}
+                        }]}, "finish_reason": "stop"}]
+                    }),
+                )
+                .await;
+        }
+        state.finish(&mut producer, &model).await;
+        assert_eq!(state.output.stop_reason, StopReason::ToolUse);
+        let context = Context::new(vec![Message::Assistant(Box::new(state.output))]);
+        let body = build_request(&model, &context, &SimpleStreamOptions::default());
+        let calls = body["messages"][0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "one");
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"],
+            "first"
+        );
+        assert_eq!(calls[1]["id"], "two");
+        assert_eq!(
+            calls[1]["extra_content"]["google"]["thought_signature"],
+            "second"
         );
     }
 

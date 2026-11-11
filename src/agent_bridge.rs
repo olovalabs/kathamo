@@ -110,7 +110,7 @@ impl AgentBridge {
         model: Option<&str>,
     ) -> Result<Self, String> {
         let trace_id = crate::stream_timing::new_trace();
-        if rpc_backend_requested() {
+        if rpc_backend_requested() && !uses_gemini(model) {
             agent_bridge_rpc::RpcAgentBridge::spawn_resumed(cwd, session, model, trace_id).map(
                 |backend| Self {
                     backend: Backend::Rpc(backend),
@@ -178,6 +178,13 @@ impl AgentBridge {
         }
     }
 
+    pub fn set_thinking_level(&self, level: &str) -> Result<(), String> {
+        match &self.backend {
+            Backend::Embedded(bridge) => bridge.session.set_thinking_level(level),
+            Backend::Rpc(_) => Err("Live thinking controls require the embedded backend.".into()),
+        }
+    }
+
     pub fn cancel(&mut self) -> Result<(), String> {
         match &mut self.backend {
             Backend::Embedded(bridge) => {
@@ -214,7 +221,7 @@ impl EmbeddedBridge {
         let request_trace = trace_id;
         let phase_trace = trace_id;
         let resumed = session.is_some();
-        let options = SessionOptions::new(cwd)
+        let mut options = SessionOptions::new(cwd)
             .with_selector(model)
             .with_session(session)
             .with_append_system_prompt(crate::agent_ui::CATALOG_PROMPT)
@@ -235,6 +242,9 @@ impl EmbeddedBridge {
                     crate::stream_timing::record_for_trace(phase_trace, label, elapsed);
                 },
             ));
+        if uses_gemini(model) {
+            options.before_tool_call = Some(gemini_tool_approval());
+        }
         let spawn_start = std::time::Instant::now();
         let mut session = EmbeddedSession::spawn(options).map_err(|error| {
             format!(
@@ -328,6 +338,44 @@ impl EmbeddedBridge {
         }
         coalesce_events(events)
     }
+}
+
+fn uses_gemini(model: Option<&str>) -> bool {
+    matches!(model, Some("google/gemini-3.8-flash" | "google-antigravity/gemini-3.8-flash"))
+}
+
+fn gemini_tool_approval() -> rpi_embedded::BeforeToolCall {
+    let dialogs = Arc::new(smol::lock::Mutex::new(()));
+    Arc::new(move |call, cancelled| {
+        let name = call.tool_call.name.clone();
+        if matches!(name.as_str(), "read" | "find" | "grep" | "ls") {
+            return Box::pin(async { None });
+        }
+        let arguments = call.args.to_string();
+        let dialogs = dialogs.clone();
+        Box::pin(async move {
+            let approve = async {
+                let _dialog = dialogs.lock().await;
+                rfd::AsyncMessageDialog::new()
+                    .set_title(format!("Allow Gemini to run {name}?"))
+                    .set_description(&arguments)
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    .await
+                    == rfd::MessageDialogResult::Yes
+            };
+            let approved = smol::future::race(approve, async {
+                cancelled.cancelled().await;
+                false
+            })
+            .await;
+            (!approved || cancelled.is_cancelled()).then(|| rpi_embedded::BeforeToolCallResult {
+                block: true,
+                reason: Some("Tool approval was declined or cancelled.".into()),
+                ..Default::default()
+            })
+        })
+    })
 }
 
 /// Largest merged delta. Bounded so a coalesced append never crosses the

@@ -135,6 +135,7 @@ pub fn builtin_api_key_env(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
+        "google" => Some("GEMINI_API_KEY"),
         _ => None,
     }
 }

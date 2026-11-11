@@ -14,4 +14,3 @@ rand = "0.8"
 directories = "6"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tempfile = "3"
-flate2 = "1"

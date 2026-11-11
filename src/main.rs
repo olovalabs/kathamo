@@ -42,9 +42,7 @@ mod integrations;
 #[cfg(unix)]
 mod kathamo_compat;
 mod logos;
-mod omp_bridge;
 mod paths;
-pub mod provider;
 mod settings;
 mod shell_history;
 #[path = "blocks/shell_integration.rs"]
@@ -1480,36 +1478,6 @@ fn agent_model_selector(model: &agent_auth::AgentModel) -> String {
     format!("{}/{}", model.provider, model.id)
 }
 
-/// Turn a pre-prompt agent failure into a short, actionable default-screen note.
-fn agent_startup_notice(error: &str) -> (String, String) {
-    let lower = error.to_ascii_lowercase();
-    let credentials = [
-        "api key",
-        "apikey",
-        "authenticat",
-        "credential",
-        "login",
-        "sign in",
-        "unauthorized",
-        "401",
-        "oauth",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    let message = if credentials {
-        "This model is not signed in yet."
-    } else {
-        "The agent could not start."
-    };
-    let hint = if credentials {
-        " Run /auth to connect a provider, or choose another model with /model."
-    } else {
-        " Check the agent installation, then try again."
-    };
-    let detail = clip_tool_text(error.lines().next().unwrap_or("").trim(), 180).0;
-    (format!("{message}{hint}"), detail)
-}
-
 /// Assistant text stops streaming whenever the agent moves on to thinking,
 /// activity, a tool call, an error, or the end of the turn. The next text
 /// event starts a fresh streaming message, so completed text gets the full
@@ -1756,59 +1724,15 @@ impl AuthModal {
     }
 }
 
-enum ModelBridge {
-    Rpi(agent_bridge::AgentBridge),
-    Omp(omp_bridge::OmpBridge),
-}
-
-impl ModelBridge {
-    fn send_prompt(
-        &mut self,
-        prompt: &str,
-        resume: Option<&str>,
-        context: Option<String>,
-    ) -> Result<(), String> {
-        match self {
-            Self::Rpi(bridge) => bridge.send_prompt_with_context(prompt, resume, context),
-            Self::Omp(bridge) => bridge.send_prompt(context.as_deref().unwrap_or(prompt)),
-        }
-    }
-    fn cancel(&mut self) -> Result<(), String> {
-        match self {
-            Self::Rpi(bridge) => bridge.cancel(),
-            Self::Omp(bridge) => bridge.cancel(),
-        }
-    }
-    fn poll(&mut self) -> Vec<agent_bridge::AgentEvent> {
-        match self {
-            Self::Rpi(bridge) => bridge.poll(),
-            Self::Omp(bridge) => bridge.poll(),
-        }
-    }
-    fn trace_id(&self) -> u64 {
-        match self {
-            Self::Rpi(bridge) => bridge.trace_id(),
-            Self::Omp(bridge) => bridge.trace_id(),
-        }
-    }
-    fn set_thinking_level(&mut self, level: &str) -> Result<(), String> {
-        match self {
-            Self::Omp(bridge) => bridge.set_thinking_level(level),
-            Self::Rpi(_) => Err("rpi does not expose live reasoning-effort selection; choose an OMP model.".into()),
-        }
-    }
-}
+type ModelBridge = agent_bridge::AgentBridge;
 
 struct WorkerView {
     index: usize,
     id: String,
     scroll: gpui::ScrollHandle,
     messages: Vec<Arc<ChatMessage>>,
-    input: Entity<InputState>,
-    _input_subscription: gpui::Subscription,
     expanded: HashSet<usize>,
     full_output: HashSet<usize>,
-    error: Option<String>,
     _load: Option<gpui::Task<()>>,
 }
 
@@ -1878,146 +1802,8 @@ fn chat_row_contains(row: &ChatRow, message_index: usize) -> bool {
     }
 }
 
-fn supported_omp_effort(level: &str) -> bool {
+fn supported_thinking_effort(level: &str) -> bool {
     matches!(level, "auto" | "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
-}
-
-struct OmpOption {
-    label: String,
-    detail: String,
-}
-
-struct OmpQuestion {
-    id: String,
-    prompt: String,
-    options: Vec<OmpOption>,
-    multi: bool,
-    selected: HashSet<usize>,
-    input: Option<Entity<InputState>>,
-}
-
-/// Ephemeral interaction state: never appended to a conversation or saved draft.
-struct OmpInteraction {
-    id: String,
-    origin: u64,
-    method: String,
-    title: String,
-    message: String,
-    questions: Vec<OmpQuestion>,
-    focus: gpui::FocusHandle,
-    error: Option<String>,
-}
-
-impl OmpInteraction {
-    fn new(request: &serde_json::Value, origin: u64, window: &mut Window, cx: &mut Context<AppState>) -> Result<Self, String> {
-        let text = |key: &str| request[key].as_str().unwrap_or("").to_owned();
-        let method = text("method");
-        if !matches!(method.as_str(), "select" | "confirm" | "input" | "editor" | "ask") {
-            return Err("Unsupported OMP interaction; cancelled rather than approved.".into());
-        }
-        let mut questions = Vec::new();
-        if method == "ask" {
-            let records = request["questions"].as_array().ok_or("OMP ask has no questions")?;
-            if records.is_empty() {
-                return Err("OMP ask has no questions".into());
-            }
-            for record in records {
-                let id = record["id"].as_str().ok_or("OMP question has no ID")?.to_owned();
-                let prompt = record["question"].as_str().ok_or("OMP question has no text")?;
-                let header = record["header"].as_str().unwrap_or("");
-                let options = record["options"].as_array().ok_or("OMP question has no options")?
-                    .iter().enumerate().map(|(index, option)| {
-                        let mut detail = option["description"].as_str().unwrap_or("").to_owned();
-                        if let Some(preview) = option["preview"].as_str() {
-                            detail.push('\n');
-                            detail.push_str(preview);
-                        }
-                        if record["recommended"].as_u64() == Some(index as u64) {
-                            detail.push_str(" (recommended by agent; not selected)");
-                        }
-                        Ok(OmpOption {
-                            label: option["label"].as_str().ok_or("OMP option has no label")?.to_owned(),
-                            detail,
-                        })
-                    }).collect::<Result<Vec<_>, String>>()?;
-                let input = cx.new(|cx| InputState::new(window, cx).placeholder("Other / additional answer").auto_grow(1, 5));
-                questions.push(OmpQuestion {
-                    id, prompt: if header.is_empty() { prompt.to_owned() } else { format!("{header}\n{prompt}") },
-                    options, multi: record["multi"].as_bool().unwrap_or(false),
-                    selected: HashSet::new(), input: Some(input),
-                });
-            }
-        } else if method != "confirm" {
-            let options = if method == "select" {
-                request["options"].as_array().ok_or("OMP select has no options")?
-                    .iter().enumerate().map(|(index, option)| Ok(OmpOption {
-                        label: option.as_str().ok_or("OMP select option is not text")?.to_owned(),
-                        detail: request["optionDetails"][index]["description"].as_str().unwrap_or("").to_owned(),
-                    })).collect::<Result<Vec<_>, String>>()?
-            } else { Vec::new() };
-            if method == "select" && options.is_empty() {
-                return Err("OMP select has no options".into());
-            }
-            let input = if method == "select" { None } else {
-                Some(cx.new(|cx| {
-                    let state = InputState::new(window, cx)
-                        .placeholder(text("placeholder"))
-                        .default_value(text("prefill"));
-                    if method == "editor" { state.auto_grow(5, 16) }
-                    else { state.masked(request["secret"].as_bool().unwrap_or(false)) }
-                }))
-            };
-            questions.push(OmpQuestion {
-                id: String::new(), prompt: String::new(), options, multi: false,
-                selected: HashSet::new(), input,
-            });
-        }
-        let focus = cx.focus_handle();
-        if let Some(input) = questions.first().and_then(|question| question.input.as_ref()) {
-            input.update(cx, |state, cx| state.focus(window, cx));
-        } else {
-            focus.focus(window, cx);
-        }
-        Ok(Self {
-            id: request["id"].as_str().ok_or("OMP interaction has no ID")?.to_owned(),
-            origin,
-            title: if method == "ask" { "OMP questions".into() } else { text("title") },
-            message: text("message"), method, questions, focus, error: None,
-        })
-    }
-
-    fn response(&self, confirmed: bool, cx: &App) -> Result<serde_json::Value, String> {
-        let mut response = serde_json::json!({"type":"extension_ui_response","id":self.id});
-        match self.method.as_str() {
-            "confirm" => response["confirmed"] = confirmed.into(),
-            "select" => {
-                let question = &self.questions[0];
-                let index = question.selected.iter().next().ok_or("Choose an option first.")?;
-                response["value"] = question.options[*index].label.clone().into();
-            }
-            "input" | "editor" => {
-                response["value"] = self.questions[0].input.as_ref()
-                    .ok_or("Missing input")?.read(cx).value().to_string().into();
-            }
-            "ask" => {
-                let answers = self.questions.iter().map(|question| {
-                    let selected: Vec<&str> = question.options.iter().enumerate()
-                        .filter(|(index, _)| question.selected.contains(index))
-                        .map(|(_, option)| option.label.as_str()).collect();
-                    let custom = question.input.as_ref().map(|input| input.read(cx).value().to_string()).unwrap_or_default();
-                    if selected.is_empty() && custom.trim().is_empty() {
-                        return Err("Answer every question, or cancel the request.".to_owned());
-                    }
-                    let mut answer = serde_json::json!({"id":question.id,"selectedOptions":selected});
-                    if !custom.is_empty() { answer["customInput"] = custom.into(); }
-                    Ok(answer)
-                }).collect::<Result<Vec<_>, String>>()?;
-                response["answers"] = answers.into();
-            }
-            _ => return Err("Unsupported interaction".into()),
-        }
-        Ok(response)
-    }
 }
 
 struct PaneChat {
@@ -2025,13 +1811,7 @@ struct PaneChat {
     active: bool,
     bridge: Option<ModelBridge>,
     bridge_model: Option<agent_auth::AgentModel>,
-    bridge_trusted: bool,
-    workspace_trusted: bool,
-    trust_confirmation: Option<PathBuf>,
-    trust_focus: Option<gpui::FocusHandle>,
-    ui_requests: std::collections::VecDeque<serde_json::Value>,
-    interaction: Option<OmpInteraction>,
-    restore_interaction_focus: bool,
+
     bridge_resume: Option<String>,
     bridge_needs_context: bool,
     cwd: Option<PathBuf>,
@@ -2077,13 +1857,7 @@ impl Default for PaneChat {
             worker_view: None,
             bridge: None,
             bridge_model: None,
-            bridge_trusted: false,
-            workspace_trusted: false,
-            trust_confirmation: None,
-            trust_focus: None,
-            ui_requests: std::collections::VecDeque::new(),
-            interaction: None,
-            restore_interaction_focus: false,
+
             bridge_resume: None,
             bridge_needs_context: false,
             cwd: None,
@@ -2123,25 +1897,6 @@ impl Default for PaneChat {
 }
 
 impl PaneChat {
-    fn cancel_interactions(&mut self) {
-        let mut ids: Vec<String> = self.ui_requests.drain(..)
-            .filter_map(|request| request["id"].as_str().map(str::to_owned)).collect();
-        if let Some(dialog) = self.interaction.take() { ids.push(dialog.id); }
-        self.trust_confirmation = None;
-        self.trust_focus = None;
-        if let Some(ModelBridge::Omp(bridge)) = self.bridge.as_mut() {
-            ids.extend(bridge.take_ui_requests().iter()
-                .filter_map(|request| request["id"].as_str().map(str::to_owned)));
-            for id in ids {
-                if bridge.is_ui_request_pending(&id) {
-                    let _ = bridge.respond_ui(serde_json::json!({
-                        "type":"extension_ui_response","id":id,"cancelled":true
-                    }));
-                }
-            }
-        }
-    }
-
     fn mode_thinking_level(&self) -> &str {
         if let Some(level) = self.thinking_override.as_deref() {
             return level;
@@ -2149,57 +1904,25 @@ impl PaneChat {
         if !self.fast_mode {
             return "high";
         }
-        if self.selected_model.as_ref().is_some_and(|model| {
-            model.provider == "google-antigravity" && model.id == "gemini-3.8-flash"
-        }) {
-            // OMP routes both Minimal and Low to LOW, which can return only
-            // answer text. MEDIUM requests a visible summary below the HIGH tier.
-            return "medium";
-        }
         "low"
     }
 
-    fn ensure_agent(&mut self, cwd: PathBuf, trusted: bool) -> Result<(), String> {
-        let trusted = trusted && self.selected_model.as_ref().is_some_and(|model|
-            model.backend == agent_auth::ModelBackend::Kathamo);
-        self.workspace_trusted = trusted;
+    fn ensure_agent(&mut self, cwd: PathBuf) -> Result<(), String> {
         if self.running || (self.bridge.is_some() && self.bridge_model == self.selected_model
-            && self.cwd.as_ref() == Some(&cwd) && self.bridge_trusted == trusted) {
+            && self.cwd.as_ref() == Some(&cwd)) {
             return Ok(());
         }
-        // A settled bridge can release its session before the replacement opens it.
         self.bridge = None;
-        self.ui_requests.clear();
-        self.interaction = None;
         let selector = self.selected_model.as_ref().map(agent_model_selector);
-        let bridge = match self.selected_model.as_ref().map(|model| &model.backend) {
-            Some(agent_auth::ModelBackend::Kathamo) => {
-                let bridge = omp_bridge::OmpBridge::spawn(
-                    &cwd,
-                    selector
-                        .as_deref()
-                        .expect("Kathamo provider model has a selector"),
-                    self.mode_thinking_level(),
-                    trusted,
-                )?;
-                self.bridge_resume = None;
-                ModelBridge::Omp(bridge)
-            }
-            _ => {
-                self.bridge_resume = self.rpi_session_id.clone();
-                let bridge = agent_bridge::AgentBridge::spawn_resumed(
-                    &cwd,
-                    self.bridge_resume.as_deref(),
-                    selector.as_deref(),
-                )?;
-                ModelBridge::Rpi(bridge)
-            }
-        };
+        self.bridge_resume = self.rpi_session_id.clone();
+        let bridge = ModelBridge::spawn_resumed(&cwd, self.bridge_resume.as_deref(), selector.as_deref())?;
+        if self.selected_model.as_ref().is_some_and(agent_auth::AgentModel::is_gemini_flash) {
+            bridge.set_thinking_level(self.mode_thinking_level())?;
+        }
         self.cwd = Some(cwd);
         self.worker_view = None;
         self.bridge = Some(bridge);
         self.bridge_model = self.selected_model.clone();
-        self.bridge_trusted = trusted;
         self.bridge_needs_context = true;
         Ok(())
     }
@@ -2312,10 +2035,6 @@ impl PaneChat {
             self.list_state.splice(count..old, 0);
         }
         self.list_rows.set(count);
-    }
-
-    fn visible_startup_error(&self) -> Option<&str> {
-        self.startup_error.as_deref()
     }
 
     fn visible_conversation(&mut self) -> Option<&mut conversations::Log> {
@@ -3158,7 +2877,7 @@ impl AppState {
                     pane.chat.active = saved_pane.chat_active;
                     pane.chat.fast_mode = saved_pane.chat.fast_mode;
                     pane.chat.thinking_override = saved_pane.chat.thinking_override.clone()
-                        .filter(|level| supported_omp_effort(level));
+                        .filter(|level| supported_thinking_effort(level));
                     // A pane keeps exactly the model it was using. Only panes
                     // that never had a choice adopt the app default.
                     pane.chat.model_explicit = saved_pane.chat.model_explicit;
@@ -4733,7 +4452,6 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if project_idx != self.active_project_idx { self.cancel_visible_omp_interactions(); }
         let Some(project) = self.projects.get_mut(project_idx) else {
             return;
         };
@@ -4870,7 +4588,6 @@ impl AppState {
         if session_idx >= project.sessions.len() {
             return;
         }
-        for pane in &mut project.sessions[session_idx].panes { pane.chat.cancel_interactions(); }
         let removed = project.sessions.remove(session_idx);
         for pane in &removed.panes {
             status::forget_pid(pane.pid);
@@ -4907,9 +4624,6 @@ impl AppState {
     fn close_project(&mut self, project_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if project_idx >= self.projects.len() {
             return;
-        }
-        for session in &mut self.projects[project_idx].sessions {
-            for pane in &mut session.panes { pane.chat.cancel_interactions(); }
         }
         let project_id = self.projects[project_idx].id;
         if self.project_menu == Some(project_id) {
@@ -5184,7 +4898,6 @@ impl AppState {
         let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&pane_id) else {
             return;
         };
-        if let Some(pane) = self.pane_mut(pane_id) { pane.chat.cancel_interactions(); }
 
         let mut session_removed = false;
         let mut needs_new_session = false;
@@ -5236,7 +4949,6 @@ impl AppState {
 
     fn focus_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.focused_pane_id.is_some_and(|old| old != pane_id) {
-            self.cancel_visible_omp_interactions();
         }
         self.active_view = ActiveView::Workspace;
         self.focused_pane_id = Some(pane_id);
@@ -5253,9 +4965,7 @@ impl AppState {
                         pane.terminal.update(cx, |term, _| {
                             term.set_read_only(should_show);
                         });
-                        if let Some(view) = &pane.chat.worker_view {
-                            view.input.update(cx, |state, cx| state.focus(window, cx));
-                        } else if should_show {
+                        if should_show {
                             if let Some(input_state) = &pane.input_state {
                                 input_state.update(cx, |state, cx| {
                                     state.focus(window, cx);
@@ -5284,7 +4994,6 @@ impl AppState {
 
     fn focus_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.focused_pane_id.is_some_and(|old| old != pane_id) {
-            self.cancel_visible_omp_interactions();
         }
         if self
             .pane_ref(pane_id)
@@ -5302,13 +5011,7 @@ impl AppState {
                 .and_then(|p| p.sessions.get_mut(s_idx))
                 .and_then(|s| s.panes.get_mut(pane_idx))
             {
-                let input = pane
-                    .chat
-                    .worker_view
-                    .as_ref()
-                    .map(|view| &view.input)
-                    .or(pane.input_state.as_ref());
-                if let Some(input_state) = input {
+                if let Some(input_state) = pane.input_state.as_ref() {
                     input_state.update(cx, |state, cx| {
                         state.focus(window, cx);
                     });
@@ -5925,89 +5628,9 @@ impl AppState {
         cx.notify();
     }
 
-    fn omp_workspace_scope(&self, pane_id: usize) -> Option<PathBuf> {
-        let &(project, _, _) = self.pane_index.get(&pane_id)?;
-        let root = self.projects.get(project)?.path.canonicalize().ok()?;
-        let cwd = self.pane_cwd_path(self.pane_ref(pane_id)?)?.canonicalize().ok()?;
-        cwd.starts_with(&root).then_some(root)
-    }
-
-    fn omp_workspace_trusted(&self, pane_id: usize) -> bool {
-        self.omp_workspace_scope(pane_id).is_some_and(|path|
-            self.settings.trusted_omp_workspaces.contains(&path))
-    }
-
-    fn request_workspace_trust(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.pane_ref(pane_id).is_some_and(|pane| pane.chat.selected_model.as_ref()
-            .is_some_and(|model| model.backend == agent_auth::ModelBackend::Kathamo)) { return; }
-        let Some(path) = self.omp_workspace_scope(pane_id) else {
-            if let Some(pane) = self.pane_mut(pane_id) {
-                pane.chat.startup_error = Some("OMP trust requires an existing canonical workspace and a working directory inside it.".into());
-                pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Status,
-                    "OMP trust requires an existing canonical workspace and a working directory inside it.".into())));
-            }
-            cx.notify();
-            return;
-        };
-        if self.settings.trusted_omp_workspaces.contains(&path) {
-            self.apply_workspace_trust(pane_id, path, false, cx);
-        } else if let Some(pane) = self.pane_mut(pane_id) {
-            let focus = cx.focus_handle();
-            focus.focus(window, cx);
-            pane.chat.trust_confirmation = Some(path);
-            pane.chat.trust_focus = Some(focus);
-            cx.notify();
-        }
-    }
-
-    fn apply_workspace_trust(&mut self, pane_id: usize, path: PathBuf, trusted: bool, cx: &mut Context<Self>) {
-        // Re-resolve at confirmation: a changed workspace must never inherit consent.
-        if self.omp_workspace_scope(pane_id).as_ref() != Some(&path)
-            || !self.pane_ref(pane_id).is_some_and(|pane| pane.chat.selected_model.as_ref()
-                .is_some_and(|model| model.backend == agent_auth::ModelBackend::Kathamo))
-            || (trusted && self.pane_ref(pane_id).and_then(|pane|
-                pane.chat.trust_confirmation.as_ref()) != Some(&path)) {
-            if let Some(pane) = self.pane_mut(pane_id) {
-                pane.chat.trust_confirmation = None;
-                pane.chat.trust_focus = None;
-                pane.chat.restore_interaction_focus = true;
-            }
-            cx.notify();
-            return;
-        }
-        self.settings.trusted_omp_workspaces.retain(|saved| saved != &path);
-        if trusted { self.settings.trusted_omp_workspaces.push(path.clone()); }
-        let affected: Vec<usize> = self.pane_index.keys().copied()
-            .filter(|id| self.omp_workspace_scope(*id).as_ref() == Some(&path)).collect();
-        for id in affected {
-            if let Some(pane) = self.pane_mut(id) {
-                pane.chat.workspace_trusted = trusted;
-                pane.chat.trust_confirmation = None;
-                pane.chat.trust_focus = None;
-                pane.chat.restore_interaction_focus = true;
-                if matches!(pane.chat.bridge, Some(ModelBridge::Omp(_))) {
-                    pane.chat.startup_error = Some(if pane.chat.running {
-                        "OMP trust change saved for the next run. The current run keeps its existing authority; Stop it to end that authority now.".into()
-                    } else {
-                        "OMP trust change saved; the next run will use the new execution policy.".into()
-                    });
-                    if let Some(warning) = pane.chat.startup_error.clone() {
-                        pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Status, warning)));
-                    }
-                    if !pane.chat.running {
-                        pane.chat.cancel_interactions();
-                        pane.chat.bridge = None;
-                    }
-                }
-            }
-        }
-        self.schedule_workspace_save(cx);
-        cx.notify();
-    }
-
     fn warm_agent_bridge(&mut self, pane_id: usize) {
         let save_history = self.settings.restore.agent_history;
-        let trusted = self.omp_workspace_trusted(pane_id);
+
         let Some(pane) = self.pane_ref(pane_id) else {
             return;
         };
@@ -6023,25 +5646,23 @@ impl AppState {
                 &pane.chat.conversation_key,
             ));
         }
-        pane.chat.startup_error = pane.chat.ensure_agent(cwd, trusted).err();
+        pane.chat.startup_error = pane.chat.ensure_agent(cwd).err();
     }
 
     fn toggle_fast_mode(&mut self, pane_id: usize, cx: &mut Context<Self>) {
         let Some(pane) = self.pane_mut(pane_id) else {
             return;
         };
+        if !pane.chat.selected_model.as_ref().is_some_and(agent_auth::AgentModel::is_gemini_flash) {
+            return;
+        }
         pane.chat.fast_mode = !pane.chat.fast_mode;
         pane.chat.thinking_override = None;
         let level = pane.chat.mode_thinking_level().to_owned();
-        if let Some(ModelBridge::Omp(bridge)) = pane.chat.bridge.as_mut() {
+        if let Some(bridge) = pane.chat.bridge.as_mut() {
             if let Err(error) = bridge.set_thinking_level(&level) {
                 pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
             }
-        }
-        if !pane.chat.selected_model.as_ref().is_some_and(|model|
-            model.backend == agent_auth::ModelBackend::Kathamo) {
-            pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Status,
-                "Fast/Deep reasoning presets apply to OMP only; rpi does not expose reasoning-effort selection.".into())));
         }
         self.schedule_workspace_save(cx);
         cx.notify();
@@ -6096,7 +5717,6 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(pane) = self.pane_mut(pane_id) { pane.chat.cancel_interactions(); }
         let Some(pane) = self.pane_ref(pane_id) else {
             return;
         };
@@ -6142,8 +5762,7 @@ impl AppState {
         if page == AgentDialogPage::Auth {
             if let Some(first) = auth.providers.first() {
                 let id = first.id.clone();
-                let spec = crate::provider::get_provider(&id);
-                let primary_var = spec.and_then(|s| s.primary_env_var()).unwrap_or("API Key");
+                let primary_var = agent_auth::key_label(&id);
                 let input_clone = auth.input.clone();
                 auth.input.update(cx, |state, cx| {
                     state.set_placeholder(format!("Paste {primary_var} here..."), window, cx);
@@ -6229,7 +5848,6 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if let Some(pane) = self.pane_mut(pane_id) {
-            pane.chat.cancel_interactions();
             pane.chat.startup_error = None;
             pane.chat.model_explicit = true;
             pane.chat.selected_model = model.clone();
@@ -6276,9 +5894,7 @@ impl AppState {
         if let Some(mut login) = auth.login.take() {
             login.cancel();
         }
-        let spec = crate::provider::get_provider(&provider);
-        let rpi_only = spec.is_none();
-        let primary_var = spec.and_then(|s| s.primary_env_var()).unwrap_or("API Key");
+        let primary_var = agent_auth::key_label(&provider);
         let input_to_focus = auth.input.clone();
         auth.input.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -6288,14 +5904,6 @@ impl AppState {
         auth.selected = Some(provider.clone());
         auth.output.clear();
         auth.error = None;
-        // rpi-only providers are authenticated in-process through the embedded
-        // agent's auth store. Kathamo providers use their private credential store.
-        if rpi_only {
-            match agent_auth::Login::start(&provider, &auth.cwd) {
-                Ok(login) => auth.login = Some(login),
-                Err(error) => auth.error = Some(error),
-            }
-        }
         cx.notify();
         window.defer(cx, move |window, cx| {
             input_to_focus.update(cx, |state, cx| {
@@ -6342,11 +5950,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let spec = crate::provider::get_provider(&provider);
-        let supports_oauth = spec.as_ref().map(|s| s.supports_oauth()).unwrap_or(false);
-        let supports_api_key = spec.as_ref().map(|s| s.supports_api_key()).unwrap_or(true);
-
-        if supports_oauth && !supports_api_key {
+        if provider == rpi_embedded::ANTIGRAVITY {
             self.start_agent_oauth(pane_id, provider, window, cx);
         } else {
             self.select_provider_for_auth(pane_id, provider, window, cx);
@@ -6354,10 +5958,10 @@ impl AppState {
     }
 
     fn submit_agent_auth(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(auth) = self
-            .pane_mut(pane_id)
-            .and_then(|pane| pane.chat.auth.as_mut())
-        else {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let Some(auth) = pane.chat.auth.as_mut() else {
             return;
         };
         if auth.page != AgentDialogPage::Auth {
@@ -6368,7 +5972,7 @@ impl AppState {
             return;
         }
 
-        // 1. If an interactive OAuth/PTY login is active, forward the response to it
+        // Forward input to an interactive login while it is active.
         if let Some(login) = auth.login.as_mut() {
             let value = auth.input.read(cx).value().to_string();
             let result = login.submit(&value);
@@ -6390,8 +5994,9 @@ impl AppState {
                 return;
             }
 
-            match crate::provider::save_api_key(&provider, &key) {
+            match agent_auth::save_api_key(&provider, &key) {
                 Ok(()) => {
+                    pane.chat.auth_refresh_pending = pane.chat.bridge.is_some();
                     auth.error = None;
                     auth.output = format!("Connected to {provider} successfully with API key!");
                     auth.input
@@ -6449,7 +6054,7 @@ impl AppState {
             login.cancel();
         }
 
-        match crate::provider::disconnect_provider(&provider) {
+        match agent_auth::disconnect_provider(&provider) {
             Ok(()) => {
                 auth.error = None;
                 auth.output = format!("Disconnected from {provider}.");
@@ -6546,15 +6151,12 @@ impl AppState {
                             while let Some(event) = login.try_event() {
                                 changed = true;
                                 match event {
+                                    agent_auth::LoginEvent::BrowserUrl(url) => {
+                                        cx.open_url(&url);
+                                        auth.output.push_str("Complete Google sign-in in your browser.");
+                                    }
                                     agent_auth::LoginEvent::Output(text) => {
-                                        let browser_already_opened =
-                                            login.browser_url(&auth.output).is_some();
                                         auth.output.push_str(&text);
-                                        if !browser_already_opened
-                                            && let Some(url) = login.browser_url(&auth.output)
-                                        {
-                                            cx.open_url(url);
-                                        }
                                     }
                                     agent_auth::LoginEvent::Finished(result) => {
                                         finished = Some(result);
@@ -6567,8 +6169,7 @@ impl AppState {
                             auth.login = None;
                             match result {
                                 Ok(()) => {
-                                    authenticated |=
-                                        auth.selected.as_deref() != Some("google-antigravity");
+                                    authenticated = true;
                                     auth.output.push_str("\nAuthentication complete.");
                                     auth.discover();
                                 }
@@ -6581,30 +6182,6 @@ impl AppState {
                         let trace = bridge.trace_id();
                         let drain_start = std::time::Instant::now();
                         let drained = bridge.poll();
-                        if let ModelBridge::Omp(omp) = &mut bridge {
-                            changed |= omp.take_worker_changes() && pane.chat.worker_view.is_some();
-                            let requests = omp.take_ui_requests();
-                            changed |= !requests.is_empty();
-                            pane.chat.ui_requests.extend(requests);
-                            let before = pane.chat.ui_requests.len();
-                            pane.chat.ui_requests.retain(|request| request["id"].as_str()
-                                .is_some_and(|id| omp.is_ui_request_pending(id)));
-                            changed |= before != pane.chat.ui_requests.len();
-                            if pane.chat.interaction.as_ref().is_some_and(|dialog|
-                                dialog.origin != omp.trace_id() || !omp.is_ui_request_pending(&dialog.id)) {
-                                pane.chat.restore_interaction_focus |= pane.chat.interaction.take().is_some();
-                                changed = true;
-                            }
-                            if pane.chat.bridge_model != pane.chat.selected_model || pane.chat.auth.is_some() {
-                                for request in pane.chat.ui_requests.drain(..) {
-                                    if let Some(id) = request["id"].as_str() {
-                                        let _ = omp.respond_ui(serde_json::json!({
-                                            "type":"extension_ui_response","id":id,"cancelled":true
-                                        }));
-                                    }
-                                }
-                            }
-                        }
                         crate::stream_timing::record_since("ui.drain", drain_start);
                         if !drained.is_empty() {
                             pane.chat.mark_active_dirty();
@@ -6639,8 +6216,6 @@ impl AppState {
                             match event {
                                 agent_bridge::AgentEvent::Done => {
                                     pane.chat.running = false;
-                                    pane.chat.ui_requests.clear();
-                                    pane.chat.restore_interaction_focus |= pane.chat.interaction.take().is_some();
                                     pane.chat.completed_turns =
                                         pane.chat.completed_turns.saturating_add(1);
                                     crate::stream_timing::turn_settled(trace);
@@ -6671,23 +6246,15 @@ impl AppState {
                             }
                             crate::stream_timing::record_since("ui.apply", apply_start);
                         }
-                        if let ModelBridge::Rpi(bridge) = &bridge
-                            && !pane.chat.bridge_needs_context
+                        if !pane.chat.bridge_needs_context
                             && let Some(id) = bridge.session_id()
                             && pane.chat.rpi_session_id.as_ref() != Some(&id)
                         {
                             session_changed = true;
                             pane.chat.rpi_session_id = Some(id);
                         }
-                        if !pane.chat.running && matches!(bridge, ModelBridge::Omp(_))
-                            && pane.chat.bridge_trusted != pane.chat.workspace_trusted {
-                            closed = true;
-                            changed = true;
-                        }
                         if closed {
                             pane.chat.cwd = None;
-                            pane.chat.ui_requests.clear();
-                            pane.chat.restore_interaction_focus |= pane.chat.interaction.take().is_some();
                         } else {
                             pane.chat.bridge = Some(bridge);
                         }
@@ -6699,13 +6266,19 @@ impl AppState {
         for project in &mut self.projects {
             for session in &mut project.sessions {
                 for pane in &mut session.panes {
-                    if authenticated && matches!(pane.chat.bridge, Some(ModelBridge::Rpi(_))) {
+                    if authenticated && pane.chat.bridge.is_some() {
                         pane.chat.auth_refresh_pending = true;
                     }
                     if pane.chat.auth_refresh_pending && !pane.chat.running {
                         let mut retry = false;
-                        if let Some(ModelBridge::Rpi(bridge)) = pane.chat.bridge.as_mut() {
-                            match bridge.restart_after_auth() {
+                        let thinking = pane.chat.bridge_model.as_ref()
+                            .filter(|model| model.is_gemini_flash())
+                            .map(|_| pane.chat.mode_thinking_level().to_owned());
+                        if let Some(bridge) = pane.chat.bridge.as_mut() {
+                            let result = bridge.restart_after_auth().and_then(|()| {
+                                thinking.as_deref().map_or(Ok(()), |level| bridge.set_thinking_level(level))
+                            });
+                            match result {
                                 Ok(()) => {}
                                 // The embedded harness is still opening its
                                 // session; retry on the next tick instead of
@@ -6802,15 +6375,6 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(input) = self
-            .pane_ref(pane_id)
-            .and_then(|pane| pane.chat.worker_view.as_ref())
-            .map(|view| view.input.clone())
-        {
-            input.update(cx, |state, cx| state.set_value(action, window, cx));
-            self.send_worker_message(pane_id, window, cx);
-            return;
-        }
         let Some(input) = self
             .pane_ref(pane_id)
             .and_then(|pane| pane.input_state.clone())
@@ -6823,7 +6387,7 @@ impl AppState {
 
     fn submit_agent_prompt(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
         let save_history = self.settings.restore.agent_history;
-        let trusted = self.omp_workspace_trusted(pane_id);
+
         let Some(pane) = self.pane_ref(pane_id) else {
             return;
         };
@@ -6860,12 +6424,12 @@ impl AppState {
         if trimmed.is_empty() {
             return;
         }
-        // Local controls are accepted even while the current OMP turn runs.
+        // Reasoning controls update the embedded session before the next prompt.
         if trimmed == "/fast" {
             input.update(cx, |state, cx| state.set_value("", window, cx));
             self.toggle_fast_mode(pane_id, cx);
             if !self.pane_ref(pane_id).is_some_and(|pane| pane.chat.selected_model.as_ref()
-                .is_some_and(|model| model.backend == agent_auth::ModelBackend::Kathamo)) {
+                .is_some_and(|model| model.is_gemini_flash())) {
                 return;
             }
             let fast = self
@@ -6890,18 +6454,18 @@ impl AppState {
         }
         if trimmed == "/thinking" || trimmed.starts_with("/thinking ") {
             let level = trimmed.trim_start_matches("/thinking").trim();
-            let status = if !supported_omp_effort(level) {
-                "Usage: /thinking auto|inherit|off|minimal|low|medium|high|xhigh|max. OMP models only.".to_owned()
+            let status = if !supported_thinking_effort(level) {
+                "Usage: /thinking auto|inherit|off|minimal|low|medium|high|xhigh|max.".to_owned()
             } else if !pane.chat.selected_model.as_ref().is_some_and(|model|
-                model.backend == agent_auth::ModelBackend::Kathamo) {
-                "rpi does not expose reasoning-effort selection; choose an OMP model.".to_owned()
+                model.is_gemini_flash()) {
+                "Choose Gemini 3.8 Flash to adjust reasoning effort.".to_owned()
             } else {
                 let result = pane.chat.bridge.as_mut()
                     .map(|bridge| bridge.set_thinking_level(level)).unwrap_or(Ok(()));
                 match result {
                     Ok(()) => {
                         pane.chat.thinking_override = Some(level.to_owned());
-                        format!("OMP reasoning effort: {level}. Model unchanged.")
+                        format!("Gemini reasoning effort: {level}.")
                     }
                     Err(error) => format!("Could not set reasoning effort: {error}"),
                 }
@@ -6924,7 +6488,7 @@ impl AppState {
                 &pane.chat.conversation_key,
             ));
         }
-        if let Err(error) = pane.chat.ensure_agent(cwd, trusted) {
+        if let Err(error) = pane.chat.ensure_agent(cwd) {
             pane.chat
                 .messages
                 .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
@@ -6932,10 +6496,7 @@ impl AppState {
             return;
         }
         let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
-        let warm = match pane.chat.bridge {
-            Some(ModelBridge::Omp(_)) => !pane.chat.bridge_needs_context,
-            _ => pane.chat.completed_turns > 0,
-        };
+        let warm = pane.chat.completed_turns > 0 && !pane.chat.bridge_needs_context;
         if let Some(trace) = trace {
             crate::stream_timing::turn_sent(trace, warm);
         }
@@ -6944,20 +6505,16 @@ impl AppState {
         } else {
             None
         };
-        let mut session_changed = false;
         let resume = pane.chat.bridge_resume.as_deref();
         match pane
             .chat
             .bridge
             .as_mut()
             .unwrap()
-            .send_prompt(&prompt, resume, context)
+            .send_prompt_with_context(&prompt, resume, context)
         {
             Ok(()) => {
                 pane.chat.bridge_needs_context = false;
-                if matches!(pane.chat.bridge, Some(ModelBridge::Omp(_))) {
-                    session_changed = pane.chat.rpi_session_id.take().is_some();
-                }
                 if let Some(log) = pane.chat.conversation.as_mut() {
                     log.append_user(&prompt);
                 }
@@ -6975,9 +6532,6 @@ impl AppState {
         }
         pane.chat.autoscroll = true;
         pane.chat.scroll_to_end();
-        if session_changed {
-            self.schedule_workspace_save(cx);
-        }
         cx.notify();
     }
 
@@ -7124,7 +6678,6 @@ impl AppState {
             .pane_ref(pane_id)
             .is_some_and(|pane| pane.chat.worker_view.is_some())
         {
-            self.stop_worker(pane_id, cx);
             return;
         }
         let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) else {
@@ -7141,8 +6694,6 @@ impl AppState {
         };
         if pane.chat.active {
             if pane.chat.running {
-                pane.chat.ui_requests.clear();
-                pane.chat.restore_interaction_focus |= pane.chat.interaction.take().is_some();
                 let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
                 if let Some(bridge) = pane.chat.bridge.as_mut() {
                     if let Err(error) = bridge.cancel() {
@@ -7575,8 +7126,7 @@ impl AppState {
         }
 
         // Workspace input must not steal focus from a transient modal.
-        if self.active_view == ActiveView::Workspace && self.history_search.is_none()
-            && self.open_omp_control_pane().is_none() {
+        if self.active_view == ActiveView::Workspace && self.history_search.is_none() {
             if let Some(pane_id) = self.focused_pane_id {
                 if let Some(&(p_idx, s_idx, pane_idx)) = self.pane_index.get(&pane_id) {
                     if let Some(project) = self.projects.get(p_idx) {
@@ -9289,7 +8839,8 @@ impl AppState {
                                 this.open_agent_auth(pane_id, AgentDialogPage::Models, window, cx);
                             }))
                     ))
-                    .when(pane.chat.active, |row| row.child(
+                    .when(pane.chat.active && pane.chat.selected_model.as_ref()
+                        .is_some_and(agent_auth::AgentModel::is_gemini_flash), |row| row.child(
                         div().id(("agent-speed-toggle", pane_id))
                             .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
                             .text_size(px(11.0))
@@ -9299,31 +8850,12 @@ impl AppState {
                             .border_color(if pane.chat.fast_mode { badge_border } else { tokens.border_subtle })
                             .cursor(CursorStyle::PointingHand)
                             .hover(|view| view.bg(tokens.pane_header_btn_hover))
-                            .child(if !pane.chat.selected_model.as_ref().is_some_and(|model|
-                                model.backend == agent_auth::ModelBackend::Kathamo) {
-                                "Effort: OMP only".to_owned()
-                            } else { pane.chat.thinking_override.as_ref().map(|level|
+                            .child(pane.chat.thinking_override.as_ref().map(|level|
                                 format!("Effort: {level}")).unwrap_or_else(||
-                                if pane.chat.fast_mode { "⚡ Fast".into() } else { "🧠 Deep".into() }) })
+                                if pane.chat.fast_mode { "⚡ Fast".into() } else { "🧠 Deep".into() }))
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.toggle_fast_mode(pane_id, cx);
-                            }))
-                    ))
-                    .when(pane.chat.active && pane.chat.selected_model.as_ref().is_some_and(
-                        |model| model.backend == agent_auth::ModelBackend::Kathamo), |row| row.child(
-                        div().id(("omp-workspace-trust", pane_id))
-                            .debug_selector(|| "omp-workspace-trust".into())
-                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
-                            .text_size(px(11.0)).text_color(tokens.text_primary)
-                            .border_1().border_color(tokens.border_subtle)
-                            .cursor(CursorStyle::PointingHand)
-                            .child(if pane.chat.running && pane.chat.bridge_trusted != pane.chat.workspace_trusted {
-                                "OMP: Policy change queued"
-                            } else if pane.chat.workspace_trusted { "OMP: Trusted" } else { "OMP: Protected" })
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.request_workspace_trust(pane_id, window, cx);
                             }))
                     ))
                     .when(pane.chat.active && pane.chat.visible_running(), |row| row.child(
@@ -9544,267 +9076,6 @@ impl AppState {
         )
     }
 
-    fn cancel_visible_omp_interactions(&mut self) {
-        if let Some(project) = self.projects.get_mut(self.active_project_idx) {
-            if let Some(session) = project.sessions.get_mut(project.active_session_idx) {
-                for pane in &mut session.panes { pane.chat.cancel_interactions(); }
-            }
-        }
-    }
-
-    fn open_omp_control_pane(&self) -> Option<usize> {
-        if self.active_view != ActiveView::Workspace { return None; }
-        self.active_session()?.panes.iter()
-            .find(|pane| pane.chat.trust_confirmation.is_some() || pane.chat.interaction.is_some())
-            .map(|pane| pane.id)
-    }
-
-    fn prepare_omp_interactions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_view != ActiveView::Workspace || self.open_agent_auth_pane().is_some() { return; }
-        let Some(session) = self.active_session() else { return; };
-        let ids: Vec<usize> = session.panes.iter().map(|pane| pane.id).collect();
-        if self.open_omp_control_pane().is_none() {
-            for id in &ids {
-                if let Some(pane) = self.pane_mut(*id) {
-                    if std::mem::take(&mut pane.chat.restore_interaction_focus) {
-                        if let Some(input) = pane.input_state.as_ref() {
-                            input.update(cx, |state, cx| state.focus(window, cx));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(open_id) = self.open_omp_control_pane() {
-            let Some(pane) = self.pane_mut(open_id) else { return; };
-            if pane.chat.trust_confirmation.is_some() { return; }
-            let stale = match (&pane.chat.bridge, &pane.chat.interaction) {
-                (Some(ModelBridge::Omp(bridge)), Some(dialog)) =>
-                    dialog.origin != bridge.trace_id() || !bridge.is_ui_request_pending(&dialog.id),
-                _ => false,
-            };
-            if !stale { return; }
-            pane.chat.interaction = None;
-            if let Some(input) = pane.input_state.as_ref() {
-                input.update(cx, |state, cx| state.focus(window, cx));
-            }
-        }
-        for id in ids {
-            let Some(pane) = self.pane_mut(id) else { continue; };
-            let Some(ModelBridge::Omp(bridge)) = pane.chat.bridge.as_mut() else { continue; };
-            if pane.chat.interaction.as_ref().is_some_and(|dialog|
-                dialog.origin != bridge.trace_id() || !bridge.is_ui_request_pending(&dialog.id)) {
-                pane.chat.interaction = None;
-                if let Some(input) = pane.input_state.as_ref() {
-                    input.update(cx, |state, cx| state.focus(window, cx));
-                }
-            }
-            if pane.chat.interaction.is_some() || pane.chat.trust_confirmation.is_some() { return; }
-            while let Some(request) = pane.chat.ui_requests.pop_front() {
-                let Some(request_id) = request["id"].as_str() else { continue; };
-                if !bridge.is_ui_request_pending(request_id) { continue; }
-                match OmpInteraction::new(&request, bridge.trace_id(), window, cx) {
-                    Ok(dialog) => {
-                        pane.chat.interaction = Some(dialog);
-                        self.focused_pane_id = Some(id);
-                        return;
-                    }
-                    Err(_) => {
-                        let _ = bridge.respond_ui(serde_json::json!({
-                            "type":"extension_ui_response","id":request_id,"cancelled":true
-                        }));
-                    }
-                }
-            }
-        }
-    }
-
-    fn finish_omp_interaction(&mut self, pane_id: usize, origin: u64, id: &str, cancel: bool, confirmed: bool,
-        window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pane) = self.pane_mut(pane_id) else { return; };
-        let Some(dialog) = pane.chat.interaction.as_ref()
-            .filter(|dialog| dialog.id == id && dialog.origin == origin) else { return; };
-        if pane.chat.bridge.as_ref().is_some_and(|bridge| bridge.trace_id() != origin) {
-            pane.chat.interaction = None;
-            if let Some(input) = pane.input_state.as_ref() {
-                input.update(cx, |state, cx| state.focus(window, cx));
-            }
-            cx.notify();
-            return;
-        }
-        let response = if cancel {
-            Ok(serde_json::json!({"type":"extension_ui_response","id":id,"cancelled":true}))
-        } else { dialog.response(confirmed, cx) };
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(dialog) = pane.chat.interaction.as_mut() { dialog.error = Some(error); }
-                cx.notify();
-                return;
-            }
-        };
-        if let Some(ModelBridge::Omp(bridge)) = pane.chat.bridge.as_mut() {
-            if bridge.is_ui_request_pending(id) {
-                if let Err(error) = bridge.respond_ui(response) {
-                    if bridge.is_ui_request_pending(id) {
-                        if let Some(dialog) = pane.chat.interaction.as_mut() { dialog.error = Some(error); }
-                        cx.notify();
-                        return;
-                    }
-                }
-            }
-        }
-        pane.chat.interaction = None;
-        self.focus_pane_input(pane_id, window, cx);
-        cx.notify();
-    }
-
-    fn dismiss_omp_control(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let request = self.pane_ref(pane_id).and_then(|pane| pane.chat.interaction.as_ref())
-            .map(|dialog| (dialog.origin, dialog.id.clone()));
-        if let Some((origin, id)) = request {
-            self.finish_omp_interaction(pane_id, origin, &id, true, false, window, cx);
-        } else if let Some(pane) = self.pane_mut(pane_id) {
-            pane.chat.trust_confirmation = None;
-            pane.chat.trust_focus = None;
-            self.focus_pane_input(pane_id, window, cx);
-            cx.notify();
-        }
-    }
-
-    fn render_omp_control_layer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let Some(pane_id) = self.open_omp_control_pane() else { return div().into_any_element(); };
-        let Some(pane) = self.pane_ref(pane_id) else { return div().into_any_element(); };
-        let tokens = self.tokens(cx);
-        let expected_request = pane.chat.interaction.as_ref().map(|dialog| (dialog.origin, dialog.id.clone()));
-        let expected_trust = pane.chat.trust_confirmation.clone();
-        let mut panel = div().id(("omp-interaction-panel", pane_id))
-            .w(px(620.0)).max_w(relative(0.95)).max_h(relative(0.9))
-            .flex().flex_col().gap(px(12.0)).p(px(20.0)).rounded(px(12.0))
-            .bg(tokens.card_bg).border_1().border_color(tokens.border_subtle)
-            .text_color(tokens.text_primary).whitespace_normal().overflow_y_scroll()
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
-            // Keep cancellation with the modal's own focus subtree.
-            .capture_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                if this.open_omp_control_pane() != Some(pane_id) { return; }
-                let keystroke = &event.keystroke;
-                if keystroke.key == "escape" {
-                    cx.stop_propagation();
-                    this.dismiss_omp_control(pane_id, window, cx);
-                } else if (keystroke.modifiers.control || keystroke.modifiers.platform)
-                    && keystroke.key == "enter" {
-                    cx.stop_propagation();
-                    if let Some((origin, id)) = this.pane_ref(pane_id).and_then(|pane|
-                        pane.chat.interaction.as_ref()).filter(|dialog| dialog.method != "confirm")
-                        .map(|dialog| (dialog.origin, dialog.id.clone())) {
-                        this.finish_omp_interaction(pane_id, origin, &id, false, true, window, cx);
-                    }
-                }
-                if this.pane_ref(pane_id).is_some_and(|pane| pane.chat.trust_confirmation.is_some()) {
-                    cx.stop_propagation();
-                }
-            }));
-        if let Some(path) = pane.chat.trust_confirmation.as_ref() {
-            let path = path.clone();
-            if let Some(focus) = pane.chat.trust_focus.as_ref() {
-                panel = panel.track_focus(focus);
-            }
-            panel = panel
-                .child(div().text_size(px(17.0)).child("Trust this workspace for OMP?"))
-                .child(path.display().to_string())
-                .child("OMP will auto-approve arbitrary commands and file changes as your current OS user. This is NOT a sandbox: commands can access files, credentials and the network outside this workspace. Only enable this for work you explicitly trust.")
-                .child("This opt-in applies only to OMP sessions in this canonical workspace. You can revoke it with the OMP: Trusted control. Running sessions keep their current authority until they end or you Stop them.")
-                .child(div().id("omp-trust-confirm").debug_selector(|| "omp-trust-confirm".into())
-                    .p(px(8.0)).border_1().border_color(tokens.border_subtle).cursor(CursorStyle::PointingHand)
-                    .child("Trust workspace — allow arbitrary commands")
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.apply_workspace_trust(pane_id, path.clone(), true, cx);
-                    })));
-        } else if let Some(dialog) = pane.chat.interaction.as_ref() {
-            let request_id = dialog.id.clone();
-            let origin = dialog.origin;
-            panel = panel.track_focus(&dialog.focus)
-                .child(div().text_size(px(17.0)).child(dialog.title.clone()))
-                .child(div().text_size(px(11.0)).text_color(tokens.text_muted)
-                    .child(format!("OMP · pane {} · {} · Cancel / Escape denies this request", pane_id, dialog.method)))
-                .when(!dialog.message.is_empty(), |panel| panel.child(dialog.message.clone()));
-            for (question_index, question) in dialog.questions.iter().enumerate() {
-                let mut field = div().flex().flex_col().gap(px(7.0))
-                    .when(!question.prompt.is_empty(), |field| field.child(question.prompt.clone()));
-                for (option_index, option) in question.options.iter().enumerate() {
-                    let selected = question.selected.contains(&option_index);
-                    let id = request_id.clone();
-                    field = field.child(div().id(("omp-option", question_index * 10000 + option_index))
-                        .debug_selector(move || format!("omp-option-{question_index}-{option_index}"))
-                        .p(px(8.0)).rounded(px(5.0)).border_1().border_color(tokens.border_subtle)
-                        .cursor(CursorStyle::PointingHand)
-                        .child(format!("{} {}", if selected { "●" } else { "○" }, option.label))
-                        .when(!option.detail.is_empty(), |row| row.child(
-                            div().text_size(px(11.0)).text_color(tokens.text_muted).child(option.detail.clone())))
-                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            if let Some(dialog) = this.pane_mut(pane_id)
-                                .and_then(|pane| pane.chat.interaction.as_mut()).filter(|dialog| dialog.id == id && dialog.origin == origin) {
-                                let question = &mut dialog.questions[question_index];
-                                if question.multi {
-                                    if !question.selected.remove(&option_index) { question.selected.insert(option_index); }
-                                } else {
-                                    question.selected.clear();
-                                    question.selected.insert(option_index);
-                                }
-                                dialog.error = None;
-                                cx.notify();
-                            }
-                        })));
-                }
-                if let Some(input) = question.input.as_ref() {
-                    field = field.child(Input::new(input).w_full());
-                }
-                panel = panel.child(field);
-            }
-            if let Some(error) = dialog.error.as_ref() { panel = panel.child(error.clone()); }
-            let id = request_id.clone();
-            let confirm = dialog.method == "confirm";
-            let editor = dialog.method == "editor" || dialog.method == "ask";
-            panel = panel
-                .on_action(cx.listener(move |this, _: &gpui_component::input::Enter, window, cx| {
-                    if !editor && !confirm {
-                        cx.stop_propagation();
-                        this.finish_omp_interaction(pane_id, origin, &id, false, true, window, cx);
-                    }
-                }))
-                .child(div().id("omp-dialog-submit").debug_selector(|| "omp-dialog-submit".into())
-                    .p(px(8.0)).border_1().border_color(tokens.border_subtle).cursor(CursorStyle::PointingHand)
-                    .child(if confirm { "Approve" } else { "Submit" })
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.finish_omp_interaction(pane_id, origin, &request_id, false, true, window, cx);
-                    })));
-            if confirm {
-                let id = dialog.id.clone();
-                panel = panel.child(div().id("omp-dialog-deny").debug_selector(|| "omp-dialog-deny".into())
-                    .p(px(8.0)).cursor(CursorStyle::PointingHand).child("Deny")
-                    .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.finish_omp_interaction(pane_id, origin, &id, false, false, window, cx);
-                    })));
-            }
-        }
-        panel = panel.child(div().id("omp-dialog-cancel").debug_selector(|| "omp-dialog-cancel".into())
-            .p(px(8.0)).cursor(CursorStyle::PointingHand).child("Cancel")
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
-                cx.stop_propagation();
-                let same_request = this.pane_ref(pane_id).and_then(|pane| pane.chat.interaction.as_ref())
-                    .map(|dialog| (dialog.origin, dialog.id.clone())) == expected_request;
-                let same_trust = this.pane_ref(pane_id).and_then(|pane| pane.chat.trust_confirmation.as_ref()) == expected_trust.as_ref();
-                if same_request && same_trust { this.dismiss_omp_control(pane_id, window, cx); }
-            })));
-        deferred(div().id(("omp-interaction-layer", pane_id)).absolute().size_full().top_0().left_0()
-            .occlude().bg(rgba(0x000000a6)).flex().items_center().justify_center()
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.stop_propagation()))
-            .child(panel)).priority(220).into_any_element()
-    }
-
     /// The pane whose provider/model dialog is open, if any.
     fn open_agent_auth_pane(&self) -> Option<usize> {
         self.projects
@@ -9849,8 +9120,7 @@ impl AppState {
             .filter(|provider| {
                 filter_query.is_empty()
                     || provider.id.to_lowercase().contains(&filter_query)
-                    || crate::provider::get_provider(&provider.id)
-                        .is_some_and(|spec| spec.name.to_lowercase().contains(&filter_query))
+
             })
             .collect();
         providers.sort_by_key(|provider| (!provider.ready, provider.id.clone()));
@@ -10514,11 +9784,10 @@ impl AppState {
                                         )
                                     })
                                     .when_some(auth.selected.as_ref(), |view, selected| {
-                                        let spec = crate::provider::get_provider(selected);
-                                        let provider_name = spec.map(|s| s.name.as_str()).unwrap_or(selected.as_str());
-                                        let supports_oauth = spec.map(|s| s.supports_oauth()).unwrap_or(false);
-                                        let supports_api_key = spec.map(|s| s.supports_api_key()).unwrap_or(true);
-                                        let primary_var = spec.and_then(|s| s.primary_env_var()).unwrap_or("API_KEY");
+                                        let provider_name = selected;
+                                        let supports_oauth = selected != "google";
+                                        let supports_api_key = selected != rpi_embedded::ANTIGRAVITY;
+                                        let primary_var = agent_auth::key_label(selected);
                                         let is_connected = auth.providers.iter().any(|p| p.id == *selected && p.ready);
 
                                         view.child(
@@ -11343,7 +10612,7 @@ impl AppState {
         pane_id: usize,
         index: usize,
         id: &str,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(pane) = self.pane_mut(pane_id) else {
@@ -11356,7 +10625,7 @@ impl AppState {
         else {
             return;
         };
-        let session_root = crate::provider::runtime::agent_dir().join("sessions");
+        let session_root = crate::paths::data_dir().join("provider/agent/sessions");
         let path = row
             .worker
             .transcript
@@ -11369,20 +10638,6 @@ impl AppState {
         let id = id.to_owned();
         let worker_id = id.clone();
         let load_id = id.clone();
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Message this subagent…")
-                .auto_grow(1, 6)
-        });
-        let input_subscription = cx.subscribe_in(
-            &input,
-            window,
-            move |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { secondary: false }) {
-                    this.send_worker_message(pane_id, window, cx);
-                }
-            },
-        );
         let load = cx.spawn(async move |this, cx| {
             let path = match path {
                 Some(path) => Some(path),
@@ -11437,54 +10692,10 @@ impl AppState {
             id,
             scroll: gpui::ScrollHandle::new(),
             messages: Vec::new(),
-            input: input.clone(),
-            _input_subscription: input_subscription,
             expanded: HashSet::new(),
             full_output: HashSet::new(),
-            error: None,
             _load: Some(load),
         });
-        input.update(cx, |state, cx| state.focus(window, cx));
-        cx.notify();
-    }
-
-    fn send_worker_message(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pane) = self.pane_mut(pane_id) else {
-            return;
-        };
-        let Some(view) = &mut pane.chat.worker_view else {
-            return;
-        };
-        let input = view.input.clone();
-        let prompt = input.read(cx).value().trim().to_owned();
-        if prompt.is_empty() {
-            return;
-        }
-        let Some(ModelBridge::Omp(bridge)) = &mut pane.chat.bridge else {
-            return;
-        };
-        match bridge.steer_worker(&view.id, &prompt) {
-            Ok(()) => {
-                view.error = None;
-                input.update(cx, |state, cx| state.set_value("", window, cx));
-                view.scroll.scroll_to_bottom();
-            }
-            Err(error) => view.error = Some(error),
-        }
-        cx.notify();
-    }
-
-    fn stop_worker(&mut self, pane_id: usize, cx: &mut Context<Self>) {
-        let Some(pane) = self.pane_mut(pane_id) else {
-            return;
-        };
-        let Some(view) = &mut pane.chat.worker_view else {
-            return;
-        };
-        let Some(ModelBridge::Omp(bridge)) = &mut pane.chat.bridge else {
-            return;
-        };
-        view.error = bridge.cancel_worker(&view.id).err();
         cx.notify();
     }
 
@@ -11497,17 +10708,6 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let pane_id = pane.id;
-        let live = pane.chat.bridge.as_ref().and_then(|bridge| match bridge {
-            ModelBridge::Omp(bridge) => bridge.live_worker(
-                row.worker,
-                pane.chat.visible_messages()[row.index]
-                    .tool
-                    .as_ref()?
-                    .id
-                    .as_deref(),
-            ),
-            ModelBridge::Rpi(_) => None,
-        });
         if view.scroll.max_offset().y + view.scroll.offset().y <= px(24.0) {
             view.scroll.scroll_to_bottom();
         }
@@ -11553,11 +10753,7 @@ impl AppState {
             .flex_col()
             .gap(px(14.0));
         let conversation = format!("worker-{}-{}", view.index, view.id);
-        let can_message = live.is_some_and(|worker| worker.active);
-        let messages = live.map_or_else(
-            || view.messages.iter().chain([].iter()),
-            |worker| worker.messages_with_history(&view.messages),
-        );
+        let messages = view.messages.iter();
         let host = UiHost::new(cx.weak_entity());
         let ui_state = Some(&pane.chat.ui_state);
         let mut has_reply = false;
@@ -11658,52 +10854,6 @@ impl AppState {
                     ),
             )
             .child(body)
-            .when_some(view.error.as_ref(), |this, error| {
-                this.child(
-                    div()
-                        .px(px(16.0))
-                        .text_size(px(12.0))
-                        .text_color(tokens.block_failure)
-                        .child(error.clone()),
-                )
-            })
-            .when(can_message, |this| {
-                this.child(
-                    div()
-                        .id(("subagent-composer", pane_id))
-                        .debug_selector(|| "subagent-composer".to_string())
-                        .px(px(16.0))
-                        .py(px(8.0))
-                        .border_t_1()
-                        .border_color(tokens.pane_border)
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(div().flex_1().min_w_0().child(Input::new(&view.input)))
-                        .child(
-                            div()
-                                .id(("subagent-send", pane_id))
-                                .px(px(8.0))
-                                .cursor(CursorStyle::PointingHand)
-                                .child("Send")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.send_worker_message(pane_id, window, cx);
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(("subagent-stop", pane_id))
-                                .px(px(8.0))
-                                .cursor(CursorStyle::PointingHand)
-                                .child("Stop")
-                                .on_click(
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.stop_worker(pane_id, cx)
-                                    }),
-                                ),
-                        ),
-                )
-            })
             .into_any_element()
     }
 
@@ -12498,7 +11648,6 @@ impl AppState {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
 
-        if self.open_omp_control_pane().is_some() { return; }
         // The provider/model dialog is modal: no workspace shortcuts fire
         // while it is open. Escape is handled by the capture listener.
         if self.open_agent_auth_pane().is_some() {
@@ -14306,10 +13455,6 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if project_idx != self.active_project_idx || self.active_project()
-            .is_some_and(|project| project.active_session_idx != session_idx) {
-            self.cancel_visible_omp_interactions();
-        }
         self.active_view = ActiveView::Workspace;
         let Some(project) = self.projects.get_mut(project_idx) else {
             return;
@@ -14428,7 +13573,6 @@ impl Render for AppState {
         // has not been seen, so a finish there must still become Done.
         self.window_active = _window.is_window_active();
         self.ensure_panes_input_state(_window, cx);
-        self.prepare_omp_interactions(_window, cx);
 
         let tokens = self.tokens(cx);
         // Track which pane owns keyboard focus each frame; the poller uses
@@ -14726,7 +13870,6 @@ impl Render for AppState {
             )
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let keystroke = &event.keystroke;
-                if this.open_omp_control_pane().is_some() { return; }
 
                 if this.image_viewer.is_some() {
                     if keystroke.key == "escape" {
@@ -14826,9 +13969,6 @@ impl Render for AppState {
             })
             .when(self.open_agent_auth_pane().is_some(), |this| {
                 this.child(self.render_agent_auth_layer(cx))
-            })
-            .when(self.open_omp_control_pane().is_some(), |this| {
-                this.child(self.render_omp_control_layer(cx))
             });
         diagnostics::render_end(diag_render);
         root
@@ -15158,7 +14298,7 @@ fn main() -> Result<()> {
                         theme_preference: app_settings.theme,
                         palette_scheme: app_settings.palette_scheme,
                         default_agent_model: app_settings.default_agent_model.clone(),
-                        fallback_agent_model: agent_auth::kathamo_provider_default_model(),
+                        fallback_agent_model: None,
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
                         sidebar_width: px(app_settings.sidebar.width.max(120.0)),
@@ -16243,19 +15383,6 @@ Done."#
             agent_model_selector(&model),
             "commandcode/deepseek/deepseek-v4-flash"
         );
-    }
-
-    #[test]
-    fn startup_failures_become_actionable_default_screen_notes() {
-        let (message, detail) = agent_startup_notice(
-            "rpi process exited (exit status: 2): error: No API key. Set one of: models.json apiKey",
-        );
-        assert!(message.contains("/auth"));
-        assert!(message.contains("/model"));
-        assert!(detail.starts_with("rpi process exited"));
-
-        let (message, _) = agent_startup_notice("rpi process exited (exit status: 127)");
-        assert!(message.contains("could not start"));
     }
 
     #[test]
@@ -17867,7 +16994,7 @@ First report
     }
 
     #[test]
-    fn antigravity_flash_uses_medium_reasoning_in_fast_mode() {
+    fn saved_antigravity_flash_uses_native_gemini() {
         let mut chat = PaneChat {
             selected_model: Some(agent_auth::AgentModel {
                 provider: "google-antigravity".into(),
@@ -17876,7 +17003,8 @@ First report
             }),
             ..PaneChat::default()
         };
-        assert_eq!(chat.mode_thinking_level(), "medium");
+        assert_eq!(chat.mode_thinking_level(), "low");
+        assert_eq!(agent_model_selector(chat.selected_model.as_ref().unwrap()), "google-antigravity/gemini-3.8-flash");
         chat.fast_mode = false;
         assert_eq!(chat.mode_thinking_level(), "high");
 
@@ -17892,7 +17020,7 @@ First report
         cx.draw_frame().unwrap();
         let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
         let model = agent_auth::AgentModel {
-            provider: "bench".into(), id: "fixture".into(), backend: agent_auth::ModelBackend::Kathamo,
+            provider: "google".into(), id: "gemini-3.8-flash".into(), backend: agent_auth::ModelBackend::Rpi,
         };
         cx.update_window_entity(&state, |s, _, _| {
             let chat = &mut s.pane_mut(id).unwrap().chat;
@@ -17925,136 +17053,6 @@ First report
             input.update(cx, |input, cx| input.set_value("/thinking high", window, cx));
             s.submit_agent_prompt(id, window, cx);
             assert!(s.pane_ref(id).unwrap().chat.thinking_override.is_none());
-        });
-    }
-
-    #[test]
-    #[ignore = "requires the actual headless GPU renderer and installed fonts"]
-    fn omp_interaction_and_trust_controls_smoke() {
-        let mut app = TestAppContext::new();
-        let (mut cx, state) = open_app(&mut app);
-        cx.draw_frame().unwrap();
-        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
-        cx.update_window_entity(&state, |s, _, _| {
-            let pane = s.pane_mut(pane_id).unwrap();
-            pane.chat.active = true;
-            pane.chat.selected_model = Some(agent_auth::AgentModel {
-                provider: "bench".into(), id: "fixture".into(), backend: agent_auth::ModelBackend::Kathamo,
-            });
-        });
-        let click = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
-            let bounds = cx.debug_bounds(selector).expect(selector);
-            let target = bounds.origin + point(px(20.0), bounds.size.height / 2.0);
-            cx.simulate_mouse_move(target, None, Modifiers::default());
-            cx.simulate_click(target, Modifiers::default());
-            cx.draw_frame().unwrap();
-        };
-        cx.draw_frame().unwrap();
-        click(&mut cx, "omp-workspace-trust");
-        state.read_with(&cx, |s, _| assert!(s.settings.trusted_omp_workspaces.is_empty()));
-        cx.simulate_keystrokes("escape");
-        cx.draw_frame().unwrap();
-        state.read_with(&cx, |s, _| {
-            assert!(s.settings.trusted_omp_workspaces.is_empty());
-            assert!(s.pane_ref(pane_id).unwrap().chat.trust_confirmation.is_none());
-        });
-        click(&mut cx, "omp-workspace-trust");
-        click(&mut cx, "omp-trust-confirm");
-        state.read_with(&cx, |s, _| {
-            assert_eq!(s.saved_settings().trusted_omp_workspaces, vec![s.projects[0].path.canonicalize().unwrap()]);
-        });
-        click(&mut cx, "omp-workspace-trust");
-        state.read_with(&cx, |s, _| assert!(s.saved_settings().trusted_omp_workspaces.is_empty()));
-
-        // Real RPC shapes presented by the actual app and GPUI inputs.
-        // The separate loopback test exercises the real child/RPC transport.
-        let records = std::collections::VecDeque::from([
-            serde_json::json!({"type":"extension_ui_request","id":"deny","method":"confirm","title":"Write file?","message":"Explicit approval required."}),
-            serde_json::json!({"type":"extension_ui_request","id":"input","method":"input","title":"Credential","secret":true}),
-            serde_json::json!({"type":"extension_ui_request","id":"select","method":"select","title":"Choose","options":["first","second"],"optionDetails":[{},{"description":"Second option"}]}),
-            serde_json::json!({"type":"extension_ui_request","id":"editor","method":"editor","title":"Edit","prefill":"first line\n"}),
-            serde_json::json!({"type":"extension_ui_request","id":"ask","method":"ask","questions":[
-                {"id":"q1","question":"Choose several","multi":true,"recommended":0,"options":[{"label":"one"},{"label":"two"}]},
-                {"id":"q2","question":"Explain","options":[]}
-            ]}),
-            serde_json::json!({"type":"extension_ui_request","id":"cancel","method":"confirm","title":"Never approve via Escape","message":"Cancel this"}),
-        ]);
-        for record in records {
-            cx.update_window_entity(&state, |s, window, cx| {
-                let dialog = OmpInteraction::new(&record, 0, window, cx).unwrap();
-                s.pane_mut(pane_id).unwrap().chat.interaction = Some(dialog);
-                cx.notify();
-            });
-            cx.draw_frame().unwrap();
-            match record["id"].as_str().unwrap() {
-                "deny" => {
-                    state.read_with(&cx, |s, cx| assert_eq!(
-                        s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().response(false, cx).unwrap()["confirmed"], false));
-                    click(&mut cx, "omp-dialog-deny");
-                }
-                "input" => {
-                    cx.simulate_input("private-answer");
-                    cx.draw_frame().unwrap();
-                    state.read_with(&cx, |s, cx| {
-                        let pane = s.pane_ref(pane_id).unwrap();
-                        assert_eq!(pane.chat.interaction.as_ref().unwrap().response(true, cx).unwrap()["value"], "private-answer");
-                        assert!(!serde_json::to_string(&s.saved_workspace(cx)).unwrap().contains("private-answer"));
-                        assert!(pane.chat.messages.iter().all(|message| !message.text.contains("private-answer")));
-                        assert_eq!(pane.input_state.as_ref().unwrap().read(cx).value().as_str(), "");
-                    });
-                    click(&mut cx, "omp-dialog-submit");
-                }
-                "select" => {
-                    state.read_with(&cx, |s, cx| assert!(
-                        s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().response(true, cx).is_err(),
-                        "no implicit first-option approval"));
-                    click(&mut cx, "omp-option-0-1");
-                    state.read_with(&cx, |s, cx| assert_eq!(
-                        s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().response(true, cx).unwrap()["value"], "second"));
-                    click(&mut cx, "omp-dialog-submit");
-                }
-                "editor" => {
-                    cx.simulate_input("second line");
-                    state.read_with(&cx, |s, cx| assert!(
-                        s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().response(true, cx).unwrap()["value"].as_str().unwrap().contains("second line")));
-                    click(&mut cx, "omp-dialog-submit");
-                }
-                "ask" => {
-                    state.read_with(&cx, |s, cx| assert!(
-                        s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().response(true, cx).is_err()));
-                    click(&mut cx, "omp-option-0-0");
-                    click(&mut cx, "omp-option-0-1");
-                    cx.update_window_entity(&state, |s, window, cx| {
-                        let input = s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().questions[1].input.clone().unwrap();
-                        input.update(cx, |input, cx| input.focus(window, cx));
-                    });
-                    cx.simulate_input("custom answer");
-                    state.read_with(&cx, |s, cx| {
-                        let response = s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().response(true, cx).unwrap();
-                        assert_eq!(response["answers"][0]["selectedOptions"], serde_json::json!(["one", "two"]));
-                        assert_eq!(response["answers"][1]["customInput"], "custom answer");
-                    });
-                    click(&mut cx, "omp-dialog-submit");
-                }
-                _ => { cx.simulate_keystrokes("escape"); cx.draw_frame().unwrap(); }
-            }
-            state.read_with(&cx, |s, _| assert!(s.pane_ref(pane_id).unwrap().chat.interaction.is_none()));
-        }
-        cx.update_window_entity(&state, |s, window, cx| {
-            let reused = serde_json::json!({"id":"reused","method":"confirm","title":"New bridge","message":"Do not approve from an old callback"});
-            let dialog = OmpInteraction::new(&reused, 42, window, cx).unwrap();
-            s.pane_mut(pane_id).unwrap().chat.interaction = Some(dialog);
-            s.finish_omp_interaction(pane_id, 41, "reused", false, true, window, cx);
-            assert_eq!(s.pane_ref(pane_id).unwrap().chat.interaction.as_ref().unwrap().origin, 42);
-            s.dismiss_omp_control(pane_id, window, cx);
-            let input = s.pane_ref(pane_id).unwrap().input_state.clone().unwrap();
-            input.update(cx, |input, cx| input.set_value("/thinking max", window, cx));
-            s.submit_agent_prompt(pane_id, window, cx);
-            let chat = &s.pane_ref(pane_id).unwrap().chat;
-            assert_eq!(chat.thinking_override.as_deref(), Some("max"));
-            assert_eq!(chat.selected_model.as_ref().unwrap().id, "fixture");
-            s.toggle_fast_mode(pane_id, cx);
-            assert!(s.pane_ref(pane_id).unwrap().chat.thinking_override.is_none());
         });
     }
 
@@ -19959,11 +18957,11 @@ First report
                 id: model.into(),
                 backend: agent_auth::ModelBackend::Rpi,
             });
-            chat.ensure_agent(cwd.clone(), false).unwrap();
+            chat.ensure_agent(cwd.clone()).unwrap();
             let context = chat.context_prompt(prompt);
             let bridge = chat.bridge.as_mut().unwrap();
             bridge
-                .send_prompt(prompt, chat.bridge_resume.as_deref(), context)
+                .send_prompt_with_context(prompt, chat.bridge_resume.as_deref(), context)
                 .unwrap();
             chat.messages
                 .push(Arc::new(ChatMessage::new(ChatRole::User, prompt.into())));
@@ -19982,9 +18980,6 @@ First report
             }
             assert_eq!(answer, "x".repeat(16));
             finish_chat_streaming(&mut chat.messages);
-            let ModelBridge::Rpi(bridge) = bridge else {
-                unreachable!()
-            };
             let actual_id = bridge.session_id().expect("durable rpi session");
             if let Some(expected) = &session_id {
                 assert_eq!(&actual_id, expected);
@@ -20046,78 +19041,94 @@ First report
     }
 
     #[test]
-    #[ignore = "requires scripts/bench-omp-tools.py loopback model fixture"]
-    fn loopback_omp_tool_latency_benchmark() {
+    #[ignore = "requires an authorized Antigravity test account in the embedded credential store"]
+    fn live_native_antigravity_smoke() {
+        use agent_bridge::AgentEvent;
         use std::time::{Duration, Instant};
-        let cwd = PathBuf::from(std::env::var_os("KATHAMO_BENCH_CWD").expect("benchmark workspace"));
+
+        let cwd = std::env::current_dir().unwrap();
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
         agent_bridge::set_wake(Arc::new(move || { let _ = wake_tx.try_send(()); }));
-        let mut app = TestAppContext::new();
-        let (mut cx, state) = open_app(&mut app);
-        cx.draw_frame().unwrap();
-        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
-        cx.update_window_entity(&state, |s, window, cx| {
-            s.projects[0].path = cwd.clone();
-            s.settings.trusted_omp_workspaces.push(cwd.canonicalize().unwrap());
-            let pane = s.pane_mut(pane_id).unwrap();
-            pane.chat.selected_model = Some(agent_auth::AgentModel {
-                provider: "bench".into(), id: "fixture".into(),
-                backend: agent_auth::ModelBackend::Kathamo,
-            });
-            pane.chat.thinking_override = Some("off".into());
-            s.set_chat_mode(pane_id, true, window, cx);
-        });
-        for sample in 0..4 {
-            let start = Instant::now();
-            let first_message = state.read_with(&cx, |s, _| s.pane_ref(pane_id).unwrap().chat.messages.len());
-            cx.update_window_entity(&state, |s, window, cx| {
-                let input = s.pane_ref(pane_id).unwrap().input_state.clone().unwrap();
-                input.update(cx, |input, cx| input.set_value("Run the local tool fixture.", window, cx));
-                s.submit_agent_prompt(pane_id, window, cx);
-                assert!(s.pane_ref(pane_id).unwrap().chat.running);
-            });
-            loop {
-                assert!(start.elapsed() < Duration::from_secs(30), "OMP fixture turn timed out");
-                let _ = wake_rx.recv_timeout(Duration::from_millis(100));
-                cx.update_window_entity(&state, |s, _, cx| {
-                    s.poll_agent_events(cx);
-                    let pane = s.pane_mut(pane_id).unwrap();
-                    // Keep the observed calls visible so production paint
-                    // markers measure the real cards and output, not a mock.
-                    let groups = pane.chat.expanded_tool_groups
-                        .entry(pane.chat.conversation_key.clone()).or_default();
-                    for (index, message) in pane.chat.messages.iter_mut().enumerate().skip(first_message) {
-                        if let Some(tool) = Arc::make_mut(message).tool.as_mut() {
-                            tool.expanded = true;
-                            groups.insert(index);
-                        }
+        let start = Instant::now();
+        let mut bridge = agent_bridge::AgentBridge::spawn_model(
+            &cwd, Some("google-antigravity/gemini-3.8-flash"),
+        ).unwrap();
+        bridge.set_thinking_level("low").unwrap();
+        crate::stream_timing::turn_sent(bridge.trace_id(), false);
+        bridge.send_prompt("Reply with exactly OK. Answer directly without tools.").unwrap();
+        let mut answer = String::new();
+        let mut first = None;
+        'turn: loop {
+            let remaining = Duration::from_secs(60).checked_sub(start.elapsed())
+                .expect("Antigravity response timed out");
+            wake_rx.recv_timeout(remaining).unwrap();
+            for event in bridge.poll() {
+                match event {
+                    AgentEvent::Text(text) => {
+                        first.get_or_insert_with(|| start.elapsed());
+                        answer.push_str(&text);
                     }
-                    cx.notify();
-                });
-                cx.draw_frame().unwrap();
-                if !state.read_with(&cx, |s, _| s.pane_ref(pane_id).unwrap().chat.running) {
-                    break;
+                    AgentEvent::Done => break 'turn,
+                    AgentEvent::Error(error) => panic!("{error}"),
+                    _ => {}
                 }
             }
-            state.read_with(&cx, |s, _| {
-                let messages = &s.pane_ref(pane_id).unwrap().chat.messages[first_message..];
-                assert!(!messages.iter().any(|message| message.role == ChatRole::Error));
-                let results: Vec<_> = messages.iter().filter_map(|message| message.tool.as_ref()).collect();
-                assert_eq!(results.len(), 3, "two independent reads and one real local multi-step shell");
-                assert!(results.iter().all(|tool| matches!(tool.state, ToolState::Completed)));
-                let reads: Vec<_> = results.iter().filter(|tool| tool.name == "read").collect();
-                assert_eq!(reads.len(), 2);
-                assert!(reads.iter().any(|tool| tool.output.contains("113")));
-                assert!(reads.iter().any(|tool| tool.output.contains("127")));
-                let shell = results.iter().find(|tool| tool.name == "bash").expect("shell tool");
-                assert!(shell.output.contains("local-a") && shell.output.contains("local-b"));
-                let answer = messages.iter().filter(|message| message.role == ChatRole::Assistant)
-                    .map(|message| message.text.as_str()).collect::<String>();
-                assert_eq!(answer, "113 127 local-a local-b");
-                println!("omp_ui_tools sample={sample} total_us={} completed_tools={}", start.elapsed().as_micros(), results.len());
-            });
         }
+        assert_eq!(answer.trim(), "OK");
+        println!("Antigravity first_ms={} total_ms={}", first.unwrap().as_millis(), start.elapsed().as_millis());
         crate::stream_timing::report_now();
+    }
+
+    #[test]
+    #[ignore = "requires scripts/bench-agent-stream.py local Gemini fixture"]
+    fn loopback_gemini_tool_round_trip() {
+        use agent_bridge::AgentEvent;
+        use std::time::{Duration, Instant};
+
+        let cwd = PathBuf::from(std::env::var_os("KATHAMO_BENCH_CWD").unwrap());
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        agent_bridge::set_wake(Arc::new(move || { let _ = wake_tx.try_send(()); }));
+        let mut chat = PaneChat::default();
+        chat.selected_model = Some(agent_auth::AgentModel {
+            provider: "google".into(),
+            id: "gemini-3.8-flash".into(),
+            backend: agent_auth::ModelBackend::Rpi,
+        });
+        for phase in ["cold", "warm"] {
+            let started = Instant::now();
+            chat.ensure_agent(cwd.clone()).unwrap();
+            let bridge = chat.bridge.as_mut().unwrap();
+            bridge.send_prompt("Run two benchmark tools.").unwrap();
+            let mut first_answer = None;
+            let mut reads = Vec::new();
+            let mut answer = String::new();
+            'turn: loop {
+                assert!(started.elapsed() < Duration::from_secs(15));
+                wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                for event in bridge.poll() {
+                    match event {
+                        AgentEvent::ToolEnd { name, output, failed, .. } => {
+                            assert_eq!(name, "read");
+                            assert!(!failed, "{output}");
+                            reads.push(output);
+                        }
+                        AgentEvent::Text(text) => {
+                            first_answer.get_or_insert_with(|| started.elapsed());
+                            answer.push_str(&text);
+                        }
+                        AgentEvent::Done => break 'turn,
+                        AgentEvent::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(reads.len(), 2);
+            assert!(reads.iter().any(|read| read.contains("113")));
+            assert!(reads.iter().any(|read| read.contains("127")));
+            assert_eq!(answer, "x".repeat(16));
+            println!("gemini {phase} first_us={} total_us={}",
+                first_answer.unwrap().as_micros(), started.elapsed().as_micros());
+        }
     }
 
     #[test]

@@ -11,6 +11,9 @@ pub mod faux;
 pub mod anthropic;
 
 #[cfg(feature = "providers")]
+pub mod antigravity;
+
+#[cfg(feature = "providers")]
 pub mod openai_completions;
 
 #[cfg(feature = "providers")]

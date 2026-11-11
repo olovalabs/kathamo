@@ -720,8 +720,33 @@ pub async fn build(
     ),
     BuildError,
 > {
+    build_with_tool_hook(resolved, args, cwd, project_trusted, None).await
+}
+
+pub async fn build_with_tool_hook(
+    resolved: &ResolvedModel,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    before_tool_call: Option<rpi_agent::BeforeToolCall>,
+) -> Result<
+    (
+        AgentHarness,
+        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+        ReloadContext,
+    ),
+    BuildError,
+> {
     let prepared = prepare_extensions(args, cwd, project_trusted)?;
-    build_prepared(resolved, args, cwd, project_trusted, prepared).await
+    build_prepared_with_tool_hook(
+        resolved,
+        args,
+        cwd,
+        project_trusted,
+        prepared,
+        before_tool_call,
+    )
+    .await
 }
 
 pub async fn build_prepared(
@@ -730,6 +755,24 @@ pub async fn build_prepared(
     cwd: &Path,
     project_trusted: bool,
     prepared: PreparedExtensions,
+) -> Result<
+    (
+        AgentHarness,
+        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+        ReloadContext,
+    ),
+    BuildError,
+> {
+    build_prepared_with_tool_hook(resolved, args, cwd, project_trusted, prepared, None).await
+}
+
+async fn build_prepared_with_tool_hook(
+    resolved: &ResolvedModel,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    prepared: PreparedExtensions,
+    host_tool_hook: Option<rpi_agent::BeforeToolCall>,
 ) -> Result<
     (
         AgentHarness,
@@ -1195,19 +1238,21 @@ pub async fn build_prepared(
     // tool-call handler. An extension session may contain flags/resources but
     // no handler; dispatching through that empty session needlessly crosses
     // the plugin bridge and can leave a headless RPC tool call waiting.
-    let before_tool_call = extension_session
-        .snapshot()
-        .filter(|snapshot| {
-            !snapshot
-                .handlers_for(rpi_plugin_sdk::EventTag::ToolCall)
-                .is_empty()
-        })
-        .map(|_| {
-            extension_tool_call_hook(
-                Arc::clone(&extension_session_cell),
-                ui_dialog_mailbox.clone(),
-            )
-        });
+    let before_tool_call = host_tool_hook.or_else(|| {
+        extension_session
+            .snapshot()
+            .filter(|snapshot| {
+                !snapshot
+                    .handlers_for(rpi_plugin_sdk::EventTag::ToolCall)
+                    .is_empty()
+            })
+            .map(|_| {
+                extension_tool_call_hook(
+                    Arc::clone(&extension_session_cell),
+                    ui_dialog_mailbox.clone(),
+                )
+            })
+    });
 
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),

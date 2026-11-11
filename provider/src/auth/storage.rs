@@ -3,9 +3,7 @@ use crate::types::StoredCredential;
 use rusqlite::{Connection, OpenFlags};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 fn auth_db_path() -> PathBuf {
     runtime::agent_dir().join("agent.db")
@@ -116,42 +114,6 @@ pub fn save_api_key(provider_id: &str, key: &str) -> Result<(), String> {
             source: Some("Stored API key".into()),
         },
     )
-}
-
-/// Feed the selected Kathamo API key to the private runtime using its auth protocol.
-pub fn sync_api_key(provider_id: &str) -> Result<(), String> {
-    let Some(path) = credentials_file_path().filter(|path| path.exists()) else {
-        return Ok(());
-    };
-    let _lock = lock_local_credentials(&path)?;
-    let Some(StoredCredential::ApiKey { key, .. }) = get_local_credential(provider_id) else {
-        return Ok(());
-    };
-    let data = serde_json::json!({
-        "version": 1,
-        "credentials": [{
-            "provider": provider_id,
-            "credential": { "type": "api_key", "key": key, "source": "login" }
-        }]
-    });
-    let mut child = runtime::command()?
-        .args(["auth", "import", "-"])
-        .current_dir(runtime::root())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("Could not load the Kathamo API key: {error}"))?;
-    let write = child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(data.to_string().as_bytes());
-    let status = child.wait();
-    match (write, status) {
-        (Ok(()), Ok(status)) if status.success() => Ok(()),
-        _ => Err("Could not import the API key into the Kathamo provider runtime".into()),
-    }
 }
 
 pub fn disconnect_provider(provider_id: &str) -> Result<(), String> {

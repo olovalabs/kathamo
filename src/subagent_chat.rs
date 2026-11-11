@@ -230,7 +230,7 @@ pub fn legacy(name: &str, text: &str) -> Vec<Worker> {
 /// Legacy logs lack the OMP session path. A matching parent tool-call ID
 /// identifies the session even when several chats used the same worker name.
 pub fn find_legacy_transcript(id: &str, tool_id: &str) -> Option<PathBuf> {
-    let agent_dir = crate::provider::runtime::agent_dir();
+    let agent_dir = crate::paths::data_dir().join("provider/agent");
     for project in fs::read_dir(agent_dir.join("sessions")).ok()?.flatten() {
         let Ok(sessions) = fs::read_dir(project.path()) else {
             continue;
@@ -293,183 +293,13 @@ fn message_text(message: &Value, role: ChatRole) -> String {
         .join("\n\n")
 }
 
-#[derive(Default)]
-pub struct LiveWorker {
-    pub tool_id: Option<String>,
-    pub transcript: Option<PathBuf>,
-    pub active: bool,
-    pub reported: Option<Worker>,
-    messages: Vec<Arc<ChatMessage>>,
-    active_timestamp: Option<u64>,
-    active_start: usize,
-}
-
-impl LiveWorker {
-    pub fn report_error(&mut self, error: &str) {
-        crate::push_chat_event(
-            &mut self.messages,
-            crate::agent_bridge::AgentEvent::Error(error.into()),
-        );
-    }
-
-    pub fn finish(&mut self) {
-        crate::finish_chat_streaming(&mut self.messages);
-        crate::finish_chat_tools(&mut self.messages);
-    }
-
-    pub fn apply(&mut self, event: &Value) -> bool {
-        let message = &event["message"];
-        let timestamp = message["timestamp"].as_u64();
-        match event["type"].as_str() {
-            Some("message_start") if message["role"] == "assistant" => {
-                crate::finish_chat_streaming(&mut self.messages);
-                self.active_timestamp = timestamp;
-                self.active_start = self.messages.len();
-                false
-            }
-            Some("message_start" | "message_end") if message["role"] == "user" => {
-                let text = message_text(message, ChatRole::User);
-                if text.is_empty()
-                    || self.messages.last().is_some_and(|last| {
-                        last.role == ChatRole::User
-                            && last.text == text
-                            && last.source_timestamp == timestamp
-                    })
-                {
-                    return false;
-                }
-                let mut row = ChatMessage::new(ChatRole::User, text);
-                row.source_timestamp = timestamp;
-                self.messages.push(Arc::new(row));
-                self.active_start = self.messages.len();
-                self.active_timestamp = None;
-                true
-            }
-            Some("message_update") => {
-                let delta = &event["assistantMessageEvent"];
-                let (role, text) = match delta["type"].as_str() {
-                    Some("text_delta") => (ChatRole::Assistant, delta["delta"].as_str()),
-                    Some("thinking_delta") => (ChatRole::Thinking, delta["delta"].as_str()),
-                    _ => return false,
-                };
-                self.apply_delta(role, text, timestamp)
-            }
-            Some("message_end") if message["role"] == "assistant" => {
-                let mut changed = false;
-                for role in [ChatRole::Thinking, ChatRole::Assistant] {
-                    let text = message_text(message, role);
-                    let current = &mut self.messages[self.active_start..];
-                    let mut rows = current.iter_mut().filter(|row| row.role == role);
-                    if let Some(row) = rows.next() {
-                        let has_multiple = rows.next().is_some();
-                        let row = Arc::make_mut(row);
-                        if !has_multiple && !text.is_empty() {
-                            row.text = text;
-                        }
-                        changed = true;
-                    } else if !text.is_empty() {
-                        let mut row = ChatMessage::new(role, text);
-                        row.source_timestamp = timestamp;
-                        self.messages.push(Arc::new(row));
-                        changed = true;
-                    }
-                }
-                for row in &mut self.messages[self.active_start..] {
-                    if matches!(row.role, ChatRole::Assistant | ChatRole::Thinking) {
-                        let row = Arc::make_mut(row);
-                        row.source_timestamp = timestamp.or(row.source_timestamp);
-                        row.streaming = false;
-                        row.stream = None;
-                    }
-                }
-                self.active_start = self.messages.len();
-                self.active_timestamp = None;
-                changed
-            }
-            Some("tool_execution_start" | "tool_execution_update" | "tool_execution_end") => {
-                let Some(event) = crate::agent_bridge::decode_tool_event(event) else {
-                    return false;
-                };
-                crate::push_chat_event(&mut self.messages, event);
-                true
-            }
-            Some("agent_end") => {
-                crate::finish_chat_streaming(&mut self.messages);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    pub(crate) fn apply_delta(
-        &mut self,
-        role: ChatRole,
-        text: Option<&str>,
-        timestamp: Option<u64>,
-    ) -> bool {
-        let Some(text) = text.filter(|text| !text.is_empty()) else {
-            return false;
-        };
-        let timestamp = timestamp.or(self.active_timestamp);
-        if let Some(last) = self.messages.last_mut().filter(|last| {
-            last.role == role && last.streaming && last.source_timestamp == timestamp
-        }) {
-            let last = Arc::make_mut(last);
-            last.text.push_str(text);
-            crate::refresh_stream_view(last, text.contains('\n'));
-        } else {
-            crate::finish_chat_streaming(&mut self.messages);
-            let mut row = ChatMessage::new(role, text.to_owned());
-            row.source_timestamp = timestamp;
-            row.streaming = true;
-            crate::refresh_stream_view(&mut row, true);
-            self.messages.push(Arc::new(row));
-        }
-        true
-    }
-
-    pub fn messages_with_history<'a>(
-        &'a self,
-        saved: &'a [Arc<ChatMessage>],
-    ) -> std::iter::Chain<
-        std::slice::Iter<'a, Arc<ChatMessage>>,
-        std::slice::Iter<'a, Arc<ChatMessage>>,
-    > {
-        // Disk can catch up while the view is open. Keep the ordered live
-        // sequence for overlapping messages so tool rows stay in place.
-        let first_live = self.messages.iter().find(|row| {
-            row.tool.is_some()
-                || matches!(
-                    row.role,
-                    ChatRole::User | ChatRole::Thinking | ChatRole::Assistant
-                )
-        });
-        let overlap = first_live.and_then(|live| {
-            saved.iter().position(|entry| {
-                if let Some(id) = live.tool.as_ref().and_then(|tool| tool.id.as_deref()) {
-                    return entry.tool.as_ref().and_then(|tool| tool.id.as_deref()) == Some(id);
-                }
-                match (entry.source_timestamp, live.source_timestamp) {
-                    (Some(saved), Some(live)) => saved >= live,
-                    _ => {
-                        entry.role == live.role && !entry.text.is_empty() && entry.text == live.text
-                    }
-                }
-            })
-        });
-        saved[..overlap.unwrap_or(saved.len())]
-            .iter()
-            .chain(&self.messages)
-    }
-}
-
 pub fn read_transcript(path: &Path) -> Option<Vec<Arc<ChatMessage>>> {
     let directory = path.parent()?.canonicalize().ok()?;
     let path = path.canonicalize().ok()?;
     if path.parent()? != directory || !path.is_file() {
         return None;
     }
-    let file = File::open(path).ok()?;
+    let file = File::open(&path).ok()?;
     let reader = BufReader::new(file.take(16 * 1024 * 1024));
     let mut messages = Vec::new();
     for line in reader.lines().map_while(Result::ok) {
@@ -490,6 +320,16 @@ pub fn read_transcript(path: &Path) -> Option<Vec<Arc<ChatMessage>>> {
                         failed: message["isError"] == true,
                     },
                 );
+                let workers = structured(name, &message["details"], Some(&path));
+                if !workers.is_empty() {
+                    crate::push_chat_event(
+                        &mut messages,
+                        crate::agent_bridge::AgentEvent::Subagents {
+                            tool_id: id.to_owned(),
+                            workers,
+                        },
+                    );
+                }
             }
             continue;
         }
@@ -635,60 +475,6 @@ mod tests {
             rows[1].worker.transcript.as_deref(),
             Some(Path::new("/sessions/parent/AnalyzeRoutesAndUI.jsonl"))
         );
-    }
-
-    #[test]
-    fn worker_reply_streams_before_the_transcript_is_written() {
-        let mut worker = LiveWorker::default();
-        for (delta, expected) in [("First", "First"), (" words", "First words")] {
-            assert!(worker.apply(&json!({
-                "type":"message_update",
-                "message":{"role":"assistant","timestamp":42},
-                "assistantMessageEvent":{"type":"text_delta","delta":delta}
-            })));
-            let reply = worker.messages_with_history(&[]).next().unwrap();
-            assert_eq!(reply.text, expected);
-            assert!(reply.streaming);
-        }
-        assert!(worker.apply(&json!({
-            "type":"message_end",
-            "message":{"role":"assistant","timestamp":42,"content":[{"type":"text","text":"First words."}]}
-        })));
-        let reply = worker.messages_with_history(&[]).next().unwrap();
-        assert_eq!(reply.text, "First words.");
-        assert!(!reply.streaming);
-        let saved = Arc::clone(reply);
-        assert_eq!(worker.messages_with_history(&[saved]).count(), 1);
-    }
-
-    #[test]
-    fn compact_worker_deltas_and_tools_keep_their_order() {
-        let mut worker = LiveWorker::default();
-        assert!(worker.apply(&json!({
-            "type": "message_update",
-            "assistantMessageEvent": {"type": "thinking_delta", "delta": "Checking"}
-        })));
-        assert!(worker.apply(&json!({
-            "type": "tool_execution_start",
-            "toolCallId": "read-one", "toolName": "read", "args": {"path": "Cargo.toml"}
-        })));
-        assert!(worker.apply(&json!({
-            "type": "tool_execution_update",
-            "toolCallId": "read-one", "toolName": "read",
-            "partialResult": {"content": [{"type": "text", "text": "partial file"}]}
-        })));
-        assert!(worker.apply(&json!({
-            "type": "message_update",
-            "assistantMessageEvent": {"type": "text_delta", "delta": "Answer so far"}
-        })));
-        let messages = worker.messages_with_history(&[]).collect::<Vec<_>>();
-        assert_eq!(messages[0].role, ChatRole::Thinking);
-        assert_eq!(
-            messages[1].tool.as_ref().unwrap().output.as_ref(),
-            "partial file"
-        );
-        assert_eq!(messages[2].text, "Answer so far");
-        assert!(messages[2].streaming);
     }
 
     #[test]

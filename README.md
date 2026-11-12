@@ -23,7 +23,7 @@ Kathamo combines native terminal rendering powered by [GPUI Fast](https://github
   - **Sub-Agent / Worker Hierarchy**: Child sessions indented cleanly beneath parent agents without triggering duplicate alerts.
 
 - **📁 Multi-Project Sidebar & Session Persistence**
-  - Group terminal sessions cleanly under collapsible project folders in the sidebar.
+  - Group terminal sessions under collapsible project folders in the sidebar, with the newest session first.
   - Restores the full workspace on relaunch: projects, tabs, split panes, focus, per-pane working directories, input drafts, command history, window geometry, and the previous terminal output.
   - Agent conversations are saved to disk; rpi sessions resume on the next prompt.
   - Quick-action buttons to create new terminal sessions per project or open existing directories.

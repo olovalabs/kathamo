@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- List each project's sidebar sessions newest-first, so a newly created session appears at the top and remains visible when the project already has five or more sessions.
 - Restored CI formatting compliance and removed a non-looping PTY benchmark readiness loop rejected by Clippy.
 
 ### Added
@@ -65,7 +66,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Restyled model selection with compact rows, trailing selection checks, free-model badges, and a two-column provider card section matching the OpenCode reference. Model selection and provider authentication now share one narrower 520px modal with theme-derived backgrounds, text, borders, and hover colors, plus consistent close and back navigation.
 - Compact streamed OMP text, worker deltas and cumulative tool snapshots before enqueue with bounded backpressure, preserving tool lifecycle order and complete results.
 - Favor independent read/search batches and deterministic multi-step local execution while keeping OMP's shared/exclusive scheduling and full tool/extension discovery.
-- Redesigned the project sidebar with compact, smaller session titles without per-session logos, reduced left padding, subtle selection styling, and project/session remove buttons shown only while hovering their row. Each project initially shows five sessions; each "Show more" click reveals ten more, and "Show less" collapses back to five. Expanded lists scroll while the toolbar and Settings footer remain visible.
+- Redesigned the project sidebar with compact, smaller session titles without per-session logos, reduced left padding, subtle selection styling, and project/session remove buttons shown only while hovering their row. Each project initially shows the five newest sessions; each "Show more" click reveals ten more, and "Show less" collapses back to five. Expanded lists scroll while the toolbar and Settings footer remain visible.
 - Poll active agent streams at approximately frame cadence while retaining the lower idle polling rate.
 - Migrated the application and terminal renderer to GPUI Fast.
 - The terminal displays a plain grid without block UI. The Warp-style bottom input is always available when the shell is idle and temporarily hides while a command runs or the alternate screen is active.

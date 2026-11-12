@@ -2460,8 +2460,19 @@ pub struct Project {
     /// project keeps its own state, so several open projects can be browsed
     /// independently without switching away from the one being worked in.
     pub expanded: bool,
-    /// Number of session titles revealed in the sidebar; reset on launch.
+    /// Number of newest session titles revealed in the sidebar; reset on launch.
     visible_session_count: usize,
+}
+
+/// Storage order is oldest-first so restore, selection, and close indices stay
+/// stable. The sidebar shows the newest `visible_count` sessions, newest first.
+fn sidebar_session_indices(
+    session_count: usize,
+    visible_count: usize,
+) -> impl Iterator<Item = usize> {
+    let shown = visible_count.min(session_count);
+    let oldest_shown = session_count - shown;
+    (oldest_shown..session_count).rev()
 }
 
 struct AppState {
@@ -13003,12 +13014,10 @@ impl AppState {
                         .into_any_element(),
                 );
             }
-            for (s_idx, session) in project
-                .sessions
-                .iter()
-                .take(project.visible_session_count)
-                .enumerate()
+            for s_idx in
+                sidebar_session_indices(project.sessions.len(), project.visible_session_count)
             {
+                let session = &project.sessions[s_idx];
                 let is_active_session = is_active_project && s_idx == project.active_session_idx;
                 rows.push(self.render_session_entry(
                     project_idx,
@@ -13516,6 +13525,10 @@ impl AppState {
 
         div()
             .id(("session-item", session.id))
+            .debug_selector({
+                let id = session.id;
+                move || format!("session-row-{id}")
+            })
             .group("session-row")
             .ml(px(6.0))
             .mr(px(6.0))
@@ -16595,6 +16608,79 @@ mod pane_tests {
         assert_eq!(remove_session_right, px(249.0));
         assert_eq!(new_session_bounds.origin.x, px(229.0));
         assert_eq!(remove_session_bounds.origin.x, px(229.0));
+    }
+
+    #[test]
+    fn sidebar_session_indices_keep_the_newest_on_the_first_page() {
+        assert_eq!(
+            sidebar_session_indices(0, 5).collect::<Vec<_>>(),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            sidebar_session_indices(3, 5).collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        assert_eq!(
+            sidebar_session_indices(6, 5).collect::<Vec<_>>(),
+            vec![5, 4, 3, 2, 1]
+        );
+        assert_eq!(
+            sidebar_session_indices(17, 15).collect::<Vec<_>>(),
+            (2..17).rev().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn new_sidebar_session_renders_first_and_stays_on_the_first_page() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, app_state) = open_app(&mut cx);
+        let (oldest_id, newest_id, previous_id) =
+            cx.update_window_entity(&app_state, |state, window, cx| {
+                for idx in 2..=6 {
+                    let title: SharedString = format!("Session {idx}").into();
+                    state.projects[0].sessions.push(Session {
+                        id: idx,
+                        uid: paths::uid("s"),
+                        title: title.clone(),
+                        display_title: title,
+                        logo: logos::default_logo(),
+                        pane_tree: None,
+                        maximized_pane_id: None,
+                        panes: Vec::new(),
+                        status: SessionStatus::Idle,
+                    });
+                }
+                state.next_id = 7;
+                state.rebuild_session_index();
+                state.create_new_session_in_project(0, window, cx);
+                let project = &state.projects[0];
+                let newest = project.sessions.last().unwrap().id;
+                assert_eq!(project.active_session_idx, project.sessions.len() - 1);
+                assert_eq!(
+                    sidebar_session_indices(project.sessions.len(), project.visible_session_count)
+                        .next(),
+                    Some(project.active_session_idx)
+                );
+                (project.sessions[0].id, newest, 6)
+            });
+        assert_eq!((oldest_id, newest_id, previous_id), (1, 7, 6));
+        cx.draw_frame()
+            .expect("sidebar with the newest session first");
+
+        let newest = cx
+            .debug_bounds("session-row-7")
+            .expect("newest session row");
+        let previous = cx
+            .debug_bounds("session-row-6")
+            .expect("previous session row");
+        assert!(
+            newest.top() < previous.top(),
+            "a new session must render above older sessions"
+        );
+        assert!(
+            cx.debug_bounds("session-row-1").is_none(),
+            "the oldest session must leave the first page instead of hiding the new one"
+        );
     }
 
     #[test]

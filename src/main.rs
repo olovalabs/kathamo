@@ -2623,6 +2623,36 @@ pub struct TerminalPane {
     pub terminal_subscription: Option<gpui::Subscription>,
 }
 
+/// Commands handled by the agent composer itself.
+const AGENT_SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "Show available commands"),
+    ("/new", "Start a new chat"),
+    ("/copy", "Copy the last assistant reply"),
+    ("/version", "Show the application version"),
+    ("/auth", "Manage provider authentication"),
+    ("/model", "Choose a model"),
+    ("/fast", "Toggle fast reasoning"),
+    ("/thinking", "Set reasoning effort"),
+];
+
+fn agent_slash_completions(value: &str) -> Vec<completion::CompletionItem> {
+    if !value.starts_with('/') || value.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let query = value.to_lowercase();
+    AGENT_SLASH_COMMANDS
+        .iter()
+        .filter(|(name, _)| name.starts_with(&query))
+        .map(|(name, description)| completion::CompletionItem {
+            value: (*name).into(),
+            display: (*name).into(),
+            detail: (*description).into(),
+            kind: completion::CompletionKind::Command,
+            is_dir: false,
+        })
+        .collect()
+}
+
 /// One visible completion popup for a pane.
 pub struct CompletionMenuState {
     /// Byte range in the input value that accepting replaces.
@@ -5721,7 +5751,28 @@ impl AppState {
                 .pane_ref(pane_id)
                 .and_then(|pane| pane.input_state.clone())
             {
+                let value = input.read(cx).value().to_string();
+                let items = agent_slash_completions(&value);
+                if let Some(pane) = self.pane_mut(pane_id) {
+                    let selected = pane
+                        .completion_menu
+                        .as_ref()
+                        .filter(|menu| menu.token == value)
+                        .map_or(0, |menu| menu.selected);
+                    pane.completion_menu = if items.is_empty() {
+                        None
+                    } else {
+                        Some(CompletionMenuState {
+                            start: 0,
+                            end: value.len(),
+                            token: value,
+                            selected: selected.min(items.len() - 1),
+                            items,
+                        })
+                    };
+                }
                 input.update(cx, |state, cx| state.clear_inline_completion(cx));
+                cx.notify();
             }
             return;
         }
@@ -5869,6 +5920,22 @@ impl AppState {
         let Some((start, end, item)) = selected else {
             return;
         };
+        if self.pane_ref(pane_id).is_some_and(|pane| pane.chat.active) {
+            let Some(input) = self
+                .pane_ref(pane_id)
+                .and_then(|pane| pane.input_state.clone())
+            else {
+                return;
+            };
+            self.close_completion_menu(pane_id, cx);
+            if item.value == "/thinking" {
+                set_input_text(&input, format!("{} ", item.value), window, cx);
+            } else {
+                set_input_text(&input, item.value, window, cx);
+                self.submit_agent_prompt(pane_id, window, cx);
+            }
+            return;
+        }
         self.apply_completion(pane_id, start, end, item, window, cx);
     }
 
@@ -7113,6 +7180,62 @@ impl AppState {
         let Some(input) = pane.input_state.clone() else {
             return;
         };
+        let command = input.read(cx).value().trim().to_owned();
+        match command.as_str() {
+            "/new" => {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+                let project_idx = self.projects.iter().position(|project| {
+                    project
+                        .sessions
+                        .iter()
+                        .any(|session| session.panes.iter().any(|pane| pane.id == pane_id))
+                });
+                if let Some(project_idx) = project_idx {
+                    self.create_new_session_in_project(project_idx, window, cx);
+                    if let Some(new_id) = self.focused_pane_id {
+                        if let Some(pane) = self.pane_mut(new_id) {
+                            pane.chat.active = true;
+                        }
+                    }
+                    cx.notify();
+                }
+                return;
+            }
+            "/help" | "/version" | "/copy" => {
+                let status = match command.as_str() {
+                    "/help" => AGENT_SLASH_COMMANDS
+                        .iter()
+                        .map(|(name, description)| format!("{name} — {description}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    "/version" => format!("Kathamo {}", env!("CARGO_PKG_VERSION")),
+                    _ => {
+                        let reply = pane
+                            .chat
+                            .visible_messages()
+                            .iter()
+                            .rev()
+                            .find(|message| {
+                                message.role == ChatRole::Assistant && !message.text.is_empty()
+                            })
+                            .map(|message| message.text.clone());
+                        if let Some(reply) = reply {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(reply));
+                            "Copied the last assistant reply.".to_owned()
+                        } else {
+                            "No assistant reply to copy yet.".to_owned()
+                        }
+                    }
+                };
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+                pane.chat
+                    .visible_messages_mut()
+                    .push(Arc::new(ChatMessage::new(ChatRole::Status, status)));
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
         let page = match input.read(cx).value().trim() {
             "/auth" => Some(AgentDialogPage::Auth),
             "/model" => Some(AgentDialogPage::Models),
@@ -7591,6 +7714,15 @@ impl AppState {
                     .pane_ref(pane_id)
                     .and_then(|pane| pane.completion_menu.as_ref().map(|menu| menu.selected))
                     .unwrap_or(0);
+                self.accept_completion_at(pane_id, selected, window, cx);
+                return;
+            }
+            if (key == "enter" || key == "return") && !modifiers.shift && pane.chat.active {
+                cx.stop_propagation();
+                let selected = pane
+                    .completion_menu
+                    .as_ref()
+                    .map_or(0, |menu| menu.selected);
                 self.accept_completion_at(pane_id, selected, window, cx);
                 return;
             }
@@ -9496,7 +9628,16 @@ impl AppState {
                 }),
             )
             .children(plus_menu)
-            .children(completion_menu)
+            .child(
+                div().relative().w_full().h(px(0.0)).children(completion_menu.map(|menu| {
+                    deferred(
+                        gpui::anchored()
+                            .anchor(gpui::Anchor::BottomLeft)
+                            .offset(gpui::point(px(0.0), px(-6.0)))
+                            .child(menu),
+                    )
+                })),
+            )
             // Row 1: Badges
             .child(
                 div()
@@ -9834,22 +9975,32 @@ impl AppState {
             return None;
         }
 
-        let bg: Hsla = if tokens.is_dark {
+        let bg: Hsla = if pane.chat.active && tokens.is_dark {
+            rgba(0x050505ff).into()
+        } else if pane.chat.active {
+            tokens.pane_header_bg
+        } else if tokens.is_dark {
             rgba(0x16171eff).into()
         } else {
             rgba(0xffffffff).into()
         };
-        let border: Hsla = if tokens.is_dark {
+        let border: Hsla = if pane.chat.active {
+            tokens.pane_border
+        } else if tokens.is_dark {
             rgba(0x2d2e3dff).into()
         } else {
             tokens.card_border
         };
-        let row_selected_bg: Hsla = if tokens.is_dark {
+        let row_selected_bg: Hsla = if pane.chat.active {
+            tokens.sidebar_item_active
+        } else if tokens.is_dark {
             rgba(0x262838ff).into()
         } else {
             rgba(0x0000000f).into()
         };
-        let row_hover_bg: Hsla = if tokens.is_dark {
+        let row_hover_bg: Hsla = if pane.chat.active {
+            tokens.sidebar_item_hover
+        } else if tokens.is_dark {
             rgba(0x1f2130ff).into()
         } else {
             rgba(0x0000000a).into()
@@ -9887,13 +10038,15 @@ impl AppState {
                             .items_center()
                             .gap(px(7.0))
                             .min_w_0()
-                            .child(
-                                div()
-                                    .w(px(14.0))
-                                    .text_size(px(10.0))
-                                    .text_color(kind_color)
-                                    .child(if item.is_dir { "▸" } else { "·" }),
-                            )
+                            .when(!pane.chat.active, |this| {
+                                this.child(
+                                    div()
+                                        .w(px(14.0))
+                                        .text_size(px(10.0))
+                                        .text_color(kind_color)
+                                        .child(if item.is_dir { "▸" } else { "·" }),
+                                )
+                            })
                             .child(
                                 div()
                                     .font_family(MONO_FONT)
@@ -9923,10 +10076,7 @@ impl AppState {
         Some(
             div()
                 .id(("completion-menu", pane_id))
-                .absolute()
-                .bottom(relative(1.0))
-                .left(px(0.0))
-                .mb(px(6.0))
+                .debug_selector(|| "completion-menu".to_string())
                 .w(px(440.0))
                 .max_w(relative(1.0))
                 .max_h(px(240.0))
@@ -16124,6 +16274,47 @@ mod resize_tests {
                     .all(|pane| pane.chat.selected_model.as_ref() == Some(&model))
             );
         });
+    }
+
+    #[test]
+    fn completion_menu_sits_directly_above_composer() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            let input = s.pane_ref(pane_id).unwrap().input_state.clone().unwrap();
+            input.update(cx, |input, cx| input.set_value("/", window, cx));
+            s.on_pane_input_changed(pane_id, window, cx);
+        });
+        cx.draw_frame().unwrap();
+        let menu = cx.debug_bounds("completion-menu").unwrap();
+        let bar = cx.debug_bounds("kathamo-input-bar").unwrap();
+        let input = cx.debug_bounds("agent-composer-input").unwrap();
+        assert!(
+            menu.bottom() <= input.top(),
+            "menu {menu:?}, bar {bar:?}, input {input:?}"
+        );
+        assert!(
+            (menu.bottom() - bar.top()).abs() < px(20.0),
+            "menu should be adjacent to the composer: menu {menu:?}, bar {bar:?}"
+        );
+    }
+
+    #[test]
+    fn agent_slash_menu_filters_only_command_input() {
+        let names = |input: &str| {
+            agent_slash_completions(input)
+                .into_iter()
+                .map(|item| item.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("/").len(), AGENT_SLASH_COMMANDS.len());
+        assert_eq!(names("/mo"), vec!["/model"]);
+        assert_eq!(names("/TH"), vec!["/thinking"]);
+        assert!(names("/thinking high").is_empty());
+        assert!(names("explain /model").is_empty());
+        assert!(names("/unknown").is_empty());
     }
 
     #[test]

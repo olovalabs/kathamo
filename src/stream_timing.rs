@@ -186,7 +186,9 @@ pub fn tool_arrived(id: &str) {
 /// First non-empty tool snapshot reached host transport admission, before
 /// queueing or projection. Final-only tool output uses the same marker.
 pub fn tool_output_arrived(id: &str) {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     if let Some(tool) = lock(&TOOLS).get_mut(id) {
         tool.output_arrived.get_or_insert_with(Instant::now);
     }
@@ -247,7 +249,9 @@ pub fn tool_card_painted(id: &str) {
 
 /// Tool start and first non-empty snapshot → the first output entered a frame.
 pub fn tool_output_painted(id: &str) {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let times = lock(&TOOLS).get_mut(id).and_then(|trace| {
         if std::mem::replace(&mut trace.output_painted, true) {
             None
@@ -257,9 +261,15 @@ pub fn tool_output_painted(id: &str) {
     });
     if let Some((arrived, output_arrived)) = times {
         let painted = Instant::now();
-        record("tool.arrival_to_output", painted.saturating_duration_since(arrived));
+        record(
+            "tool.arrival_to_output",
+            painted.saturating_duration_since(arrived),
+        );
         if let Some(output_arrived) = output_arrived {
-            record("tool.output_to_paint", painted.saturating_duration_since(output_arrived));
+            record(
+                "tool.output_to_paint",
+                painted.saturating_duration_since(output_arrived),
+            );
         }
     }
 }
@@ -316,7 +326,9 @@ static TURNS: LazyLock<Mutex<HashMap<u64, TurnTrace>>> =
 /// Paint identity for the current turn, including a turn that settled before
 /// its first frame. A conversation trace is reused; its submit time is not.
 pub fn turn_started_at(trace: u64) -> Option<Instant> {
-    if !enabled() { return None; }
+    if !enabled() {
+        return None;
+    }
     lock(&TURNS).get(&trace).map(|turn| turn.sent)
 }
 

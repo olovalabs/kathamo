@@ -801,8 +801,16 @@ impl Shell for InMemoryExecutionEnv {
         }
 
         Ok(ShellOutput {
-            stdout: if options.capture_output { script.stdout } else { String::new() },
-            stderr: if options.capture_output { script.stderr } else { String::new() },
+            stdout: if options.capture_output {
+                script.stdout
+            } else {
+                String::new()
+            },
+            stderr: if options.capture_output {
+                script.stderr
+            } else {
+                String::new()
+            },
             exit_code: script.exit_code,
         })
     }

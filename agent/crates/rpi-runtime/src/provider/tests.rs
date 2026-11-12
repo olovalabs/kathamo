@@ -2149,29 +2149,61 @@ fn case_distinct_wire_model_ids_select_the_exact_route() {
     registry.declare(crate::ProviderDeclaration {
         id: "case-models".into(),
         models: vec![
-            Model::new("Case-ID", "Upper", rpi_ai::Api::OpenaiCompletions, "case-models", "https://upper.example/v1"),
-            Model::new("case-id", "Lower", rpi_ai::Api::OpenaiCompletions, "case-models", "https://lower.example/v1"),
+            Model::new(
+                "Case-ID",
+                "Upper",
+                rpi_ai::Api::OpenaiCompletions,
+                "case-models",
+                "https://upper.example/v1",
+            ),
+            Model::new(
+                "case-id",
+                "Lower",
+                rpi_ai::Api::OpenaiCompletions,
+                "case-models",
+                "https://lower.example/v1",
+            ),
         ],
         api_key_env: None,
         requires_auth: true,
     });
     let mut config = crate::RuntimeConfig::default();
-    config.credentials.insert("case-models".into(), Credential::ApiKey {
-        key: Some("fixture-key".into()), env: None,
-    });
+    config.credentials.insert(
+        "case-models".into(),
+        Credential::ApiKey {
+            key: Some("fixture-key".into()),
+            env: None,
+        },
+    );
     for (id, endpoint) in [
         ("Case-ID", "https://upper.example/v1"),
         ("case-id", "https://lower.example/v1"),
     ] {
-        let resolved = config.resolve(&crate::ModelRequest {
-            provider: Some("case-models"), model: Some(id), ..Default::default()
-        }, &registry, &BTreeMap::new()).unwrap();
+        let resolved = config
+            .resolve(
+                &crate::ModelRequest {
+                    provider: Some("case-models"),
+                    model: Some(id),
+                    ..Default::default()
+                },
+                &registry,
+                &BTreeMap::new(),
+            )
+            .unwrap();
         assert_eq!(resolved.model.id, id);
         assert_eq!(resolved.model.base_url, endpoint);
     }
-    let error = config.resolve(&crate::ModelRequest {
-        provider: Some("case-models"), model: Some("CASE-ID"), ..Default::default()
-    }, &registry, &BTreeMap::new()).unwrap_err();
+    let error = config
+        .resolve(
+            &crate::ModelRequest {
+                provider: Some("case-models"),
+                model: Some("CASE-ID"),
+                ..Default::default()
+            },
+            &registry,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
     assert!(matches!(error, ResolveError::AmbiguousModel { .. }));
 }
 
@@ -2196,20 +2228,27 @@ fn host_declaration_replaces_builtin_antigravity_route() {
         requires_auth: false,
     });
     registry.register(Arc::new(provider), rpi_ai::Api::GoogleGenerativeAi);
-    let resolved = crate::RuntimeConfig::default().resolve(
-        &crate::ModelRequest {
-            provider: Some(antigravity::ID),
-            model: Some("gemini-3.8-flash"),
-            ..Default::default()
-        },
-        &registry,
-        &BTreeMap::new(),
-    ).unwrap();
+    let resolved = crate::RuntimeConfig::default()
+        .resolve(
+            &crate::ModelRequest {
+                provider: Some(antigravity::ID),
+                model: Some("gemini-3.8-flash"),
+                ..Default::default()
+            },
+            &registry,
+            &BTreeMap::new(),
+        )
+        .unwrap();
 
     assert_eq!(resolved.model.api, rpi_ai::Api::GoogleGenerativeAi);
     assert_eq!(resolved.model.base_url, antigravity::ENDPOINT);
     assert_eq!(
-        resolved.provider.models().iter().filter(|model| model.id == "gemini-3.8-flash").count(),
+        resolved
+            .provider
+            .models()
+            .iter()
+            .filter(|model| model.id == "gemini-3.8-flash")
+            .count(),
         1,
         "the native host route must replace, not duplicate, the bundled route",
     );
@@ -2221,30 +2260,48 @@ fn host_declaration_preserves_its_explicit_wire_variants() {
     registry.declare(crate::ProviderDeclaration {
         id: "openai".into(),
         models: vec![
-            Model::new("gpt-6-astra", "Chat", rpi_ai::Api::OpenaiCompletions, "openai", "https://chat.example/v1"),
-            Model::new("gpt-6-astra", "Responses", rpi_ai::Api::OpenaiResponses, "openai", "https://responses.example/v1"),
+            Model::new(
+                "gpt-6-astra",
+                "Chat",
+                rpi_ai::Api::OpenaiCompletions,
+                "openai",
+                "https://chat.example/v1",
+            ),
+            Model::new(
+                "gpt-6-astra",
+                "Responses",
+                rpi_ai::Api::OpenaiResponses,
+                "openai",
+                "https://responses.example/v1",
+            ),
         ],
         api_key_env: None,
         requires_auth: true,
     });
     let mut config = crate::RuntimeConfig::default();
-    config.credentials.insert("openai".into(), Credential::ApiKey {
-        key: Some("fixture-key".into()), env: None,
-    });
+    config.credentials.insert(
+        "openai".into(),
+        Credential::ApiKey {
+            key: Some("fixture-key".into()),
+            env: None,
+        },
+    );
     for (api, endpoint) in [
         (rpi_ai::Api::OpenaiCompletions, "https://chat.example/v1"),
         (rpi_ai::Api::OpenaiResponses, "https://responses.example/v1"),
     ] {
-        let resolved = config.resolve(
-            &crate::ModelRequest {
-                provider: Some("openai"),
-                model: Some("gpt-6-astra"),
-                api: Some(api.clone()),
-                ..Default::default()
-            },
-            &registry,
-            &BTreeMap::new(),
-        ).unwrap();
+        let resolved = config
+            .resolve(
+                &crate::ModelRequest {
+                    provider: Some("openai"),
+                    model: Some("gpt-6-astra"),
+                    api: Some(api.clone()),
+                    ..Default::default()
+                },
+                &registry,
+                &BTreeMap::new(),
+            )
+            .unwrap();
         assert_eq!(resolved.model.api, api);
         assert_eq!(resolved.model.base_url, endpoint);
     }

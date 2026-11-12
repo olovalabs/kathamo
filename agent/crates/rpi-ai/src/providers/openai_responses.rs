@@ -113,10 +113,15 @@ impl OpenAiResponsesProvider {
     ) -> AssistantMessageEventStream {
         let (mut producer, stream) =
             create_assistant_message_event_stream_with_cancellation(&opts.signal);
-        let deployment_key = headers.keys().find(|name| name.eq_ignore_ascii_case("x-omp-azure-deployment")).cloned();
+        let deployment_key = headers
+            .keys()
+            .find(|name| name.eq_ignore_ascii_case("x-omp-azure-deployment"))
+            .cloned();
         let deployment = deployment_key.and_then(|name| headers.remove(&name));
         let mut body = build_request(model, ctx, opts);
-        if let Some(deployment) = deployment { body["model"] = json!(deployment); }
+        if let Some(deployment) = deployment {
+            body["model"] = json!(deployment);
+        }
         let preparation = Ok(PreparedRequest {
             headers,
             body,
@@ -163,10 +168,13 @@ where
     }
     let key = resolve_api_key(provider_key, opts, allow_env_api_key);
     apply_api_key(&mut headers, key);
-    if require_auth && !headers.keys().any(|name| {
-        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
-            || name.eq_ignore_ascii_case("cf-aig-authorization")
-    }) {
+    if require_auth
+        && !headers.keys().any(|name| {
+            name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-api-key")
+                || name.eq_ignore_ascii_case("cf-aig-authorization")
+        })
+    {
         return Err("No API key".to_string());
     }
 
@@ -202,7 +210,15 @@ impl Provider for OpenAiResponsesProvider {
         // Prepare headers while the caller's Context is borrowed. The helper
         // returns an error result for the producer task, so auth failure still
         // follows the original terminal Error event path without a dummy body.
-        let preparation = prepare_request(model, ctx, opts, &key, allow_env_api_key, self.require_auth, build_request);
+        let preparation = prepare_request(
+            model,
+            ctx,
+            opts,
+            &key,
+            allow_env_api_key,
+            self.require_auth,
+            build_request,
+        );
         let model = model.clone();
         let mut opts = opts.clone();
         opts.signal = producer.cancellation_token();
@@ -2022,12 +2038,24 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
 /// ChatGPT's Codex endpoint speaks Responses SSE, but rejects the public
 /// API's sampling/output limits and requires stateless encrypted reasoning.
 fn shape_codex_request(body: &mut Value) {
-    let Some(object) = body.as_object_mut() else { return };
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
     for name in [
-        "max_output_tokens", "max_completion_tokens", "temperature", "top_p",
-        "top_k", "min_p", "presence_penalty", "repetition_penalty",
-        "frequency_penalty", "stop", "prompt_cache_retention",
-    ] { object.remove(name); }
+        "max_output_tokens",
+        "max_completion_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+        "frequency_penalty",
+        "stop",
+        "prompt_cache_retention",
+    ] {
+        object.remove(name);
+    }
     object.entry("instructions").or_insert_with(|| json!(""));
     object.insert("store".into(), json!(false));
     object.insert("stream".into(), json!(true));
@@ -2039,7 +2067,9 @@ fn shape_codex_request(body: &mut Value) {
         input.retain(|item| item["type"] != "item_reference");
         for item in input {
             if item["type"] != "computer_call" {
-                if let Some(item) = item.as_object_mut() { item.remove("id"); }
+                if let Some(item) = item.as_object_mut() {
+                    item.remove("id");
+                }
             }
         }
     }
@@ -3952,7 +3982,10 @@ mod tests {
         };
         assert!(build_request(&model, &ctx, &opts)["reasoning"]["summary"].is_null());
         model.base_url = "https://api.openai.com/v1".into();
-        assert_eq!(build_request(&model, &ctx, &opts)["reasoning"]["summary"], "auto");
+        assert_eq!(
+            build_request(&model, &ctx, &opts)["reasoning"]["summary"],
+            "auto"
+        );
     }
 
     #[tokio::test]
@@ -4327,15 +4360,26 @@ mod native_compat_tests {
 
     #[test]
     fn supergrok_output_budget_and_reasoning_follow_native_limits() {
-        let mut model = Model::new("grok-build-0.1", "Grok Build", Api::OpenaiResponses, "xai-oauth", "https://api.x.ai/v1");
+        let mut model = Model::new(
+            "grok-build-0.1",
+            "Grok Build",
+            Api::OpenaiResponses,
+            "xai-oauth",
+            "https://api.x.ai/v1",
+        );
         model.reasoning = true;
         model.max_tokens = 1_000_000;
-        model.compat = Some(StreamingProtocolCompat::OpenaiResponses(crate::model::OpenaiResponsesCompat {
-            supports_reasoning_effort: Some(false),
-            include_encrypted_reasoning: Some(true),
+        model.compat = Some(StreamingProtocolCompat::OpenaiResponses(
+            crate::model::OpenaiResponsesCompat {
+                supports_reasoning_effort: Some(false),
+                include_encrypted_reasoning: Some(true),
+                ..Default::default()
+            },
+        ));
+        let options = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::High),
             ..Default::default()
-        }));
-        let options = SimpleStreamOptions { reasoning: Some(ThinkingLevel::High), ..Default::default() };
+        };
         let request = build_request(&model, &Context::default(), &options);
         assert_eq!(request["max_output_tokens"], 64_000);
         assert!(request.get("reasoning").is_none());

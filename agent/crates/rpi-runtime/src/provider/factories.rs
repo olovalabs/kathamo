@@ -32,7 +32,8 @@ impl ProviderFactory for ProtocolFactory {
         };
         let http = provider_http_client(&models, fallback, settings, values)?;
         let requires_auth = crate::catalog::builtin_provider(provider_id)
-            .map(|provider| provider.requires_auth).unwrap_or(true);
+            .map(|provider| provider.requires_auth)
+            .unwrap_or(true);
         let provider: Arc<dyn Provider> = match &self.0 {
             rpi_ai::Api::AnthropicMessages => {
                 if !requires_auth {
@@ -111,10 +112,20 @@ impl ProviderFactory for ProtocolFactory {
             }
             _ => unreachable!("only supported wire protocols are registered"),
         };
-        if matches!(provider_id, "github-copilot" | "gitlab-duo" | "cloudflare-ai-gateway" | "alibaba-coding-plan" | "alibaba-token-plan" | "coreweave" | "snowflake")
-            || self.0 == rpi_ai::Api::OpenaiCodexResponses
+        if matches!(
+            provider_id,
+            "github-copilot"
+                | "gitlab-duo"
+                | "cloudflare-ai-gateway"
+                | "alibaba-coding-plan"
+                | "alibaba-token-plan"
+                | "coreweave"
+                | "snowflake"
+        ) || self.0 == rpi_ai::Api::OpenaiCodexResponses
         {
-            Ok(Arc::new(rpi_ai::providers::routed::RoutedProvider::new(provider, http)))
+            Ok(Arc::new(rpi_ai::providers::routed::RoutedProvider::new(
+                provider, http,
+            )))
         } else {
             Ok(provider)
         }
@@ -408,11 +419,27 @@ impl Provider for ConfiguredProvider {
         };
         let explicit_auth = options.api_key.is_some()
             || [model.headers.as_ref(), options.headers.as_ref()]
-                .into_iter().flatten().any(|headers| headers.keys().any(|name| {
-                    ["authorization", "x-api-key", "api-key", "x-omp-aws-access-key-id"]
-                        .iter().any(|auth| name.eq_ignore_ascii_case(auth))
-                }));
-        if !explicit_auth && (self.id == "google-vertex" || matches!(model.api, rpi_ai::Api::GoogleVertex | rpi_ai::Api::BedrockConverseStream)) {
+                .into_iter()
+                .flatten()
+                .any(|headers| {
+                    headers.keys().any(|name| {
+                        [
+                            "authorization",
+                            "x-api-key",
+                            "api-key",
+                            "x-omp-aws-access-key-id",
+                        ]
+                        .iter()
+                        .any(|auth| name.eq_ignore_ascii_case(auth))
+                    })
+                });
+        if !explicit_auth
+            && (self.id == "google-vertex"
+                || matches!(
+                    model.api,
+                    rpi_ai::Api::GoogleVertex | rpi_ai::Api::BedrockConverseStream
+                ))
+        {
             match crate::cloud_auth::request_headers(&self.id).await {
                 Ok(mut headers) => {
                     if let Some(overrides) = options.headers.take() {

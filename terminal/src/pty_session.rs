@@ -536,7 +536,8 @@ impl Resources {
                 root_killed = group == pid && killed;
             }
         }
-        if !root_killed && self.child.is_some()
+        if !root_killed
+            && self.child.is_some()
             && pid > 1
             && pid != own_group
             && unsafe { libc::getpgid(pid) } == pid

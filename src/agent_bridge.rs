@@ -70,21 +70,42 @@ pub enum AgentEvent {
 impl QueuedEvent for AgentEvent {
     fn queued_bytes(&self) -> usize {
         match self {
-            Self::Text(text) | Self::Thinking(text) | Self::Status(text) | Self::Tool(text) |
-            Self::Error(text) | Self::Title(text) => text.len(),
-            Self::ToolStart { id, name, input } => id.as_ref().map_or(0, String::len) + name.len() + input.len(),
-            Self::ToolUpdate { id, name, output } | Self::ToolEnd { id, name, output, .. } =>
-                id.as_ref().map_or(0, String::len) + name.len() + output.len(),
+            Self::Text(text)
+            | Self::Thinking(text)
+            | Self::Status(text)
+            | Self::Tool(text)
+            | Self::Error(text)
+            | Self::Title(text) => text.len(),
+            Self::ToolStart { id, name, input } => {
+                id.as_ref().map_or(0, String::len) + name.len() + input.len()
+            }
+            Self::ToolUpdate { id, name, output }
+            | Self::ToolEnd {
+                id, name, output, ..
+            } => id.as_ref().map_or(0, String::len) + name.len() + output.len(),
             Self::Usage(_) => std::mem::size_of::<rpi_embedded::AgentUsage>(),
-            Self::Subagents { tool_id, workers } => tool_id.len() + workers.iter().map(|worker| {
-                worker.id.len() + worker.title.len() + worker.status.len() +
-                worker.result.as_ref().map_or(0, String::len) +
-                worker.transcript.as_ref().map_or(0, |path| path.as_os_str().len())
-            }).sum::<usize>(),
+            Self::Subagents { tool_id, workers } => {
+                tool_id.len()
+                    + workers
+                        .iter()
+                        .map(|worker| {
+                            worker.id.len()
+                                + worker.title.len()
+                                + worker.status.len()
+                                + worker.result.as_ref().map_or(0, String::len)
+                                + worker
+                                    .transcript
+                                    .as_ref()
+                                    .map_or(0, |path| path.as_os_str().len())
+                        })
+                        .sum::<usize>()
+            }
             Self::Done | Self::Closed => 0,
         }
     }
-    fn is_snapshot(&self) -> bool { matches!(self, Self::ToolUpdate { .. }) }
+    fn is_snapshot(&self) -> bool {
+        matches!(self, Self::ToolUpdate { .. })
+    }
     fn supersedes(&self, previous: &Self) -> bool {
         matches!((self, previous),
             (Self::ToolUpdate { id: Some(id), name, .. },
@@ -258,11 +279,14 @@ impl EmbeddedBridge {
                 crate::stream_timing::turn_provider_request(request_trace);
             }))
             .with_delta_arrival_hook(Arc::new(move |reasoning| {
-                crate::stream_timing::turn_delta_arrived(delta_trace, if reasoning {
-                    crate::stream_timing::DeltaKind::Reasoning
-                } else {
-                    crate::stream_timing::DeltaKind::Answer
-                });
+                crate::stream_timing::turn_delta_arrived(
+                    delta_trace,
+                    if reasoning {
+                        crate::stream_timing::DeltaKind::Reasoning
+                    } else {
+                        crate::stream_timing::DeltaKind::Answer
+                    },
+                );
             }))
             .with_phase_hook(Arc::new(
                 move |label: &'static str, elapsed: std::time::Duration| {
@@ -417,7 +441,10 @@ pub(crate) fn coalesce_events(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
         if event.is_snapshot() {
             // Only identified calls may supersede snapshots. A structural
             // boundary ends the replacement window, including for reused IDs.
-            if let Some(index) = out.iter().enumerate().rev()
+            if let Some(index) = out
+                .iter()
+                .enumerate()
+                .rev()
                 .take_while(|(_, old)| old.is_snapshot())
                 .find_map(|(index, old)| event.supersedes(old).then_some(index))
             {
@@ -426,9 +453,15 @@ pub(crate) fn coalesce_events(events: Vec<AgentEvent>) -> Vec<AgentEvent> {
         }
         match (out.last_mut(), event) {
             (Some(AgentEvent::Text(previous)), AgentEvent::Text(next))
-                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT => previous.push_str(&next),
+                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT =>
+            {
+                previous.push_str(&next)
+            }
             (Some(AgentEvent::Thinking(previous)), AgentEvent::Thinking(next))
-                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT => previous.push_str(&next),
+                if previous.len() + next.len() <= COALESCE_TEXT_LIMIT =>
+            {
+                previous.push_str(&next)
+            }
             (_, event) => out.push(event),
         }
     }
@@ -542,7 +575,8 @@ fn decode_event(record: &Value) -> Vec<AgentEvent> {
             let message = &record["message"];
             if message["role"] == "assistant" && message["usage"].is_object() {
                 let usage = &message["usage"];
-                let cost = usage["cost"]["total"].as_f64()
+                let cost = usage["cost"]["total"]
+                    .as_f64()
                     .filter(|cost| cost.is_finite() && *cost > 0.0);
                 events.push(AgentEvent::Usage(rpi_embedded::AgentUsage {
                     input: usage["input"].as_i64().unwrap_or_default(),
@@ -711,20 +745,33 @@ mod tests {
     #[test]
     fn unidentified_snapshots_and_structural_boundaries_are_lossless() {
         let update = |id: Option<&str>, output: &str| AgentEvent::ToolUpdate {
-            id: id.map(str::to_owned), name: "bash".into(), output: output.into(),
+            id: id.map(str::to_owned),
+            name: "bash".into(),
+            output: output.into(),
         };
         let out = coalesce_events(vec![
-            update(None, "first"), update(None, "second"),
-            update(Some("a"), "old"), update(Some("b"), "peer"),
-            update(Some("a"), "latest"), AgentEvent::Error("boundary".into()),
+            update(None, "first"),
+            update(None, "second"),
+            update(Some("a"), "old"),
+            update(Some("b"), "peer"),
+            update(Some("a"), "latest"),
+            AgentEvent::Error("boundary".into()),
             update(Some("a"), "after"),
-            AgentEvent::ToolEnd { id: Some("a".into()), name: "bash".into(),
-                output: "final".into(), failed: false },
+            AgentEvent::ToolEnd {
+                id: Some("a".into()),
+                name: "bash".into(),
+                output: "final".into(),
+                failed: false,
+            },
             AgentEvent::Done,
         ]);
-        let snapshots: Vec<_> = out.iter().filter_map(|event| match event {
-            AgentEvent::ToolUpdate { output, .. } => Some(output.as_str()), _ => None,
-        }).collect();
+        let snapshots: Vec<_> = out
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolUpdate { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(snapshots, ["first", "second", "peer", "latest", "after"]);
         assert!(matches!(&out[4], AgentEvent::Error(text) if text == "boundary"));
         assert!(matches!(&out[6], AgentEvent::ToolEnd { output, .. } if output == "final"));

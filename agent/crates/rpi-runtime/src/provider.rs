@@ -515,7 +515,8 @@ pub(crate) fn resolve_with_factories(
     let selected_provider = model.provider.clone();
     if !crate::catalog::is_chat_model(&model) {
         let kind = crate::catalog::model_metadata(&model.provider, &model.id)
-            .map(|metadata| metadata.kind.as_str()).unwrap_or("non-chat");
+            .map(|metadata| metadata.kind.as_str())
+            .unwrap_or("non-chat");
         return Err(ResolveError::UnsupportedApi {
             provider: selected_provider.clone(),
             api: format!("{kind} task via {}", selected_api.as_str()),
@@ -666,9 +667,7 @@ pub(crate) fn resolve_with_factories(
     model = execution
         .descriptors()
         .iter()
-        .find(|candidate| {
-            candidate.api == model.api && candidate.id == model.id
-        })
+        .find(|candidate| candidate.api == model.api && candidate.id == model.id)
         .expect("selected model is bound")
         .clone();
     let ids: std::collections::BTreeSet<_> = full_catalog
@@ -756,10 +755,15 @@ fn build_runtime(
     factories: &RuntimeFactories,
 ) -> Result<BoundRuntime, ResolveError> {
     let (anthropic_credential, openai_key) = credentials;
-    let anonymous = factories.manifests.iter().find(|manifest| manifest.id == provider_id)
+    let anonymous = factories
+        .manifests
+        .iter()
+        .find(|manifest| manifest.id == provider_id)
         .map(|manifest| !manifest.requires_auth)
-        .unwrap_or_else(|| crate::catalog::builtin_provider(provider_id)
-            .is_some_and(|provider| !provider.requires_auth))
+        .unwrap_or_else(|| {
+            crate::catalog::builtin_provider(provider_id)
+                .is_some_and(|provider| !provider.requires_auth)
+        })
         || crate::cloud_auth::configured(provider_id, values).is_some();
     let provider_has_auth = anthropic_credential.is_some() || openai_key.is_some() || anonymous;
     let models = catalog
@@ -892,7 +896,8 @@ pub(crate) fn builtin_catalog() -> Vec<Model> {
         config::provider_to_models("google", &google, &BTreeMap::new())
             .expect("Gemini uses the OpenAI completions protocol"),
     );
-    let mut known: std::collections::BTreeSet<_> = catalog.iter()
+    let mut known: std::collections::BTreeSet<_> = catalog
+        .iter()
         .map(|model| (model.provider.clone(), model.id.clone()))
         .collect();
     for provider in crate::catalog::builtin_providers() {
@@ -940,24 +945,40 @@ fn build_catalog(
     let mut catalog = builtin_catalog();
     for model in &mut catalog {
         if let Some(provider) = crate::catalog::builtin_provider(&model.provider) {
-            if cfg.providers.get(&model.provider).is_some_and(|config| config.base_url.is_some())
-                || provider.base_url_env.as_ref().and_then(|name| values.env(name)).is_some()
+            if cfg
+                .providers
+                .get(&model.provider)
+                .is_some_and(|config| config.base_url.is_some())
+                || provider
+                    .base_url_env
+                    .as_ref()
+                    .and_then(|name| values.env(name))
+                    .is_some()
             {
                 model.base_url = crate::catalog::configured_base_url(provider, cfg, values);
             }
         }
-        if let Some(headers) = cfg.providers.get(&model.provider).and_then(|config| config.headers.as_ref()) {
-            merge_auth_headers(model, &crate::values::resolve_headers(headers, None, values));
+        if let Some(headers) = cfg
+            .providers
+            .get(&model.provider)
+            .and_then(|config| config.headers.as_ref())
+        {
+            merge_auth_headers(
+                model,
+                &crate::values::resolve_headers(headers, None, values),
+            );
         }
     }
     for manifest in manifests {
         // Host declarations own the wire routes for their model identities.
         // Replace bundled routes before adding the declaration's API variants.
-        let declared: std::collections::HashSet<_> =
-            manifest.models.iter().map(|model| model.id.as_str()).collect();
-        catalog.retain(|model| {
-            model.provider != manifest.id || !declared.contains(model.id.as_str())
-        });
+        let declared: std::collections::HashSet<_> = manifest
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        catalog
+            .retain(|model| model.provider != manifest.id || !declared.contains(model.id.as_str()));
         let config = cfg.providers.get(&manifest.id);
         for mut model in manifest.models.clone() {
             if let Some(base) = config.and_then(|config| config.base_url.as_ref()) {
@@ -974,7 +995,9 @@ fn build_catalog(
     }
     merge_user_catalog(&mut catalog, cfg, values);
     let endpoint_defaults = crate::catalog::EndpointDefaults::new(values);
-    for model in &mut catalog { endpoint_defaults.apply(model, cfg); }
+    for model in &mut catalog {
+        endpoint_defaults.apply(model, cfg);
+    }
     catalog
 }
 
@@ -1043,17 +1066,30 @@ fn resolve_anthropic_credentials_with(
     for (provider_id, provider_cfg) in &cfg.providers {
         if (config::provider_is_anthropic_compatible(provider_cfg)
             || crate::catalog::builtin_provider(provider_id).is_some_and(|provider| {
-                provider.models.iter().any(|model| model.api == rpi_ai::Api::AnthropicMessages)
+                provider
+                    .models
+                    .iter()
+                    .any(|model| model.api == rpi_ai::Api::AnthropicMessages)
             })
-            || manifests.iter().filter(|manifest| manifest.id == *provider_id)
-                .any(|manifest| manifest.models.iter().any(|model| model.api == rpi_ai::Api::AnthropicMessages)))
+            || manifests
+                .iter()
+                .filter(|manifest| manifest.id == *provider_id)
+                .any(|manifest| {
+                    manifest
+                        .models
+                        .iter()
+                        .any(|model| model.api == rpi_ai::Api::AnthropicMessages)
+                }))
             && !provider_ids.iter().any(|known| known == provider_id)
         {
             provider_ids.push(provider_id.clone());
         }
     }
     for manifest in manifests {
-        if manifest.models.iter().any(|model| model.api == rpi_ai::Api::AnthropicMessages)
+        if manifest
+            .models
+            .iter()
+            .any(|model| model.api == rpi_ai::Api::AnthropicMessages)
             && !provider_ids.contains(&manifest.id)
         {
             provider_ids.push(manifest.id.clone());
@@ -1142,10 +1178,21 @@ fn resolve_openai_credentials_with(
         );
         // Anthropic keys are represented by their own map, preserving bearer vs
         // x-api-key semantics. Anonymous declarations apply to every protocol.
-        let has_non_anthropic_models = crate::catalog::builtin_provider(&provider_id)
-            .is_some_and(|provider| provider.models.iter().any(|model| model.api != rpi_ai::Api::AnthropicMessages))
-            || manifest.is_some_and(|manifest| manifest.models.iter().any(|model| model.api != rpi_ai::Api::AnthropicMessages));
-        if provider_cfg.is_some_and(config::provider_is_anthropic_compatible) && !has_non_anthropic_models {
+        let has_non_anthropic_models =
+            crate::catalog::builtin_provider(&provider_id).is_some_and(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .any(|model| model.api != rpi_ai::Api::AnthropicMessages)
+            }) || manifest.is_some_and(|manifest| {
+                manifest
+                    .models
+                    .iter()
+                    .any(|model| model.api != rpi_ai::Api::AnthropicMessages)
+            });
+        if provider_cfg.is_some_and(config::provider_is_anthropic_compatible)
+            && !has_non_anthropic_models
+        {
             if matches!(
                 resolved.source,
                 crate::credentials::CredentialSource::Anonymous
@@ -1157,7 +1204,8 @@ fn resolve_openai_credentials_with(
         } else if matches!(
             resolved.source,
             crate::credentials::CredentialSource::Anonymous
-        ) || crate::cloud_auth::configured(&provider_id, values).is_some() {
+        ) || crate::cloud_auth::configured(&provider_id, values).is_some()
+        {
             credentials.insert(provider_id, OpenAiCredential::Anonymous);
         }
     }
@@ -1270,11 +1318,18 @@ fn find_model(
     catalog: &[Model],
     cfg: &config::ModelsConfig,
 ) -> Option<Model> {
-    let belongs = |model: &&Model| {
-        provider.is_none_or(|requested| provider_matches(model, requested, cfg))
-    };
-    catalog.iter().filter(belongs).find(|model| model.id == pattern)
-        .or_else(|| catalog.iter().filter(belongs).find(|model| model.id.eq_ignore_ascii_case(pattern)))
+    let belongs =
+        |model: &&Model| provider.is_none_or(|requested| provider_matches(model, requested, cfg));
+    catalog
+        .iter()
+        .filter(belongs)
+        .find(|model| model.id == pattern)
+        .or_else(|| {
+            catalog
+                .iter()
+                .filter(belongs)
+                .find(|model| model.id.eq_ignore_ascii_case(pattern))
+        })
         .cloned()
 }
 
@@ -1512,7 +1567,10 @@ fn pick_default_model(
                 model.provider == *provider
                     && model.id.eq_ignore_ascii_case(&declared.id)
                     && model_is_authed_for_resolution(
-                        model, anthropic_credentials, openai_credentials, has_cli_key,
+                        model,
+                        anthropic_credentials,
+                        openai_credentials,
+                        has_cli_key,
                     )
             }) {
                 return model.clone();

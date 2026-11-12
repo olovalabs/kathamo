@@ -85,10 +85,7 @@ impl StreamDecoder {
 
     /// Like `push`, but first-needed console discovery runs off the runtime.
     /// ASCII and valid UTF-8 never wait for or start a console probe.
-    pub async fn push_async(
-        &mut self,
-        mut bytes: &[u8],
-    ) -> Result<String, tokio::task::JoinError> {
+    pub async fn push_async(&mut self, mut bytes: &[u8]) -> Result<String, tokio::task::JoinError> {
         let mut out = String::new();
         while let Some((consumed, last)) = self.push_into(bytes, &mut out) {
             self.fallback = Some(console_encoding_async().await?);
@@ -231,7 +228,8 @@ async fn console_encoding_async() -> Result<&'static Encoding, tokio::task::Join
         if let Some(encoding) = CONSOLE_ENCODING.get() {
             return Ok(*encoding);
         }
-        static ENCODING: tokio::sync::OnceCell<&'static Encoding> = tokio::sync::OnceCell::const_new();
+        static ENCODING: tokio::sync::OnceCell<&'static Encoding> =
+            tokio::sync::OnceCell::const_new();
         return ENCODING
             .get_or_try_init(|| async { tokio::task::spawn_blocking(console_encoding).await })
             .await
@@ -323,7 +321,9 @@ mod tests {
             output.push_str(&decoder.push_async("中文\n".as_bytes()).await.unwrap());
             output.push_str(&decoder.finish_async().await.unwrap());
             output
-        }.now_or_never().expect("ASCII and valid UTF-8 must decode immediately");
+        }
+        .now_or_never()
+        .expect("ASCII and valid UTF-8 must decode immediately");
         assert_eq!(output, "ascii 中文\n");
     }
 

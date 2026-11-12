@@ -204,7 +204,10 @@ impl OsExecutionEnv {
         // POSIX.
         #[cfg(not(windows))]
         {
-            if tokio::fs::metadata("/bin/bash").await.is_ok_and(|m| m.is_file()) {
+            if tokio::fs::metadata("/bin/bash")
+                .await
+                .is_ok_and(|m| m.is_file())
+            {
                 return Ok(ShellConfig {
                     shell: PathBuf::from("/bin/bash"),
                     args: vec!["-c".to_string()],
@@ -216,7 +219,11 @@ impl OsExecutionEnv {
                 run_command("which", &["bash"], std::time::Duration::from_millis(5000)).await
             {
                 let trimmed = found.trim();
-                if !trimmed.is_empty() && tokio::fs::metadata(trimmed).await.is_ok_and(|m| m.is_file()) {
+                if !trimmed.is_empty()
+                    && tokio::fs::metadata(trimmed)
+                        .await
+                        .is_ok_and(|m| m.is_file())
+                {
                     return Ok(ShellConfig {
                         shell: PathBuf::from(trimmed),
                         args: vec!["-c".to_string()],
@@ -365,7 +372,9 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
         return None;
     }
     // `where` prints paths in the console code page (e.g. a Chinese user name).
-    let s = crate::output_decode::decode_output_async(&out.stdout).await.ok()?;
+    let s = crate::output_decode::decode_output_async(&out.stdout)
+        .await
+        .ok()?;
     if s.trim().is_empty() {
         None
     } else {
@@ -896,11 +905,20 @@ impl FileSystem for OsExecutionEnv {
     }
 
     async fn cleanup(&self) {
-        let pids: Vec<u32> = self.active_pids.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+        let pids: Vec<u32> = self
+            .active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
         for pid in pids {
             kill_process_tree(pid).await;
         }
-        self.active_pids.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.active_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -993,7 +1011,10 @@ impl Shell for OsExecutionEnv {
         if options.inherit_env {
             // Command already inherits the environment. Remove only private
             // host keys instead of copying every inherited key/value twice.
-            for key in HOST_PRIVATE_ENV.iter().chain(rpi_plugin_sdk::SUBAGENT_PARENT_ENV.iter()) {
+            for key in HOST_PRIVATE_ENV
+                .iter()
+                .chain(rpi_plugin_sdk::SUBAGENT_PARENT_ENV.iter())
+            {
                 cmd.env_remove(*key);
             }
         } else {
@@ -1065,7 +1086,10 @@ impl Shell for OsExecutionEnv {
             }
         }
         if let Some(pid) = pid {
-            self.active_pids.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
+            self.active_pids
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid);
         }
 
         // Drive legacy stdin concurrently with output, status and deadlines.
@@ -1318,10 +1342,18 @@ impl Shell for OsExecutionEnv {
             let drain = async {
                 tokio::join!(
                     async {
-                        if stdout_done { Ok(()) } else { (&mut stdout_task).await }
+                        if stdout_done {
+                            Ok(())
+                        } else {
+                            (&mut stdout_task).await
+                        }
                     },
                     async {
-                        if stderr_done { Ok(()) } else { (&mut stderr_task).await }
+                        if stderr_done {
+                            Ok(())
+                        } else {
+                            (&mut stderr_task).await
+                        }
                     },
                 )
             };
@@ -1329,7 +1361,9 @@ impl Shell for OsExecutionEnv {
             let results = match tokio::time::timeout(
                 std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS),
                 &mut drain,
-            ).await {
+            )
+            .await
+            {
                 Ok(results) => results,
                 Err(_) => {
                     // Stop idle reads, but finish already-read decoder tails.
@@ -1347,8 +1381,10 @@ impl Shell for OsExecutionEnv {
 
         // A cancellation can race successful reaping (including during drain).
         // In that case the guard must still terminate surviving descendants.
-        group_guard.armed = !tree_killed && (exit_status.is_err() || output_error.is_some()
-            || cancel.map(|token| token.is_cancelled()).unwrap_or(false));
+        group_guard.armed = !tree_killed
+            && (exit_status.is_err()
+                || output_error.is_some()
+                || cancel.map(|token| token.is_cancelled()).unwrap_or(false));
         if let Some(error) = output_error {
             return Err(ExecutionError::new(
                 ExecutionErrorCode::Unknown,

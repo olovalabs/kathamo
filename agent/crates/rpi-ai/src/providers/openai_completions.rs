@@ -752,7 +752,8 @@ fn reasoning_effort(model: &Model, level: ThinkingLevel) -> Option<String> {
 
 fn has_auth_header(headers: &BTreeMap<String, String>) -> bool {
     headers.keys().any(|name| {
-        name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("x-api-key")
+        name.eq_ignore_ascii_case("authorization")
+            || name.eq_ignore_ascii_case("x-api-key")
             || name.eq_ignore_ascii_case("cf-aig-authorization")
     })
 }

@@ -216,7 +216,9 @@ async fn dropped_execution_stops_background_work() {
     let mut execution = Box::pin(env.exec(
         "(sleep 0.3; printf leaked > escaped) & printf ready; wait",
         ShellExecOptions {
-            on_stdout: Some(Box::new(move |_| { let _ = ready.send(()); })),
+            on_stdout: Some(Box::new(move |_| {
+                let _ = ready.send(());
+            })),
             ..Default::default()
         },
     ));
@@ -227,7 +229,10 @@ async fn dropped_execution_stops_background_work() {
     }
     drop(execution);
     tokio::time::sleep(Duration::from_millis(450)).await;
-    assert!(!dir.path().join("escaped").exists(), "dropped execution left its descendant alive");
+    assert!(
+        !dir.path().join("escaped").exists(),
+        "dropped execution left its descendant alive"
+    );
 }
 
 #[cfg(unix)]
@@ -247,7 +252,9 @@ async fn timeout_and_cancellation_interrupt_full_output_backpressure() {
                 cancel: Some(&token),
                 output: Some(output),
                 capture_output: false,
-                on_stdout: Some(Box::new(move |_| { let _ = ready.send(()); })),
+                on_stdout: Some(Box::new(move |_| {
+                    let _ = ready.send(());
+                })),
                 ..Default::default()
             },
         );
@@ -260,15 +267,22 @@ async fn timeout_and_cancellation_interrupt_full_output_backpressure() {
             token.cancel();
         }
         let error = tokio::time::timeout(Duration::from_secs(2), execution)
-            .await.expect("backpressure prevented process termination")
+            .await
+            .expect("backpressure prevented process termination")
             .expect_err("execution must stop");
-        assert_eq!(error.code, if cancel_execution {
-            ExecutionErrorCode::Aborted
-        } else {
-            ExecutionErrorCode::Timeout
-        });
+        assert_eq!(
+            error.code,
+            if cancel_execution {
+                ExecutionErrorCode::Aborted
+            } else {
+                ExecutionErrorCode::Timeout
+            }
+        );
         tokio::time::sleep(Duration::from_millis(450)).await;
-        assert!(!dir.path().join("escaped").exists(), "termination left a background descendant alive");
+        assert!(
+            !dir.path().join("escaped").exists(),
+            "termination left a background descendant alive"
+        );
     }
 }
 
@@ -300,7 +314,9 @@ async fn slow_output_consumer_preserves_buffered_bytes_after_child_exit() {
     };
     let (result, bytes) = tokio::time::timeout(Duration::from_secs(6), async {
         tokio::join!(execution, consumer)
-    }).await.expect("output backpressure stalled completion");
+    })
+    .await
+    .expect("output backpressure stalled completion");
     let result = result.expect("shell execution");
     assert_eq!(bytes, 100_000);
     assert!(result.stdout.is_empty() && result.stderr.is_empty());
@@ -317,7 +333,9 @@ async fn cancellation_after_shell_exit_still_stops_descendants() {
         "(sleep 0.3; printf leaked > escaped) & printf ready",
         ShellExecOptions {
             cancel: Some(&token),
-            on_stdout: Some(Box::new(move |_| { let _ = ready.send(()); })),
+            on_stdout: Some(Box::new(move |_| {
+                let _ = ready.send(());
+            })),
             ..Default::default()
         },
     );
@@ -330,7 +348,10 @@ async fn cancellation_after_shell_exit_still_stops_descendants() {
     let error = execution.await.expect_err("cancellation must be reported");
     assert_eq!(error.code, ExecutionErrorCode::Aborted);
     tokio::time::sleep(Duration::from_millis(450)).await;
-    assert!(!dir.path().join("escaped").exists(), "reaped shell left its descendant alive");
+    assert!(
+        !dir.path().join("escaped").exists(),
+        "reaped shell left its descendant alive"
+    );
 }
 
 #[cfg(unix)]
@@ -349,7 +370,8 @@ async fn continuously_writing_descendant_does_not_hold_completion_open() {
                 ..Default::default()
             },
         ),
-    ).await;
+    )
+    .await;
     // Successful execution deliberately does not kill background descendants.
     if let Ok(pid) = pid_text.trim().parse::<i32>() {
         let _ = nix::sys::signal::kill(
@@ -357,7 +379,8 @@ async fn continuously_writing_descendant_does_not_hold_completion_open() {
             nix::sys::signal::Signal::SIGKILL,
         );
     }
-    let output = result.expect("continuously ready descendant output prevented completion")
+    let output = result
+        .expect("continuously ready descendant output prevented completion")
         .expect("shell execution");
     assert_eq!(output.exit_code, 0);
     assert!(output.stdout.is_empty());

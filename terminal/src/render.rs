@@ -1596,26 +1596,32 @@ mod tests {
     #[test]
     fn row_match_ranges_preserve_multiline_and_scrollback_boundaries() {
         let matches = vec![
-            GridPoint::new(GridLine(-10), GridColumn(2))..=GridPoint::new(GridLine(-8), GridColumn(4)),
-            GridPoint::new(GridLine(-8), GridColumn(8))..=GridPoint::new(GridLine(0), GridColumn(1)),
+            GridPoint::new(GridLine(-10), GridColumn(2))
+                ..=GridPoint::new(GridLine(-8), GridColumn(4)),
+            GridPoint::new(GridLine(-8), GridColumn(8))
+                ..=GridPoint::new(GridLine(0), GridColumn(1)),
             GridPoint::new(GridLine(0), GridColumn(3))..=GridPoint::new(GridLine(0), GridColumn(6)),
             GridPoint::new(GridLine(3), GridColumn(0))..=GridPoint::new(GridLine(4), GridColumn(2)),
         ];
         for line in -12..7 {
-            let expected: Vec<_> = matches.iter().filter(|m| {
-                m.start().line.0 <= line && line <= m.end().line.0
-            }).collect();
+            let expected: Vec<_> = matches
+                .iter()
+                .filter(|m| m.start().line.0 <= line && line <= m.end().line.0)
+                .collect();
             let range = row_match_range(&matches, line);
-            assert_eq!(matches[range].iter().collect::<Vec<_>>(), expected, "line {line}");
+            assert_eq!(
+                matches[range].iter().collect::<Vec<_>>(),
+                expected,
+                "line {line}"
+            );
         }
         assert_eq!(row_match_range(&[], 0), 0..0);
     }
 
     #[test]
     fn snapshot_runs_preserve_combining_wide_and_styled_cells() {
-        let renderer = TerminalRenderer::new(
-            "monospace".into(), px(14.0), 1.2, ColorPalette::default(),
-        );
+        let renderer =
+            TerminalRenderer::new("monospace".into(), px(14.0), 1.2, ColorPalette::default());
         let colors = Colors::default();
         let mut accent = Cell::default();
         accent.c = 'e';
@@ -1644,20 +1650,23 @@ mod tests {
     fn streaming_search_paint_index_benchmark() {
         use std::hint::black_box;
         use std::time::Instant;
-        let matches: Vec<Match> = (0..5_000).map(|index| {
-            let line = GridLine(index / 4 - 1_200);
-            let col = GridColumn((index as usize % 4) * 10);
-            GridPoint::new(line, col)..=GridPoint::new(line, GridColumn(col.0 + 5))
-        }).collect();
+        let matches: Vec<Match> = (0..5_000)
+            .map(|index| {
+                let line = GridLine(index / 4 - 1_200);
+                let col = GridColumn((index as usize % 4) * 10);
+                GridPoint::new(line, col)..=GridPoint::new(line, GridColumn(col.0 + 5))
+            })
+            .collect();
         let mut baseline = Vec::with_capacity(101);
         let mut candidate = Vec::with_capacity(101);
         for _ in 0..101 {
             let start = Instant::now();
             let mut old_count = 0;
             for line in 0..48 {
-                old_count += black_box(&matches).iter().filter(|m| {
-                    m.start().line.0 <= line && line <= m.end().line.0
-                }).count();
+                old_count += black_box(&matches)
+                    .iter()
+                    .filter(|m| m.start().line.0 <= line && line <= m.end().line.0)
+                    .count();
             }
             baseline.push(start.elapsed().as_nanos());
             let start = Instant::now();
@@ -1670,8 +1679,14 @@ mod tests {
         }
         baseline.sort_unstable();
         candidate.sort_unstable();
-        eprintln!("search index 48 rows/5000 matches: baseline p50={}ns p95={}ns; candidate p50={}ns p95={}ns; baseline visited={} matches/frame",
-            baseline[50], baseline[95], candidate[50], candidate[95], 48 * matches.len());
+        eprintln!(
+            "search index 48 rows/5000 matches: baseline p50={}ns p95={}ns; candidate p50={}ns p95={}ns; baseline visited={} matches/frame",
+            baseline[50],
+            baseline[95],
+            candidate[50],
+            candidate[95],
+            48 * matches.len()
+        );
     }
 
     #[test]

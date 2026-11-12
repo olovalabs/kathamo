@@ -115,7 +115,9 @@ impl AgentTool for PowerShellTool {
                             &progress_update,
                             progress.output,
                             progress.truncation.truncated.then_some(progress.truncation),
-                            progress.full_output_path.map(|path| path.to_string_lossy().into_owned()),
+                            progress
+                                .full_output_path
+                                .map(|path| path.to_string_lossy().into_owned()),
                         );
                     }
                 })),

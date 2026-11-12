@@ -66,12 +66,10 @@ fn main() {
             events,
         } = pending;
         smol::block_on(async {
-            loop {
-                match events.recv().await.unwrap() {
-                    PtyEvent::Ready { .. } => break,
-                    PtyEvent::Error(error) => panic!("{error}"),
-                    _ => panic!("exit before readiness"),
-                }
+            match events.recv().await.unwrap() {
+                PtyEvent::Ready { .. } => {}
+                PtyEvent::Error(error) => panic!("{error}"),
+                _ => panic!("exit before readiness"),
             }
         });
         let mut line = String::new();

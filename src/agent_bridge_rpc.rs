@@ -10,8 +10,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use serde_json::{Value, json};
 use rpi_embedded::EventQueue;
+use serde_json::{Value, json};
 
 use super::{AgentEvent, coalesce_events, decode_message_update, decode_tool_event};
 use crate::agent_writer::AgentWriter;
@@ -38,14 +38,18 @@ impl Drop for CleanupSignal {
 impl Write for DeferredStdin {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if self.sink.is_none() {
-            self.sink = Some(self.receiver.recv().map_err(|_| io::Error::new(
-                io::ErrorKind::BrokenPipe, "rpi startup failed",
-            ))?);
+            self.sink =
+                Some(self.receiver.recv().map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "rpi startup failed")
+                })?);
         }
         self.sink.as_mut().expect("attached stdin").write(bytes)
     }
     fn flush(&mut self) -> io::Result<()> {
-        match &mut self.sink { Some(sink) => sink.flush(), None => Ok(()) }
+        match &mut self.sink {
+            Some(sink) => sink.flush(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -67,7 +71,10 @@ pub(crate) struct RpcAgentBridge {
 
 impl RpcAgentBridge {
     pub(crate) fn spawn_resumed(
-        cwd: &Path, session: Option<&str>, model: Option<&str>, trace_id: u64,
+        cwd: &Path,
+        session: Option<&str>,
+        model: Option<&str>,
+        trace_id: u64,
     ) -> Result<Self, String> {
         Self::spawn_session_with(Path::new("rpi"), cwd, session, model, trace_id, None)
     }
@@ -77,15 +84,24 @@ impl RpcAgentBridge {
     }
 
     fn spawn_session_with(
-        binary: &Path, cwd: &Path, session: Option<&str>, model: Option<&str>, trace_id: u64,
+        binary: &Path,
+        cwd: &Path,
+        session: Option<&str>,
+        model: Option<&str>,
+        trace_id: u64,
         after_cleanup: Option<Arc<Cleanup>>,
     ) -> Result<Self, String> {
         let events = Arc::new(EventQueue::default());
         let error_events = Arc::clone(&events);
         let (stdin_tx, stdin_rx) = mpsc::channel();
         let writer = AgentWriter::spawn(
-            DeferredStdin { receiver: stdin_rx, sink: None },
-            move |error| { emit(&error_events, AgentEvent::Error(error)); },
+            DeferredStdin {
+                receiver: stdin_rx,
+                sink: None,
+            },
+            move |error| {
+                emit(&error_events, AgentEvent::Error(error));
+            },
         );
         writer.send_json(json!({"type":"get_state","id":"kathamo-session"}))?;
         let session_id = Arc::new(Mutex::new(session.map(str::to_owned)));
@@ -94,10 +110,18 @@ impl RpcAgentBridge {
         let cleanup = Arc::new(Cleanup::default());
         let cleaned = Arc::clone(&cleanup);
         let mut command = Command::new(binary);
-        command.args(["--mode", "rpc"]).current_dir(cwd)
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        if let Some(session) = session { command.args(["--session", session]); }
-        if let Some(model) = model { command.args(["--model", model]); }
+        command
+            .args(["--mode", "rpc"])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(session) = session {
+            command.args(["--session", session]);
+        }
+        if let Some(model) = model {
+            command.args(["--model", model]);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -243,38 +267,72 @@ impl RpcAgentBridge {
             return Err(format!("Could not start rpi lifecycle worker: {error}"));
         }
         Ok(Self {
-            writer, events, stop, closed: false, next_id: 0, trace_id,
+            writer,
+            events,
+            stop,
+            closed: false,
+            next_id: 0,
+            trace_id,
             cleanup,
-            cwd: cwd.to_path_buf(), binary: binary.to_path_buf(), session_id, model: model_id,
+            cwd: cwd.to_path_buf(),
+            binary: binary.to_path_buf(),
+            session_id,
+            model: model_id,
         })
     }
 
     pub(crate) fn restart_after_auth(&mut self) -> Result<(), String> {
-        let session = self.session_id().ok_or("The agent session is still starting; try again shortly")?;
-        let model = self.model.lock().map_err(|_| "rpi model lock was poisoned")?.clone()
+        let session = self
+            .session_id()
+            .ok_or("The agent session is still starting; try again shortly")?;
+        let model = self
+            .model
+            .lock()
+            .map_err(|_| "rpi model lock was poisoned")?
+            .clone()
             .ok_or("The agent model is still starting; try again shortly")?;
         let predecessor = Some(Arc::clone(&self.cleanup));
-        let replacement = Self::spawn_session_with(&self.binary, &self.cwd, Some(&session), Some(&model), self.trace_id, predecessor)?;
+        let replacement = Self::spawn_session_with(
+            &self.binary,
+            &self.cwd,
+            Some(&session),
+            Some(&model),
+            self.trace_id,
+            predecessor,
+        )?;
         *self = replacement;
         Ok(())
     }
 
     pub(crate) fn send_prompt(&mut self, prompt: &str) -> Result<(), String> {
-        if self.closed { return Err("The rpi process has exited".into()); }
+        if self.closed {
+            return Err("The rpi process has exited".into());
+        }
         self.next_id = self.next_id.wrapping_add(1);
-        self.writer.send_prompt(format!("kathamo-{}", self.next_id), prompt.to_owned())
+        self.writer
+            .send_prompt(format!("kathamo-{}", self.next_id), prompt.to_owned())
     }
 
     pub(crate) fn cancel(&mut self) -> Result<(), String> {
-        if self.closed { return Err("The rpi process has exited".into()); }
+        if self.closed {
+            return Err("The rpi process has exited".into());
+        }
         self.next_id = self.next_id.wrapping_add(1);
-        self.writer.send_json(json!({"type":"abort","id":format!("kathamo-{}", self.next_id)}))
+        self.writer
+            .send_json(json!({"type":"abort","id":format!("kathamo-{}", self.next_id)}))
     }
 
     pub(crate) fn poll(&mut self) -> Vec<AgentEvent> {
         let (events, more) = self.events.drain();
-        if events.iter().any(|event| matches!(event, AgentEvent::Closed)) { self.closed = true; }
-        if more { super::signal_wake(); }
+        if events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Closed))
+        {
+            self.closed = true;
+        }
+        if more {
+            super::signal_wake();
+        }
         coalesce_events(events)
     }
 }
@@ -289,14 +347,18 @@ impl Drop for RpcAgentBridge {
 
 fn terminate(child: &mut Child) {
     #[cfg(unix)]
-    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL); }
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
 
 fn emit(events: &EventQueue<AgentEvent>, event: AgentEvent) -> bool {
     let sent = events.send_blocking(event).is_ok();
-    if sent { super::signal_wake(); }
+    if sent {
+        super::signal_wake();
+    }
     sent
 }
 
@@ -304,16 +366,28 @@ fn handle_extension_ui(record: &Value, writer: &AgentWriter, events: &EventQueue
     match record["method"].as_str().unwrap_or("") {
         "select" | "confirm" | "input" | "editor" => {
             let title = record["title"].as_str().unwrap_or("Extension interaction");
-            emit(events, AgentEvent::Error(format!("{title}: interactive extension dialogs are not supported in this view; request cancelled")));
+            emit(
+                events,
+                AgentEvent::Error(format!(
+                    "{title}: interactive extension dialogs are not supported in this view; request cancelled"
+                )),
+            );
             if let Err(error) = writer.send_json(json!({
                 "type":"extension_ui_response","id":record["id"],"cancelled":true,
-            })) { emit(events, AgentEvent::Error(error)); }
+            })) {
+                emit(events, AgentEvent::Error(error));
+            }
         }
         "notify" => {
             if let Some(message) = record["message"].as_str() {
-                emit(events, if record["notifyType"] == "error" {
-                    AgentEvent::Error(message.to_owned())
-                } else { AgentEvent::Tool(message.to_owned()) });
+                emit(
+                    events,
+                    if record["notifyType"] == "error" {
+                        AgentEvent::Error(message.to_owned())
+                    } else {
+                        AgentEvent::Tool(message.to_owned())
+                    },
+                );
             }
         }
         _ => {}
@@ -342,9 +416,13 @@ fn decode_event(record: &Value) -> Vec<AgentEvent> {
         }
         "message_end" => {
             let message = &record["message"];
-            if message["role"] == "assistant" && let Some(usage) = message["usage"].as_object() {
+            if message["role"] == "assistant"
+                && let Some(usage) = message["usage"].as_object()
+            {
                 let count = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
-                let cost = usage.get("cost").and_then(|cost| cost["total"].as_f64())
+                let cost = usage
+                    .get("cost")
+                    .and_then(|cost| cost["total"].as_f64())
                     .filter(|cost| cost.is_finite() && *cost > 0.0);
                 events.push(AgentEvent::Usage(rpi_embedded::AgentUsage {
                     input: count("input"),
@@ -412,17 +490,34 @@ mod tests {
         let dir = std::env::temp_dir().join(crate::paths::uid("kathamo-slow-rpc"));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("slow-rpi.sh");
-        std::fs::write(&script, "#!/bin/sh\necho $$ > pid\nsleep 30 &\necho $! > descendant\nwait\n").unwrap();
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho $$ > pid\nsleep 30 &\necho $! > descendant\nwait\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut bridge = RpcAgentBridge::spawn_session_with(&script, &dir, None, None, 1, None).unwrap();
+        let mut bridge =
+            RpcAgentBridge::spawn_session_with(&script, &dir, None, None, 1, None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while std::fs::read_to_string(dir.join("descendant")).ok()
-            .and_then(|pid| pid.trim().parse::<i32>().ok()).is_none() && Instant::now() < deadline {
+        while std::fs::read_to_string(dir.join("descendant"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+            .is_none()
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(5));
         }
-        let pid: i32 = std::fs::read_to_string(dir.join("pid")).unwrap().trim().parse().unwrap();
-        let descendant: i32 = std::fs::read_to_string(dir.join("descendant")).unwrap().trim().parse().unwrap();
+        let pid: i32 = std::fs::read_to_string(dir.join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let descendant: i32 = std::fs::read_to_string(dir.join("descendant"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         let prompt = "x".repeat(4 * 1024 * 1024);
         let start = Instant::now();
         bridge.send_prompt(&prompt).unwrap();
@@ -440,39 +535,70 @@ mod tests {
         );
         let start = Instant::now();
         drop(bridge);
-        assert!(start.elapsed() < Duration::from_millis(50), "RPC drop blocked");
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "RPC drop blocked"
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "lifecycle worker must reap its child");
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "lifecycle worker must reap its child"
+        );
         let descendant_dead = || {
             #[cfg(target_os = "linux")]
             {
                 std::fs::read_to_string(format!("/proc/{descendant}/stat"))
-                    .map(|stat| stat.rsplit_once(')').is_some_and(|(_, fields)| fields.trim_start().starts_with('Z')))
+                    .map(|stat| {
+                        stat.rsplit_once(')')
+                            .is_some_and(|(_, fields)| fields.trim_start().starts_with('Z'))
+                    })
                     .unwrap_or(true)
             }
             #[cfg(not(target_os = "linux"))]
-            { (unsafe { libc::kill(descendant, 0) }) == -1 }
+            {
+                (unsafe { libc::kill(descendant, 0) }) == -1
+            }
         };
-        while !descendant_dead() && Instant::now() < deadline { thread::sleep(Duration::from_millis(5)); }
-        assert!(descendant_dead(), "RPC descendants must be terminated with their process group");
+        while !descendant_dead() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            descendant_dead(),
+            "RPC descendants must be terminated with their process group"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn asynchronous_start_failure_delivers_error_done_closed_in_order() {
         let mut bridge = RpcAgentBridge::spawn_session_with(
-            Path::new("/definitely-missing-rpi-binary"), &std::env::temp_dir(), None, None, 2, None,
-        ).unwrap();
+            Path::new("/definitely-missing-rpi-binary"),
+            &std::env::temp_dir(),
+            None,
+            None,
+            2,
+            None,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut events = Vec::new();
         while Instant::now() < deadline {
             events.extend(bridge.poll());
-            if events.iter().any(|event| matches!(event, AgentEvent::Closed)) { break; }
+            if events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Closed))
+            {
+                break;
+            }
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(matches!(&events[..], [AgentEvent::Error(_), AgentEvent::Done, AgentEvent::Closed]));
+        assert!(matches!(
+            &events[..],
+            [AgentEvent::Error(_), AgentEvent::Done, AgentEvent::Closed]
+        ));
     }
 }

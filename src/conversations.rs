@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRY_BYTES: usize = 64 * 1024;
@@ -30,7 +30,9 @@ struct QueueCharge {
 }
 
 impl Drop for QueueCharge {
-    fn drop(&mut self) { self.total.fetch_sub(self.bytes, Ordering::Relaxed); }
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone)]
@@ -72,10 +74,15 @@ static WRITER: LazyLock<Writer> = LazyLock::new(|| {
     let _ = std::thread::Builder::new()
         .name("kathamo-conversation-writer".into())
         .spawn(move || writer_loop(receiver));
-    Writer { sender, bytes: Arc::new(AtomicUsize::new(0)) }
+    Writer {
+        sender,
+        bytes: Arc::new(AtomicUsize::new(0)),
+    }
 });
 
-fn writer() -> &'static Writer { &WRITER }
+fn writer() -> &'static Writer {
+    &WRITER
+}
 
 struct OpenFile {
     file: Option<File>,
@@ -97,9 +104,8 @@ fn writer_loop(receiver: mpsc::Receiver<WriteJob>) {
                 let mut line = match serde_json::to_vec(&entry) {
                     Ok(line) => line,
                     Err(error) => {
-                        *error_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
-                            "Failed to encode conversation history: {error}"
-                        ));
+                        *error_sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(format!("Failed to encode conversation history: {error}"));
                         crate::agent_bridge::signal_wake();
                         continue;
                     }
@@ -108,9 +114,8 @@ fn writer_loop(receiver: mpsc::Receiver<WriteJob>) {
                 let result = write_line(&mut files, &path, max_bytes, &line);
                 crate::stream_timing::record_since("transcript.write", write_start);
                 if let Err(error) = result {
-                    *error_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
-                        "Failed to append conversation history: {error}"
-                    ));
+                    *error_sink.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("Failed to append conversation history: {error}"));
                     crate::agent_bridge::signal_wake();
                 }
             }
@@ -149,7 +154,9 @@ fn write_line(
     line: &[u8],
 ) -> io::Result<()> {
     if !files.contains_key(path) && files.len() >= MAX_OPEN_FILES {
-        if let Some(oldest) = files.keys().next().cloned() { files.remove(&oldest); }
+        if let Some(oldest) = files.keys().next().cloned() {
+            files.remove(&oldest);
+        }
     }
     let open = files.entry(path.to_path_buf()).or_insert_with(|| OpenFile {
         file: None,
@@ -243,17 +250,28 @@ impl Log {
         let enqueue_start = std::time::Instant::now();
         let bytes = entry_bytes(&entry).saturating_add(self.path.as_os_str().len());
         let previous = self.writer.bytes.fetch_add(bytes, Ordering::Relaxed);
-        let charge = QueueCharge { bytes, total: Arc::clone(&self.writer.bytes) };
+        let charge = QueueCharge {
+            bytes,
+            total: Arc::clone(&self.writer.bytes),
+        };
         if previous.saturating_add(bytes) > MAX_QUEUED_BYTES {
             drop(charge);
-            *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some("Conversation history queue is full; this entry was not saved.".into());
+            *self.error.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some("Conversation history queue is full; this entry was not saved.".into());
         } else if let Err(error) = self.writer.sender.try_send(WriteJob::Append {
-            path: self.path.clone(), max_bytes: self.max_bytes, entry, charge,
+            path: self.path.clone(),
+            max_bytes: self.max_bytes,
+            entry,
+            charge,
             error: Arc::clone(&self.error),
         }) {
             *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(match error {
-                mpsc::TrySendError::Full(_) => "Conversation history queue is full; this entry was not saved.".into(),
-                mpsc::TrySendError::Disconnected(_) => "Conversation history writer stopped; this entry was not saved.".into(),
+                mpsc::TrySendError::Full(_) => {
+                    "Conversation history queue is full; this entry was not saved.".into()
+                }
+                mpsc::TrySendError::Disconnected(_) => {
+                    "Conversation history writer stopped; this entry was not saved.".into()
+                }
             });
         }
         crate::stream_timing::record_since("transcript.enqueue", enqueue_start);
@@ -278,14 +296,20 @@ impl Drop for Log {
     fn drop(&mut self) {
         // Never wait for disk backpressure during pane/session teardown.
         // If full, the bounded open-file cache eventually releases the handle.
-        let _ = self.writer.sender.try_send(WriteJob::Close { path: self.path.clone() });
+        let _ = self.writer.sender.try_send(WriteJob::Close {
+            path: self.path.clone(),
+        });
     }
 }
 
 fn capped(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes { return text.to_owned(); }
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
     let mut end = max_bytes;
-    while !text.is_char_boundary(end) { end -= 1; }
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
     let suffix = "… (truncated)";
     let mut out = String::with_capacity(end + suffix.len());
     out.push_str(&text[..end]);
@@ -301,21 +325,41 @@ fn project_event(event: &AgentEvent) -> AgentEvent {
         AgentEvent::Status(text) => AgentEvent::Status(capped(text, MAX_ENTRY_BYTES)),
         AgentEvent::Tool(text) => AgentEvent::Tool(capped(text, MAX_ENTRY_BYTES)),
         AgentEvent::ToolStart { id, name, input } => AgentEvent::ToolStart {
-            id: id.clone(), name: name.clone(), input: capped(input, MAX_ENTRY_BYTES),
+            id: id.clone(),
+            name: name.clone(),
+            input: capped(input, MAX_ENTRY_BYTES),
         },
         AgentEvent::ToolUpdate { id, name, output } => AgentEvent::ToolUpdate {
-            id: id.clone(), name: name.clone(), output: capped(output, MAX_ENTRY_BYTES),
+            id: id.clone(),
+            name: name.clone(),
+            output: capped(output, MAX_ENTRY_BYTES),
         },
-        AgentEvent::ToolEnd { id, name, output, failed } => AgentEvent::ToolEnd {
-            id: id.clone(), name: name.clone(), output: capped(output, MAX_ENTRY_BYTES), failed: *failed,
+        AgentEvent::ToolEnd {
+            id,
+            name,
+            output,
+            failed,
+        } => AgentEvent::ToolEnd {
+            id: id.clone(),
+            name: name.clone(),
+            output: capped(output, MAX_ENTRY_BYTES),
+            failed: *failed,
         },
         AgentEvent::Subagents { tool_id, workers } => AgentEvent::Subagents {
             tool_id: tool_id.clone(),
-            workers: workers.iter().map(|worker| crate::subagent_chat::Worker {
-                id: worker.id.clone(), title: worker.title.clone(), status: worker.status.clone(),
-                transcript: worker.transcript.clone(),
-                result: worker.result.as_deref().map(|text| capped(text, MAX_ENTRY_BYTES)),
-            }).collect(),
+            workers: workers
+                .iter()
+                .map(|worker| crate::subagent_chat::Worker {
+                    id: worker.id.clone(),
+                    title: worker.title.clone(),
+                    status: worker.status.clone(),
+                    transcript: worker.transcript.clone(),
+                    result: worker
+                        .result
+                        .as_deref()
+                        .map(|text| capped(text, MAX_ENTRY_BYTES)),
+                })
+                .collect(),
         },
         AgentEvent::Error(text) => AgentEvent::Error(capped(text, MAX_ENTRY_BYTES)),
         AgentEvent::Title(text) => AgentEvent::Title(capped(text, 200)),
@@ -327,10 +371,11 @@ fn project_event(event: &AgentEvent) -> AgentEvent {
 
 fn entry_bytes(entry: &Entry) -> usize {
     use rpi_embedded::QueuedEvent;
-    std::mem::size_of::<Entry>() + match entry {
-        Entry::User { text } | Entry::Local { text, .. } => text.capacity(),
-        Entry::Event { event } => event.queued_bytes(),
-    }
+    std::mem::size_of::<Entry>()
+        + match entry {
+            Entry::User { text } | Entry::Local { text, .. } => text.capacity(),
+            Entry::Event { event } => event.queued_bytes(),
+        }
 }
 
 /// File name stem for a chat: `default` for the model-less conversation, or a
@@ -402,8 +447,9 @@ pub fn load_usage(path: &Path) -> Option<rpi_embedded::AgentUsage> {
     let text = read_bounded(path)?;
     let mut total: Option<rpi_embedded::AgentUsage> = None;
     for line in text.lines() {
-        let Ok(Entry::Event { event: AgentEvent::Usage(usage) }) =
-            serde_json::from_str::<Entry>(line.trim())
+        let Ok(Entry::Event {
+            event: AgentEvent::Usage(usage),
+        }) = serde_json::from_str::<Entry>(line.trim())
         else {
             continue;
         };
@@ -457,7 +503,8 @@ fn normalize_replay(messages: &mut [std::sync::Arc<ChatMessage>]) {
 /// the directory.
 pub fn clear_all() -> io::Result<()> {
     let (ack, receiver) = mpsc::channel();
-    writer().sender
+    writer()
+        .sender
         .send(WriteJob::Clear { ack })
         .map_err(|_| io::Error::other("conversation writer stopped"))?;
     receiver
@@ -550,29 +597,51 @@ mod tests {
         log.append_user("first");
         log.append_event(&AgentEvent::Text("answer".into()));
         log.append_event(&AgentEvent::Usage(rpi_embedded::AgentUsage {
-            input: 100, output: 20, cache_read: 40, cache_write: 10, cost: Some(0.125),
+            input: 100,
+            output: 20,
+            cache_read: 40,
+            cache_write: 10,
+            cost: Some(0.125),
         }));
         log.append_event(&AgentEvent::Done);
         log.append_user("second");
         log.append_event(&AgentEvent::Text("another answer".into()));
         log.append_event(&AgentEvent::Usage(rpi_embedded::AgentUsage {
-            input: 200, output: 30, cache_read: 80, cache_write: 15, cost: Some(0.25),
+            input: 200,
+            output: 30,
+            cache_read: 80,
+            cache_write: 15,
+            cost: Some(0.25),
         }));
         log.append_event(&AgentEvent::Done);
         log.flush();
 
-        assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
-            input: 300, output: 50, cache_read: 120, cache_write: 25, cost: Some(0.375),
-        }));
+        assert_eq!(
+            load_usage(log.path()),
+            Some(rpi_embedded::AgentUsage {
+                input: 300,
+                output: 50,
+                cache_read: 120,
+                cache_write: 25,
+                cost: Some(0.375),
+            })
+        );
         let messages = load(log.path());
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].text, "answer");
         assert_eq!(messages[3].text, "another answer");
         assert!(messages.iter().all(|message| !message.streaming));
         // Replaying is read-only and never adds the deltas a second time.
-        assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
-            input: 300, output: 50, cache_read: 120, cache_write: 25, cost: Some(0.375),
-        }));
+        assert_eq!(
+            load_usage(log.path()),
+            Some(rpi_embedded::AgentUsage {
+                input: 300,
+                output: 50,
+                cache_read: 120,
+                cache_write: 25,
+                cost: Some(0.375),
+            })
+        );
 
         let path = log.path().to_path_buf();
         drop(log);
@@ -585,13 +654,24 @@ mod tests {
             let mut log = temp_log("usage-unknown-cost", MAX_FILE_BYTES);
             for cost in costs {
                 log.append_event(&AgentEvent::Usage(rpi_embedded::AgentUsage {
-                    input: 10, output: 2, cache_read: 3, cache_write: 4, cost,
+                    input: 10,
+                    output: 2,
+                    cache_read: 3,
+                    cache_write: 4,
+                    cost,
                 }));
             }
             log.flush();
-            assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
-                input: 30, output: 6, cache_read: 9, cache_write: 12, cost: None,
-            }));
+            assert_eq!(
+                load_usage(log.path()),
+                Some(rpi_embedded::AgentUsage {
+                    input: 30,
+                    output: 6,
+                    cache_read: 9,
+                    cache_write: 12,
+                    cost: None,
+                })
+            );
             let path = log.path().to_path_buf();
             drop(log);
             fs::remove_file(path).unwrap();
@@ -607,17 +687,31 @@ mod tests {
         assert_eq!(load_usage(log.path()), None);
 
         let usage = rpi_embedded::AgentUsage {
-            input: 15, output: 5, cache_read: 2, cache_write: 1, cost: Some(0.0),
+            input: 15,
+            output: 5,
+            cache_read: 2,
+            cache_write: 1,
+            cost: Some(0.0),
         };
         let entry = serde_json::to_string(&Entry::Event {
             event: AgentEvent::Usage(usage),
-        }).unwrap();
-        fs::write(log.path(), format!(
-            "not json\n\n{entry}\n{{\"t\":\"event\",\"event\":null}}\n{entry}\n{{"
-        )).unwrap();
-        assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
-            input: 30, output: 10, cache_read: 4, cache_write: 2, cost: Some(0.0),
-        }));
+        })
+        .unwrap();
+        fs::write(
+            log.path(),
+            format!("not json\n\n{entry}\n{{\"t\":\"event\",\"event\":null}}\n{entry}\n{{"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_usage(log.path()),
+            Some(rpi_embedded::AgentUsage {
+                input: 30,
+                output: 10,
+                cache_read: 4,
+                cache_write: 2,
+                cost: Some(0.0),
+            })
+        );
         assert!(load(log.path()).is_empty());
 
         let path = log.path().to_path_buf();
@@ -629,20 +723,31 @@ mod tests {
     fn usage_replay_uses_the_transcript_read_bound() {
         let log = temp_log("usage-bounded", MAX_FILE_BYTES);
         let usage = rpi_embedded::AgentUsage {
-            input: 10, output: 2, cache_read: 3, cache_write: 4, cost: Some(0.125),
+            input: 10,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            cost: Some(0.125),
         };
         let entry = serde_json::to_string(&Entry::Event {
             event: AgentEvent::Usage(usage),
-        }).unwrap();
+        })
+        .unwrap();
         let mut file = File::create(log.path()).unwrap();
         writeln!(file, "{entry}").unwrap();
         // A sparse oversized line puts the first usage outside the read window.
         file.seek(SeekFrom::Start(MAX_FILE_BYTES + 1024)).unwrap();
         writeln!(file).unwrap();
         writeln!(file, "{entry}").unwrap();
-        writeln!(file, "{}", serde_json::to_string(&Entry::User {
-            text: "retained".into(),
-        }).unwrap()).unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&Entry::User {
+                text: "retained".into(),
+            })
+            .unwrap()
+        )
+        .unwrap();
         drop(file);
 
         assert_eq!(load_usage(log.path()), Some(usage));
@@ -735,16 +840,24 @@ mod tests {
     #[test]
     fn projection_caps_tool_results_without_changing_live_payload() {
         let event = AgentEvent::ToolEnd {
-            id: Some("call".into()), name: "bash".into(),
-            output: "α".repeat(2 * 1024 * 1024), failed: true,
+            id: Some("call".into()),
+            name: "bash".into(),
+            output: "α".repeat(2 * 1024 * 1024),
+            failed: true,
         };
         let projected = project_event(&event);
-        assert!(matches!(&event, AgentEvent::ToolEnd { output, .. } if output.len() == 4 * 1024 * 1024));
-        assert!(matches!(&projected, AgentEvent::ToolEnd { id, name, output, failed }
+        assert!(
+            matches!(&event, AgentEvent::ToolEnd { output, .. } if output.len() == 4 * 1024 * 1024)
+        );
+        assert!(
+            matches!(&projected, AgentEvent::ToolEnd { id, name, output, failed }
             if id.as_deref() == Some("call") && name == "bash" && *failed &&
-                output.len() < MAX_ENTRY_BYTES + 32 && output.ends_with("(truncated)")));
+                output.len() < MAX_ENTRY_BYTES + 32 && output.ends_with("(truncated)"))
+        );
         assert!(matches!(project_event(&AgentEvent::Done), AgentEvent::Done));
-        assert!(matches!(project_event(&AgentEvent::Error("error".into())), AgentEvent::Error(text) if text == "error"));
+        assert!(
+            matches!(project_event(&AgentEvent::Error("error".into())), AgentEvent::Error(text) if text == "error")
+        );
     }
 
     #[test]
@@ -752,8 +865,12 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         let bytes = Arc::new(AtomicUsize::new(0));
         let mut log = Log {
-            path: PathBuf::from("stalled-history"), max_bytes: MAX_FILE_BYTES,
-            writer: Writer { sender, bytes: Arc::clone(&bytes) },
+            path: PathBuf::from("stalled-history"),
+            max_bytes: MAX_FILE_BYTES,
+            writer: Writer {
+                sender,
+                bytes: Arc::clone(&bytes),
+            },
             error: Arc::new(Mutex::new(None)),
         };
         log.append_event(&AgentEvent::Text("accepted".into()));
@@ -778,12 +895,18 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(MAX_QUEUED_ENTRIES);
         let bytes = Arc::new(AtomicUsize::new(0));
         let mut log = Log {
-            path: PathBuf::from("byte-budget"), max_bytes: MAX_FILE_BYTES,
-            writer: Writer { sender, bytes: Arc::clone(&bytes) },
+            path: PathBuf::from("byte-budget"),
+            max_bytes: MAX_FILE_BYTES,
+            writer: Writer {
+                sender,
+                bytes: Arc::clone(&bytes),
+            },
             error: Arc::new(Mutex::new(None)),
         };
         let event = AgentEvent::Text("x".repeat(MAX_ENTRY_BYTES));
-        for _ in 0..MAX_QUEUED_ENTRIES { log.append_event(&event); }
+        for _ in 0..MAX_QUEUED_ENTRIES {
+            log.append_event(&event);
+        }
         assert!(bytes.load(Ordering::Relaxed) <= MAX_QUEUED_BYTES);
         assert!(log.take_error().unwrap().contains("queue is full"));
         drop(receiver);
@@ -803,14 +926,22 @@ mod tests {
     #[ignore = "manual transcript projection cost comparison"]
     fn transcript_projection_benchmark() {
         let event = AgentEvent::ToolUpdate {
-            id: Some("bench".into()), name: "bash".into(), output: "x".repeat(1024 * 1024),
+            id: Some("bench".into()),
+            name: "bash".into(),
+            output: "x".repeat(1024 * 1024),
         };
         let start = std::time::Instant::now();
-        for _ in 0..1000 { std::hint::black_box(project_event(std::hint::black_box(&event))); }
+        for _ in 0..1000 {
+            std::hint::black_box(project_event(std::hint::black_box(&event)));
+        }
         let capped = start.elapsed();
         let start = std::time::Instant::now();
-        for _ in 0..1000 { std::hint::black_box(std::hint::black_box(&event).clone()); }
-        eprintln!("transcript projection: capped={capped:?}, full_clone={:?}, retained_prefix_limit={MAX_ENTRY_BYTES}",
-            start.elapsed());
+        for _ in 0..1000 {
+            std::hint::black_box(std::hint::black_box(&event).clone());
+        }
+        eprintln!(
+            "transcript projection: capped={capped:?}, full_clone={:?}, retained_prefix_limit={MAX_ENTRY_BYTES}",
+            start.elapsed()
+        );
     }
 }

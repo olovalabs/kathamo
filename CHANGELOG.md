@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Restored CI formatting compliance and removed a non-looping PTY benchmark readiness loop rejected by Clippy.
+
 ### Added
 - Show conversation input/output tokens, cache reads/writes, and estimated USD cost beneath the Agent input. Totals update after each model response, survive history restoration, and show unavailable pricing as unknown rather than free; hover for exact token counts.
 - Added native provider/model discovery for all 67 OMP README integrations while preserving existing provider/model identities: 104 catalog providers, 6,279 frozen model entries, and real local/account model discovery. Chat selection excludes non-chat task models without deleting their metadata.

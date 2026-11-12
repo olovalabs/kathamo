@@ -182,7 +182,9 @@ enum Escape {
 impl Sanitizer {
     fn push_owned(&mut self, chunk: String) -> String {
         if matches!(self.escape, Escape::Text)
-            && !chunk.chars().any(|c| matches!(c, '\x00'..='\x08' | '\x0b'..='\x1f' | '\u{fff9}'..='\u{fffb}'))
+            && !chunk
+                .chars()
+                .any(|c| matches!(c, '\x00'..='\x08' | '\x0b'..='\x1f' | '\u{fff9}'..='\u{fffb}'))
         {
             return chunk;
         }
@@ -199,12 +201,14 @@ impl Sanitizer {
                     '\x00'..='\x1f' | '\u{fff9}'..='\u{fffb}' => {}
                     _ => out.push(c),
                 },
-                Escape::Start => self.escape = match c {
-                    '[' => Escape::Csi,
-                    ']' => Escape::Osc,
-                    '(' | ')' => Escape::Charset,
-                    _ => Escape::Text,
-                },
+                Escape::Start => {
+                    self.escape = match c {
+                        '[' => Escape::Csi,
+                        ']' => Escape::Osc,
+                        '(' | ')' => Escape::Charset,
+                        _ => Escape::Text,
+                    }
+                }
                 Escape::Csi => {
                     if ('\x40'..='\x7e').contains(&c) {
                         self.escape = Escape::Text;
@@ -215,11 +219,9 @@ impl Sanitizer {
                     '\x1b' => self.escape = Escape::OscEscape,
                     _ => {}
                 },
-                Escape::OscEscape => self.escape = if c == '\\' {
-                    Escape::Text
-                } else {
-                    Escape::Osc
-                },
+                Escape::OscEscape => {
+                    self.escape = if c == '\\' { Escape::Text } else { Escape::Osc }
+                }
                 Escape::Charset => self.escape = Escape::Text,
             }
         }
@@ -308,7 +310,8 @@ pub async fn execute_shell_with_capture(
                     prefix.push_str(&text);
                 }
                 let total_lines = state.completed_lines + usize::from(state.has_open_line);
-                let needs_spool = state.total_bytes > DEFAULT_MAX_BYTES || total_lines > DEFAULT_MAX_LINES;
+                let needs_spool =
+                    state.total_bytes > DEFAULT_MAX_BYTES || total_lines > DEFAULT_MAX_LINES;
                 if state.full_output_path.is_none() && !needs_spool {
                     continue;
                 }
@@ -324,7 +327,8 @@ pub async fn execute_shell_with_capture(
                     let writing = async {
                         if let Some(path) = &state.full_output_path {
                             append_full_output(env, path, &mut spool_writer, &mut spool_buffer)
-                                .await.map(|()| None)
+                                .await
+                                .map(|()| None)
                         } else if needs_spool {
                             init_full_output_file(env, &prefix).await.map(Some)
                         } else {
@@ -367,7 +371,9 @@ pub async fn execute_shell_with_capture(
         }
         if !spool_buffer.is_empty() {
             if let Some(path) = &state.full_output_path {
-                if let Err(error) = append_full_output(env, path, &mut spool_writer, &mut spool_buffer).await {
+                if let Err(error) =
+                    append_full_output(env, path, &mut spool_writer, &mut spool_buffer).await
+                {
                     tracing::warn!("shell full-output persistence failed: {error}");
                     state.full_output_path = None;
                 }
@@ -445,7 +451,12 @@ async fn append_full_output(
     let result = if let Some(writer) = writer {
         writer.append(buffer.as_bytes()).await
     } else {
-        env.append_file(&path.to_string_lossy(), FileContent::Text(std::mem::take(buffer)), None).await
+        env.append_file(
+            &path.to_string_lossy(),
+            FileContent::Text(std::mem::take(buffer)),
+            None,
+        )
+        .await
     };
     result.map_err(|error| ExecutionError::new(ExecutionErrorCode::Unknown, error.to_string()))?;
     buffer.clear();
@@ -462,13 +473,22 @@ async fn init_full_output_file(
         .create_temp_file("bash-", ".log", None)
         .await
         .map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
-    let mut writer = env.open_append_file(&path.to_string_lossy())
+    let mut writer = env
+        .open_append_file(&path.to_string_lossy())
         .await
         .map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
     match &mut writer {
         Some(writer) => writer.append(initial.as_bytes()).await,
-        None => env.append_file(&path.to_string_lossy(), FileContent::Text(initial.to_string()), None).await,
-    }.map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
+        None => {
+            env.append_file(
+                &path.to_string_lossy(),
+                FileContent::Text(initial.to_string()),
+                None,
+            )
+            .await
+        }
+    }
+    .map_err(|e| ExecutionError::new(ExecutionErrorCode::Unknown, e.to_string()))?;
     Ok((path, writer))
 }
 

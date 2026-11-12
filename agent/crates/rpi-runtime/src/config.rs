@@ -228,11 +228,18 @@ pub fn provider_to_models(
     } else {
         serde_json::from_value(serde_json::Value::String(cfg.api.clone()?)).ok()?
     };
-    let provider_base = cfg.base_url.clone()
-        .or_else(|| crate::catalog::builtin_provider(provider_id).map(|provider| {
-            provider.base_url_env.as_ref().and_then(|name| values.env(name))
-                .unwrap_or_else(|| provider.base_url.clone())
-        }))
+    let provider_base = cfg
+        .base_url
+        .clone()
+        .or_else(|| {
+            crate::catalog::builtin_provider(provider_id).map(|provider| {
+                provider
+                    .base_url_env
+                    .as_ref()
+                    .and_then(|name| values.env(name))
+                    .unwrap_or_else(|| provider.base_url.clone())
+            })
+        })
         .unwrap_or_else(|| match api {
             Api::OpenaiCompletions | Api::OpenaiResponses => "https://api.openai.com".to_string(),
             _ => default_anthropic_base_url(),

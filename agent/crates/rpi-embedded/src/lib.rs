@@ -20,8 +20,8 @@
 //! discovery and login still load extensions when they need an OAuth provider.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 #[cfg(test)]
@@ -53,9 +53,11 @@ pub fn auth_methods(provider: &str) -> AuthMethods {
 /// Pure cached metadata for a project path, including its discovered canonical alias.
 pub fn cached_auth_methods(provider: &str, cwd: &Path) -> AuthMethods {
     let mut methods = auth_methods(provider);
-    methods.oauth |= EXTENSION_OAUTH_METHODS.read()
+    methods.oauth |= EXTENSION_OAUTH_METHODS
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(cwd).is_some_and(|providers| providers.contains(provider));
+        .get(cwd)
+        .is_some_and(|providers| providers.contains(provider));
     methods
 }
 
@@ -74,16 +76,25 @@ fn auth_runtime() -> Result<&'static tokio::runtime::Runtime, String> {
 
 /// Refresh extension metadata outside a UI render pass, for the selected project.
 pub fn refresh_auth_methods(cwd: &Path) -> Result<(), String> {
-    let canonical = cwd.canonicalize()
+    let canonical = cwd
+        .canonicalize()
         .map_err(|_| "Could not resolve authentication project directory".to_string())?;
     let _runtime = auth_runtime()?.enter();
     let prepared = rpi_cli::session::prepare_extensions(
-        &Args::default(), &canonical, project_trusted(&canonical),
-    ).map_err(|error| format!("Could not discover extension authentication: {error}"))?;
-    let providers = prepared.extension_session.snapshot()
-        .map(rpi_extensions::list_oauth_providers).unwrap_or_default();
+        &Args::default(),
+        &canonical,
+        project_trusted(&canonical),
+    )
+    .map_err(|error| format!("Could not discover extension authentication: {error}"))?;
+    let providers = prepared
+        .extension_session
+        .snapshot()
+        .map(rpi_extensions::list_oauth_providers)
+        .unwrap_or_default();
     let methods = Arc::new(providers.into_iter().map(|provider| provider.id).collect());
-    let mut cache = EXTENSION_OAUTH_METHODS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = EXTENSION_OAUTH_METHODS
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     cache.insert(canonical, Arc::clone(&methods));
     cache.insert(cwd.to_path_buf(), methods);
     Ok(())
@@ -129,14 +140,10 @@ fn catalog_filtered(chat_only: bool) -> Result<Vec<ModelInfo>, String> {
                 })
                 .collect();
             rows.retain(|model| model.provider != ANTIGRAVITY);
-            rows.extend(
-                antigravity::models()
-                    .into_iter()
-                    .map(|model| ModelInfo {
-                        provider: ANTIGRAVITY.into(),
-                        id: model.id,
-                    }),
-            );
+            rows.extend(antigravity::models().into_iter().map(|model| ModelInfo {
+                provider: ANTIGRAVITY.into(),
+                id: model.id,
+            }));
             rows
         })
         .map_err(|error| error.to_string())
@@ -305,31 +312,70 @@ impl<E: QueuedEvent> EventQueue<E> {
             if let Some(hook) = hook {
                 queue.timing = Some(QueueTiming {
                     hook: Arc::clone(hook),
-                    admission: if raw { "queue.raw.admission" } else { "queue.projected.admission" },
-                    lock: if raw { "queue.raw.lock" } else { "queue.projected.lock" },
-                    backpressure: if raw { "queue.raw.backpressure" } else { "queue.projected.backpressure" },
-                    residence: if raw { "queue.raw.residence" } else { "queue.projected.residence" },
-                    snapshot_dropped: if raw { "queue.raw.snapshot_dropped" } else { "queue.projected.snapshot_dropped" },
+                    admission: if raw {
+                        "queue.raw.admission"
+                    } else {
+                        "queue.projected.admission"
+                    },
+                    lock: if raw {
+                        "queue.raw.lock"
+                    } else {
+                        "queue.projected.lock"
+                    },
+                    backpressure: if raw {
+                        "queue.raw.backpressure"
+                    } else {
+                        "queue.projected.backpressure"
+                    },
+                    residence: if raw {
+                        "queue.raw.residence"
+                    } else {
+                        "queue.projected.residence"
+                    },
+                    snapshot_dropped: if raw {
+                        "queue.raw.snapshot_dropped"
+                    } else {
+                        "queue.projected.snapshot_dropped"
+                    },
                 });
-                queue.state.get_mut().unwrap_or_else(|e| e.into_inner()).enqueued = Some(Default::default());
+                queue
+                    .state
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .enqueued = Some(Default::default());
             }
         }
         queue
     }
 
-    fn admission_finished(&self, started: Option<std::time::Instant>, blocked: bool, lock_wait: std::time::Duration) {
+    fn admission_finished(
+        &self,
+        started: Option<std::time::Instant>,
+        blocked: bool,
+        lock_wait: std::time::Duration,
+    ) {
         if let (Some(timing), Some(started)) = (&self.timing, started) {
             let elapsed = started.elapsed();
             (timing.hook)(timing.admission, elapsed);
             (timing.hook)(timing.lock, lock_wait);
-            if blocked { (timing.hook)(timing.backpressure, elapsed); }
+            if blocked {
+                (timing.hook)(timing.backpressure, elapsed);
+            }
         }
     }
 
-    fn lock_state(&self) -> (std::sync::MutexGuard<'_, EventQueueState<E>>, std::time::Duration) {
+    fn lock_state(
+        &self,
+    ) -> (
+        std::sync::MutexGuard<'_, EventQueueState<E>>,
+        std::time::Duration,
+    ) {
         let started = self.timing.as_ref().map(|_| std::time::Instant::now());
         let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        (guard, started.map_or(std::time::Duration::ZERO, |started| started.elapsed()))
+        (
+            guard,
+            started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
+        )
     }
 
     fn insert(state: &mut EventQueueState<E>, event: E) -> Result<(), E> {
@@ -337,7 +383,11 @@ impl<E: QueuedEvent> EventQueue<E> {
             return Err(event);
         }
         let replaced = if event.is_snapshot() {
-            state.events.iter().enumerate().rev()
+            state
+                .events
+                .iter()
+                .enumerate()
+                .rev()
                 .take_while(|(_, old)| old.is_snapshot())
                 .find(|(_, old)| event.supersedes(old))
                 .map(|(index, old)| (index, old.queued_bytes()))
@@ -348,16 +398,22 @@ impl<E: QueuedEvent> EventQueue<E> {
         let old_size = replaced.map_or(0, |(_, size)| size);
         let count = state.events.len() - usize::from(replaced.is_some());
         let bytes = state.bytes - old_size;
-        if count != 0 && (count >= EVENT_QUEUE_RECORDS || bytes.saturating_add(size) > EVENT_QUEUE_BYTES) {
+        if count != 0
+            && (count >= EVENT_QUEUE_RECORDS || bytes.saturating_add(size) > EVENT_QUEUE_BYTES)
+        {
             return Err(event);
         }
         if let Some((index, _)) = replaced {
             state.events.remove(index);
-            if let Some(enqueued) = &mut state.enqueued { enqueued.remove(index); }
+            if let Some(enqueued) = &mut state.enqueued {
+                enqueued.remove(index);
+            }
         }
         state.bytes = bytes.saturating_add(size);
         state.events.push_back(event);
-        if let Some(enqueued) = &mut state.enqueued { enqueued.push_back(std::time::Instant::now()); }
+        if let Some(enqueued) = &mut state.enqueued {
+            enqueued.push_back(std::time::Instant::now());
+        }
         Ok(())
     }
 
@@ -372,7 +428,9 @@ impl<E: QueuedEvent> EventQueue<E> {
             {
                 let (mut state, elapsed) = self.lock_state();
                 lock_wait += elapsed;
-                if state.closed { return Err(()); }
+                if state.closed {
+                    return Err(());
+                }
                 match Self::insert(&mut state, event) {
                     Ok(()) => {
                         drop(state);
@@ -394,7 +452,9 @@ impl<E: QueuedEvent> EventQueue<E> {
         let mut blocked = false;
         let (mut state, lock_wait) = self.lock_state();
         loop {
-            if state.closed { return Err(()); }
+            if state.closed {
+                return Err(());
+            }
             match Self::insert(&mut state, event) {
                 Ok(()) => {
                     drop(state);
@@ -442,7 +502,9 @@ impl<E: QueuedEvent> EventQueue<E> {
                     }
                     return Some(event);
                 }
-                if state.closed { return None; }
+                if state.closed {
+                    return None;
+                }
             }
             notified.await;
         }
@@ -456,9 +518,13 @@ impl<E: QueuedEvent> EventQueue<E> {
         let mut bytes = 0usize;
         let mut residence = Vec::new();
         while events.len() < POLL_RECORDS {
-            let Some(front) = state.events.front() else { break };
+            let Some(front) = state.events.front() else {
+                break;
+            };
             let size = front.queued_bytes();
-            if !events.is_empty() && bytes.saturating_add(size) > POLL_BYTES { break; }
+            if !events.is_empty() && bytes.saturating_add(size) > POLL_BYTES {
+                break;
+            }
             bytes = bytes.saturating_add(size);
             state.bytes -= size;
             events.push(state.events.pop_front().expect("front exists"));
@@ -471,7 +537,9 @@ impl<E: QueuedEvent> EventQueue<E> {
         self.ready.notify_waiters();
         self.space.notify_all();
         if let Some(timing) = &self.timing {
-            for elapsed in residence { (timing.hook)(timing.residence, elapsed); }
+            for elapsed in residence {
+                (timing.hook)(timing.residence, elapsed);
+            }
         }
         (events, more)
     }
@@ -487,15 +555,23 @@ impl<E: QueuedEvent> EventQueue<E> {
 impl QueuedEvent for SessionEvent {
     fn queued_bytes(&self) -> usize {
         match self {
-            Self::Text(text) | Self::Thinking(text) | Self::Status(text) | Self::Error(text) => text.len(),
-            Self::ToolStart { id, name, input } => id.as_ref().map_or(0, String::len) + name.len() + input.len(),
-            Self::ToolUpdate { id, name, output } | Self::ToolEnd { id, name, output, .. } =>
-                id.as_ref().map_or(0, String::len) + name.len() + output.len(),
+            Self::Text(text) | Self::Thinking(text) | Self::Status(text) | Self::Error(text) => {
+                text.len()
+            }
+            Self::ToolStart { id, name, input } => {
+                id.as_ref().map_or(0, String::len) + name.len() + input.len()
+            }
+            Self::ToolUpdate { id, name, output }
+            | Self::ToolEnd {
+                id, name, output, ..
+            } => id.as_ref().map_or(0, String::len) + name.len() + output.len(),
             Self::Usage(_) => std::mem::size_of::<AgentUsage>(),
             Self::Done | Self::Closed => 0,
         }
     }
-    fn is_snapshot(&self) -> bool { matches!(self, Self::ToolUpdate { .. }) }
+    fn is_snapshot(&self) -> bool {
+        matches!(self, Self::ToolUpdate { .. })
+    }
     fn supersedes(&self, previous: &Self) -> bool {
         matches!((self, previous),
             (Self::ToolUpdate { id: Some(id), name, .. },
@@ -509,8 +585,19 @@ impl QueuedEvent for SessionEvent {
 /// or skips an intermediate snapshot under pressure. Final results are lossless.
 enum PendingEvent {
     Ready(SessionEvent),
-    Update { id: String, name: String, result: Arc<rpi_agent::AgentToolResult>, bytes: usize },
-    End { id: String, name: String, result: rpi_agent::AgentToolResult, failed: bool, bytes: usize },
+    Update {
+        id: String,
+        name: String,
+        result: Arc<rpi_agent::AgentToolResult>,
+        bytes: usize,
+    },
+    End {
+        id: String,
+        name: String,
+        result: rpi_agent::AgentToolResult,
+        failed: bool,
+        bytes: usize,
+    },
 }
 
 impl QueuedEvent for PendingEvent {
@@ -520,7 +607,9 @@ impl QueuedEvent for PendingEvent {
             Self::Update { bytes, .. } | Self::End { bytes, .. } => *bytes,
         }
     }
-    fn is_snapshot(&self) -> bool { matches!(self, Self::Update { .. }) }
+    fn is_snapshot(&self) -> bool {
+        matches!(self, Self::Update { .. })
+    }
     fn supersedes(&self, old: &Self) -> bool {
         matches!((self, old),
             (Self::Update { id, name, .. }, Self::Update { id: old_id, name: old_name, .. })
@@ -529,21 +618,36 @@ impl QueuedEvent for PendingEvent {
 }
 
 fn result_bytes(result: &rpi_agent::AgentToolResult) -> usize {
-    result.content.capacity() * std::mem::size_of::<rpi_agent::TextContentOrImage>() +
-    result.content.iter().map(|content| match content {
-        rpi_agent::TextContentOrImage::Text(text) => text.text.capacity(),
-        rpi_agent::TextContentOrImage::Image(image) => image.data.len() + image.mime_type.capacity(),
-    }).sum::<usize>() + json_bytes(&result.details) +
-        result.added_tool_names.capacity() * std::mem::size_of::<String>() +
-        result.added_tool_names.iter().map(String::capacity).sum::<usize>()
+    result.content.capacity() * std::mem::size_of::<rpi_agent::TextContentOrImage>()
+        + result
+            .content
+            .iter()
+            .map(|content| match content {
+                rpi_agent::TextContentOrImage::Text(text) => text.text.capacity(),
+                rpi_agent::TextContentOrImage::Image(image) => {
+                    image.data.len() + image.mime_type.capacity()
+                }
+            })
+            .sum::<usize>()
+        + json_bytes(&result.details)
+        + result.added_tool_names.capacity() * std::mem::size_of::<String>()
+        + result
+            .added_tool_names
+            .iter()
+            .map(String::capacity)
+            .sum::<usize>()
 }
 
 fn json_bytes(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::String(text) => text.len() + 32,
-        serde_json::Value::Array(values) => values.iter().map(json_bytes).sum::<usize>() + values.len() * 32,
-        serde_json::Value::Object(values) => values.iter()
-            .map(|(key, value)| key.len() + json_bytes(value) + 64).sum(),
+        serde_json::Value::Array(values) => {
+            values.iter().map(json_bytes).sum::<usize>() + values.len() * 32
+        }
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len() + json_bytes(value) + 64)
+            .sum(),
         _ => 32,
     }
 }
@@ -552,11 +656,24 @@ impl PendingEvent {
     fn into_session(self) -> SessionEvent {
         match self {
             Self::Ready(event) => event,
-            Self::Update { id, name, result, .. } => SessionEvent::ToolUpdate {
-                id: Some(id), name, output: tool_result_text(&result),
+            Self::Update {
+                id, name, result, ..
+            } => SessionEvent::ToolUpdate {
+                id: Some(id),
+                name,
+                output: tool_result_text(&result),
             },
-            Self::End { id, name, result, failed, .. } => SessionEvent::ToolEnd {
-                id: Some(id), name, output: tool_result_text(&result), failed,
+            Self::End {
+                id,
+                name,
+                result,
+                failed,
+                ..
+            } => SessionEvent::ToolEnd {
+                id: Some(id),
+                name,
+                output: tool_result_text(&result),
+                failed,
             },
         }
     }
@@ -581,16 +698,24 @@ impl rpi_agent::AgentEmitter for HostEmitter {
         }
         Box::pin(async move {
             if let Some(usage) = usage {
-                if pending.send(PendingEvent::Ready(SessionEvent::Usage(usage))).await.is_err() {
+                if pending
+                    .send(PendingEvent::Ready(SessionEvent::Usage(usage)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
-            if let Some(event) = event { let _ = pending.send(event).await; }
+            if let Some(event) = event {
+                let _ = pending.send(event).await;
+            }
         })
     }
     fn try_emit(&self, event: RpiEvent) {
         if matches!(event, RpiEvent::ToolExecutionUpdate { .. }) {
-            if let Some(event) = pending_event(event) { let _ = self.pending.try_send(event); }
+            if let Some(event) = pending_event(event) {
+                let _ = self.pending.try_send(event);
+            }
         }
     }
 }
@@ -696,11 +821,19 @@ enum Command {
 const COMMAND_RECORDS: usize = 65;
 const COMMAND_BYTES: usize = 32 * 1024 * 1024;
 
-struct CommandCharge { bytes: usize, total: Arc<AtomicUsize> }
-impl Drop for CommandCharge {
-    fn drop(&mut self) { self.total.fetch_sub(self.bytes, Ordering::Relaxed); }
+struct CommandCharge {
+    bytes: usize,
+    total: Arc<AtomicUsize>,
 }
-struct QueuedCommand { command: Command, _charge: CommandCharge }
+impl Drop for CommandCharge {
+    fn drop(&mut self) {
+        self.total.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+struct QueuedCommand {
+    command: Command,
+    _charge: CommandCharge,
+}
 
 /// Host wakeup callback shared with the worker and forwarder.
 ///
@@ -727,7 +860,9 @@ impl Wake {
     }
 
     pub fn signal(&self) {
-        if self.0.pending.swap(true, Ordering::AcqRel) { return; }
+        if self.0.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let callback = self.0.callback.lock().ok().and_then(|slot| slot.clone());
         if let Some(callback) = callback {
             callback();
@@ -819,7 +954,9 @@ impl EmbeddedSession {
         if self.closed {
             return Err("The agent session has closed".into());
         }
-        let bytes = prompt.len().saturating_add(context.as_ref().map_or(0, String::len));
+        let bytes = prompt
+            .len()
+            .saturating_add(context.as_ref().map_or(0, String::len));
         self.enqueue_command(bytes, false, || Command::Prompt {
             text: prompt.to_owned(),
             fallback: context.map(|context| (resume.map(str::to_owned), context)),
@@ -842,25 +979,50 @@ impl EmbeddedSession {
         self.enqueue_command(0, false, || Command::Thinking(level))
     }
 
-    fn enqueue_command(&self, bytes: usize, abort: bool, make: impl FnOnce() -> Command) -> Result<(), String> {
+    fn enqueue_command(
+        &self,
+        bytes: usize,
+        abort: bool,
+        make: impl FnOnce() -> Command,
+    ) -> Result<(), String> {
         let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if self.commands.is_closed() { return Err("The agent session has closed".into()); }
+        if self.commands.is_closed() {
+            return Err("The agent session has closed".into());
+        }
         // Reserve one abort slot and one shutdown slot. A full reserved tail
         // already contains an abort after every admitted ordinary command.
         if self.commands.capacity() <= if abort { 1 } else { 2 } {
-            return if abort { Ok(()) } else { Err("The agent input queue is full".into()) };
+            return if abort {
+                Ok(())
+            } else {
+                Err("The agent input queue is full".into())
+            };
         }
         let mut queued = self.command_bytes.load(Ordering::Relaxed);
         loop {
-            let total = queued.checked_add(bytes).filter(|total| *total <= COMMAND_BYTES)
+            let total = queued
+                .checked_add(bytes)
+                .filter(|total| *total <= COMMAND_BYTES)
                 .ok_or_else(|| "The agent input queue is full".to_string())?;
-            match self.command_bytes.compare_exchange_weak(queued, total, Ordering::Relaxed, Ordering::Relaxed) {
+            match self.command_bytes.compare_exchange_weak(
+                queued,
+                total,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(current) => queued = current,
             }
         }
-        let _charge = CommandCharge { bytes, total: Arc::clone(&self.command_bytes) };
-        self.commands.try_send(QueuedCommand { command: make(), _charge })
+        let _charge = CommandCharge {
+            bytes,
+            total: Arc::clone(&self.command_bytes),
+        };
+        self.commands
+            .try_send(QueuedCommand {
+                command: make(),
+                _charge,
+            })
             .map_err(|_| "The agent session has closed".to_string())
     }
 
@@ -868,10 +1030,15 @@ impl EmbeddedSession {
     pub fn poll(&mut self) -> Vec<SessionEvent> {
         self.wake.acknowledge();
         let (events, more) = self.events.drain();
-        if events.iter().any(|event| matches!(event, SessionEvent::Closed)) {
+        if events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Closed))
+        {
             self.closed = true;
         }
-        if more { self.wake.signal(); }
+        if more {
+            self.wake.signal();
+        }
         events
     }
 }
@@ -882,7 +1049,10 @@ impl Drop for EmbeddedSession {
         self.shutting_down.store(true, Ordering::Release);
         let _ = self.commands.try_send(QueuedCommand {
             command: Command::Shutdown,
-            _charge: CommandCharge { bytes: 0, total: Arc::clone(&self.command_bytes) },
+            _charge: CommandCharge {
+                bytes: 0,
+                total: Arc::clone(&self.command_bytes),
+            },
         });
         self.events.close();
     }
@@ -910,16 +1080,28 @@ fn run_worker(
         Ok(runtime) => runtime,
         Err(error) => {
             for event in [
-                SessionEvent::Error(format!("Could not start the embedded agent runtime: {error}")),
-                SessionEvent::Done, SessionEvent::Closed,
+                SessionEvent::Error(format!(
+                    "Could not start the embedded agent runtime: {error}"
+                )),
+                SessionEvent::Done,
+                SessionEvent::Closed,
             ] {
-                if events.send_blocking(event).is_err() { break; }
+                if events.send_blocking(event).is_err() {
+                    break;
+                }
                 wake.signal();
             }
             return;
         }
     };
-    runtime.block_on(run_session(options, commands, events, session_id, shutting_down, wake));
+    runtime.block_on(run_session(
+        options,
+        commands,
+        events,
+        session_id,
+        shutting_down,
+        wake,
+    ));
 }
 
 async fn run_session(
@@ -973,9 +1155,12 @@ async fn run_session(
             return;
         }
         Err(error) => {
-            send_fatal(&events,
-            &wake,
-            format!("Could not resolve the agent model: {error}"),).await;
+            send_fatal(
+                &events,
+                &wake,
+                format!("Could not resolve the agent model: {error}"),
+            )
+            .await;
             return;
         }
     };
@@ -1039,10 +1224,16 @@ async fn run_session(
     drop(broadcast_rx);
     let pending = Arc::new(EventQueue::timed(phase_hook.as_ref(), true));
     let emitter = Arc::new(HostEmitter {
-        pending: Arc::clone(&pending), delta_arrival: delta_arrival_hook,
+        pending: Arc::clone(&pending),
+        delta_arrival: delta_arrival_hook,
     });
     if let Err(error) = harness.set_agent_emitter(Some(emitter)).await {
-        send_fatal(&events, &wake, format!("Could not install host event delivery: {error}")).await;
+        send_fatal(
+            &events,
+            &wake,
+            format!("Could not install host event delivery: {error}"),
+        )
+        .await;
         return;
     }
     if let Some(hook) = &phase_hook {
@@ -1069,9 +1260,11 @@ async fn run_session(
         }
         let hooks: Arc<dyn rpi_ai::ProviderHooks> = Arc::new(HostTimingHooks(hook));
         if let Err(error) = harness.set_provider_hooks(Some(hooks)).await {
-            let _ = events.send(SessionEvent::Status(format!(
-                "Could not install timing hooks: {error}"
-            ))).await;
+            let _ = events
+                .send(SessionEvent::Status(format!(
+                    "Could not install timing hooks: {error}"
+                )))
+                .await;
         }
     }
 
@@ -1084,9 +1277,9 @@ async fn run_session(
     let running = Arc::new(AtomicBool::new(false));
     let forward_running = Arc::clone(&running);
     let (finished, mut completions) = tokio::sync::mpsc::channel::<Option<String>>(1);
-    let forward_timing = phase_hook.clone().filter(|_| {
-        std::env::var_os("KATHAMO_STREAM_TIMINGS").is_some_and(|value| value != "0")
-    });
+    let forward_timing = phase_hook
+        .clone()
+        .filter(|_| std::env::var_os("KATHAMO_STREAM_TIMINGS").is_some_and(|value| value != "0"));
     let forwarder = tokio::spawn(async move {
         let _reload = reload;
         loop {
@@ -1122,11 +1315,17 @@ async fn run_session(
     let mut prompt_task = None;
     while let Some(command) = commands.recv().await {
         let QueuedCommand { command, _charge } = command;
-        if shutting_down.load(Ordering::Acquire) { break; }
+        if shutting_down.load(Ordering::Acquire) {
+            break;
+        }
         match command {
             Command::Prompt { mut text, fallback } => {
                 if running.swap(true, Ordering::SeqCst) {
-                    let _ = events.send(SessionEvent::Error("The agent is already running a prompt".into(),)).await;
+                    let _ = events
+                        .send(SessionEvent::Error(
+                            "The agent is already running a prompt".into(),
+                        ))
+                        .await;
                     wake.signal();
                     continue;
                 }
@@ -1164,7 +1363,9 @@ async fn run_session(
     pending.close();
     harness.request_stop_round();
     let _ = harness.abort_reclaiming(true).await;
-    if let Some(task) = prompt_task { let _ = task.await; }
+    if let Some(task) = prompt_task {
+        let _ = task.await;
+    }
     forwarder.abort();
     let _ = events.send(SessionEvent::Closed).await;
     wake.signal();
@@ -1187,14 +1388,24 @@ fn describe_build_error(error: BuildError) -> String {
 }
 
 async fn send_fatal(events: &EventQueue<SessionEvent>, wake: &Wake, message: String) {
-    for event in [SessionEvent::Error(message), SessionEvent::Done, SessionEvent::Closed] {
-        if events.send(event).await.is_err() { break; }
+    for event in [
+        SessionEvent::Error(message),
+        SessionEvent::Done,
+        SessionEvent::Closed,
+    ] {
+        if events.send(event).await.is_err() {
+            break;
+        }
         wake.signal();
     }
 }
 
 fn finalized_usage(event: &RpiEvent) -> Option<AgentUsage> {
-    let RpiEvent::MessageEnd { message: AgentMessage::Assistant(assistant), .. } = event else {
+    let RpiEvent::MessageEnd {
+        message: AgentMessage::Assistant(assistant),
+        ..
+    } = event
+    else {
         return None;
     };
     let usage = &assistant.usage;
@@ -1209,35 +1420,76 @@ fn finalized_usage(event: &RpiEvent) -> Option<AgentUsage> {
 
 fn pending_event(event: RpiEvent) -> Option<PendingEvent> {
     let event = match event {
-        RpiEvent::MessageUpdate { assistant_message_event, .. } => match assistant_message_event {
+        RpiEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event {
             AssistantMessageEvent::TextDelta { delta, .. } => SessionEvent::Text(delta),
             AssistantMessageEvent::ThinkingDelta { delta, .. } => SessionEvent::Thinking(delta),
             _ => return None,
         },
-        RpiEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
-            if let Some(hook) = TOOL_ARRIVAL_HOOK.get() { hook(&tool_call_id); }
+        RpiEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => {
+            if let Some(hook) = TOOL_ARRIVAL_HOOK.get() {
+                hook(&tool_call_id);
+            }
             SessionEvent::ToolStart {
-                id: Some(tool_call_id), name: tool_name,
+                id: Some(tool_call_id),
+                name: tool_name,
                 input: serde_json::to_string(&args).unwrap_or_default(),
             }
         }
-        RpiEvent::ToolExecutionUpdate { tool_call_id, tool_name, partial_result, .. } => {
+        RpiEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            partial_result,
+            ..
+        } => {
             tool_output_arrived(&tool_call_id, &partial_result);
             let bytes = tool_call_id.len() + tool_name.len() + result_bytes(&partial_result);
-            return Some(PendingEvent::Update { id: tool_call_id, name: tool_name, result: partial_result, bytes });
+            return Some(PendingEvent::Update {
+                id: tool_call_id,
+                name: tool_name,
+                result: partial_result,
+                bytes,
+            });
         }
-        RpiEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
-            if let Some(hook) = TOOL_END_HOOK.get() { hook(&tool_call_id); }
+        RpiEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => {
+            if let Some(hook) = TOOL_END_HOOK.get() {
+                hook(&tool_call_id);
+            }
             tool_output_arrived(&tool_call_id, &result);
             let bytes = tool_call_id.len() + tool_name.len() + result_bytes(&result);
             return Some(PendingEvent::End {
-                id: tool_call_id, name: tool_name, result, failed: is_error, bytes,
+                id: tool_call_id,
+                name: tool_name,
+                result,
+                failed: is_error,
+                bytes,
             });
         }
-        RpiEvent::MessageEnd { message: AgentMessage::Assistant(assistant), .. }
-            if assistant.stop_reason == StopReason::Error =>
-                SessionEvent::Error(assistant.error_message.unwrap_or_else(|| "The agent encountered an error".into())),
-        RpiEvent::RetryScheduled { attempt, max_retries, delay_ms, error } => SessionEvent::Status(format!(
+        RpiEvent::MessageEnd {
+            message: AgentMessage::Assistant(assistant),
+            ..
+        } if assistant.stop_reason == StopReason::Error => SessionEvent::Error(
+            assistant
+                .error_message
+                .unwrap_or_else(|| "The agent encountered an error".into()),
+        ),
+        RpiEvent::RetryScheduled {
+            attempt,
+            max_retries,
+            delay_ms,
+            error,
+        } => SessionEvent::Status(format!(
             "Retrying model request (attempt {attempt}/{max_retries}; delay {delay_ms} ms): {error}"
         )),
         _ => return None,
@@ -1265,7 +1517,9 @@ fn tool_output_arrived(id: &str, result: &rpi_agent::AgentToolResult) {
 #[cfg(test)]
 async fn forward_event(event: RpiEvent, events: &EventQueue<SessionEvent>) -> bool {
     let sent_usage = if let Some(usage) = finalized_usage(&event) {
-        if events.send(SessionEvent::Usage(usage)).await.is_err() { return false; }
+        if events.send(SessionEvent::Usage(usage)).await.is_err() {
+            return false;
+        }
         true
     } else {
         false
@@ -1277,17 +1531,20 @@ async fn forward_event(event: RpiEvent, events: &EventQueue<SessionEvent>) -> bo
 }
 
 fn tool_result_text(result: &rpi_agent::AgentToolResult) -> String {
-    let (bytes, count) = result.content.iter().fold((0usize, 0usize), |(bytes, count), content| {
-        match content {
+    let (bytes, count) = result
+        .content
+        .iter()
+        .fold((0usize, 0usize), |(bytes, count), content| match content {
             rpi_agent::TextContentOrImage::Text(text) => (bytes + text.text.len(), count + 1),
             rpi_agent::TextContentOrImage::Image(_) => (bytes, count),
-        }
-    });
+        });
     let mut out = String::with_capacity(bytes + count.saturating_sub(1));
     let mut first = true;
     for content in &result.content {
         if let rpi_agent::TextContentOrImage::Text(text) = content {
-            if !first { out.push('\n'); }
+            if !first {
+                out.push('\n');
+            }
             first = false;
             out.push_str(&text.text);
         }
@@ -1330,18 +1587,43 @@ impl Login {
     }
 
     /// Explicitly choose API-key, browser OAuth, or supported headless device OAuth.
-    pub fn start_with_method(provider: &str, cwd: &Path, method: AuthMethod) -> Result<Self, String> {
+    pub fn start_with_method(
+        provider: &str,
+        cwd: &Path,
+        method: AuthMethod,
+    ) -> Result<Self, String> {
         let methods = auth_methods_for_cwd(provider, cwd);
         match method {
-            AuthMethod::ApiKey if !methods.api_key => return Err("This provider does not support API-key sign-in".into()),
-            AuthMethod::OAuth if !methods.oauth => return Err("This provider does not support OAuth sign-in".into()),
-            AuthMethod::DeviceCode if !matches!(provider, "openai-codex" | "openai-codex-device" | "github-copilot" | "kimi-code" | "factory-droid" | "muse-code" | "xai-oauth") => return Err("This provider does not support device-code sign-in".into()),
+            AuthMethod::ApiKey if !methods.api_key => {
+                return Err("This provider does not support API-key sign-in".into())
+            }
+            AuthMethod::OAuth if !methods.oauth => {
+                return Err("This provider does not support OAuth sign-in".into())
+            }
+            AuthMethod::DeviceCode
+                if !matches!(
+                    provider,
+                    "openai-codex"
+                        | "openai-codex-device"
+                        | "github-copilot"
+                        | "kimi-code"
+                        | "factory-droid"
+                        | "muse-code"
+                        | "xai-oauth"
+                ) =>
+            {
+                return Err("This provider does not support device-code sign-in".into())
+            }
             _ => {}
         }
         Self::start_selected(provider, cwd, Some(method))
     }
 
-    fn start_selected(provider: &str, cwd: &Path, method: Option<AuthMethod>) -> Result<Self, String> {
+    fn start_selected(
+        provider: &str,
+        cwd: &Path,
+        method: Option<AuthMethod>,
+    ) -> Result<Self, String> {
         let (event_tx, event_rx) = mpsc::channel();
         let (input_tx, input_rx) = mpsc::channel();
         let provider = provider.to_string();
@@ -1436,7 +1718,10 @@ fn login_worker(
             let _ = events.send(event);
         };
         let result = rpi_cli::native_auth::login(
-            &provider, &emit, &inputs, method == Some(AuthMethod::DeviceCode),
+            &provider,
+            &emit,
+            &inputs,
+            method == Some(AuthMethod::DeviceCode),
         );
         let _ = events.send(LoginEvent::Finished(result));
     } else if method.is_some() {
@@ -1598,7 +1883,10 @@ mod tests {
     #[tokio::test]
     async fn finalized_usage_is_emitted_once_with_partial_failures_and_unknown_prices() {
         let pending = Arc::new(EventQueue::default());
-        let emitter = HostEmitter { pending: Arc::clone(&pending), delta_arrival: None };
+        let emitter = HostEmitter {
+            pending: Arc::clone(&pending),
+            delta_arrival: None,
+        };
         for (stop_reason, cost) in [
             (StopReason::Stop, 0.25),
             (StopReason::Error, 0.0),
@@ -1613,24 +1901,41 @@ mod tests {
             assistant.stop_reason = stop_reason;
             assistant.error_message = Some("provider failed".into());
             let partial = Arc::new(assistant.clone());
-            rpi_agent::AgentEmitter::emit(&emitter, RpiEvent::MessageUpdate {
-                message_id: None,
-                message: Arc::clone(&partial),
-                assistant_message_event: AssistantMessageEvent::TextDelta {
-                    content_index: 0, delta: "partial".into(), partial,
+            rpi_agent::AgentEmitter::emit(
+                &emitter,
+                RpiEvent::MessageUpdate {
+                    message_id: None,
+                    message: Arc::clone(&partial),
+                    assistant_message_event: AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "partial".into(),
+                        partial,
+                    },
                 },
-            }).await;
-            rpi_agent::AgentEmitter::emit(&emitter, RpiEvent::MessageEnd {
-                message: AgentMessage::Assistant(Box::new(assistant)), message_id: None,
-            }).await;
+            )
+            .await;
+            rpi_agent::AgentEmitter::emit(
+                &emitter,
+                RpiEvent::MessageEnd {
+                    message: AgentMessage::Assistant(Box::new(assistant)),
+                    message_id: None,
+                },
+            )
+            .await;
             let (raw, more) = pending.drain();
             assert!(!more);
             let events: Vec<_> = raw.into_iter().map(PendingEvent::into_session).collect();
             assert_eq!(events[0], SessionEvent::Text("partial".into()));
-            assert_eq!(events[1], SessionEvent::Usage(AgentUsage {
-                input: 9_007_199_254_740_993, output: 12, cache_read: 34, cache_write: 56,
-                cost: (cost > 0.0).then_some(cost),
-            }));
+            assert_eq!(
+                events[1],
+                SessionEvent::Usage(AgentUsage {
+                    input: 9_007_199_254_740_993,
+                    output: 12,
+                    cache_read: 34,
+                    cache_write: 56,
+                    cost: (cost > 0.0).then_some(cost),
+                })
+            );
             if stop_reason == StopReason::Error {
                 assert_eq!(events[2], SessionEvent::Error("provider failed".into()));
                 assert_eq!(events.len(), 3);
@@ -1640,13 +1945,23 @@ mod tests {
         }
     }
 
-    fn test_session(events: Arc<EventQueue<SessionEvent>>) -> (EmbeddedSession, tokio::sync::mpsc::Receiver<QueuedCommand>) {
+    fn test_session(
+        events: Arc<EventQueue<SessionEvent>>,
+    ) -> (EmbeddedSession, tokio::sync::mpsc::Receiver<QueuedCommand>) {
         let (commands, receiver) = tokio::sync::mpsc::channel(COMMAND_RECORDS);
-        (EmbeddedSession {
-            events, commands, command_bytes: Arc::new(AtomicUsize::new(0)),
-            admission: Mutex::new(()), shutting_down: Arc::new(AtomicBool::new(false)),
-            session_id: Arc::new(Mutex::new(None)), wake: Wake::default(), closed: false,
-        }, receiver)
+        (
+            EmbeddedSession {
+                events,
+                commands,
+                command_bytes: Arc::new(AtomicUsize::new(0)),
+                admission: Mutex::new(()),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+                session_id: Arc::new(Mutex::new(None)),
+                wake: Wake::default(),
+                closed: false,
+            },
+            receiver,
+        )
     }
 
     #[test]
@@ -1654,8 +1969,12 @@ mod tests {
         let (mut session, _commands) = test_session(Arc::new(EventQueue::default()));
         let wakes = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&wakes);
-        session.wake.set(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
-        for _ in 0..10_000 { session.wake.signal(); }
+        session.wake.set(Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
+        for _ in 0..10_000 {
+            session.wake.signal();
+        }
         assert_eq!(wakes.load(Ordering::Relaxed), 1);
         assert!(session.poll().is_empty());
         session.wake.signal();
@@ -1666,19 +1985,28 @@ mod tests {
     fn wake_installation_and_replacement_rearm_preexisting_events() {
         let queue = Arc::new(EventQueue::default());
         let (mut session, _commands) = test_session(Arc::clone(&queue));
-        assert!(queue.try_send(SessionEvent::Text("before callback".into())).is_ok());
+        assert!(queue
+            .try_send(SessionEvent::Text("before callback".into()))
+            .is_ok());
         session.wake.signal(); // No callback yet; leaves a pending signal.
         let first = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&first);
-        session.set_wake(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+        session.set_wake(Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
         assert_eq!(first.load(Ordering::Relaxed), 1);
         session.wake.signal();
         assert_eq!(first.load(Ordering::Relaxed), 1);
         let replacement = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&replacement);
-        session.set_wake(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+        session.set_wake(Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
         assert_eq!(replacement.load(Ordering::Relaxed), 1);
-        assert_eq!(session.poll(), vec![SessionEvent::Text("before callback".into())]);
+        assert_eq!(
+            session.poll(),
+            vec![SessionEvent::Text("before callback".into())]
+        );
         session.wake.signal();
         assert_eq!(replacement.load(Ordering::Relaxed), 2);
     }
@@ -1701,7 +2029,9 @@ mod tests {
                 output.lock().unwrap().extend(session.poll());
                 session.wake.clone()
             };
-            if index == 0 { wake.signal(); }
+            if index == 0 {
+                wake.signal();
+            }
         });
         let wake = {
             let session = session.lock().unwrap();
@@ -1714,9 +2044,13 @@ mod tests {
         assert!(queue.try_send(SessionEvent::Text("second".into())).is_ok());
         wake.signal();
         assert_eq!(wakes.load(Ordering::Relaxed), 3);
-        assert_eq!(*received.lock().unwrap(), vec![
-            SessionEvent::Text("first".into()), SessionEvent::Text("second".into()),
-        ]);
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![
+                SessionEvent::Text("first".into()),
+                SessionEvent::Text("second".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1725,7 +2059,9 @@ mod tests {
         let (mut session, _commands) = test_session(Arc::clone(&queue));
         let wakes = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&wakes);
-        session.wake.set(Arc::new(move || { count.fetch_add(1, Ordering::Relaxed); }));
+        session.wake.set(Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+        }));
         let boundary = Arc::new(std::sync::Barrier::new(2));
         let producer_boundary = Arc::clone(&boundary);
         let wake = session.wake.clone();
@@ -1743,7 +2079,10 @@ mod tests {
             let events = session.poll();
             boundary.wait();
             if events.is_empty() {
-                assert!(wakes.load(Ordering::Relaxed) > 0, "queued delta lost its wake");
+                assert!(
+                    wakes.load(Ordering::Relaxed) > 0,
+                    "queued delta lost its wake"
+                );
                 assert_eq!(session.poll(), vec![SessionEvent::Text("delta".into())]);
             } else {
                 assert_eq!(events, vec![SessionEvent::Text("delta".into())]);
@@ -1762,18 +2101,26 @@ mod tests {
         let (mut session, _commands) = test_session(Arc::clone(&queue));
         let wakes = Arc::new(AtomicUsize::new(0));
         let wake_count = Arc::clone(&wakes);
-        session.wake.set(Arc::new(move || { wake_count.fetch_add(1, Ordering::Relaxed); }));
+        session.wake.set(Arc::new(move || {
+            wake_count.fetch_add(1, Ordering::Relaxed);
+        }));
         let pending = Arc::clone(&queue);
         let done = tokio::spawn(async move { pending.send(SessionEvent::Done).await });
         tokio::task::yield_now().await;
         assert!(!done.is_finished(), "backpressure must asynchronously wait");
         assert_eq!(session.poll().len(), POLL_RECORDS);
-        assert_eq!(wakes.load(Ordering::Relaxed), 1, "backlog must resignal the host");
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "backlog must resignal the host"
+        );
         done.await.unwrap().unwrap();
         let mut remaining = Vec::new();
         loop {
             let batch = session.poll();
-            if batch.is_empty() { break; }
+            if batch.is_empty() {
+                break;
+            }
             remaining.extend(batch);
         }
         assert_eq!(remaining.len(), EVENT_QUEUE_RECORDS - POLL_RECORDS + 1);
@@ -1787,13 +2134,17 @@ mod tests {
         for _ in 0..EVENT_QUEUE_BYTES / chunk.len() {
             assert!(queue.try_send(SessionEvent::Text(chunk.clone())).is_ok());
         }
-        assert!(queue.try_send(SessionEvent::Text("overflow".into())).is_err());
+        assert!(queue
+            .try_send(SessionEvent::Text("overflow".into()))
+            .is_err());
         let (batch, more) = queue.drain();
         assert_eq!(batch.len(), 2);
         assert!(more);
         let oversized = SessionEvent::ToolEnd {
-            id: Some("large".into()), name: "bash".into(),
-            output: "x".repeat(EVENT_QUEUE_BYTES + 1), failed: false,
+            id: Some("large".into()),
+            name: "bash".into(),
+            output: "x".repeat(EVENT_QUEUE_BYTES + 1),
+            failed: false,
         };
         let pending = Arc::clone(&queue);
         let blocked = tokio::spawn(async move { pending.send(oversized).await });
@@ -1802,7 +2153,9 @@ mod tests {
         queue.close();
         assert!(blocked.await.unwrap().is_err());
         let exclusive = EventQueue::default();
-        assert!(exclusive.try_send(SessionEvent::Text("x".repeat(EVENT_QUEUE_BYTES + 1))).is_ok());
+        assert!(exclusive
+            .try_send(SessionEvent::Text("x".repeat(EVENT_QUEUE_BYTES + 1)))
+            .is_ok());
         assert!(exclusive.try_send(SessionEvent::Done).is_err());
         let (events, more) = exclusive.drain();
         assert_eq!(events.len(), 1);
@@ -1813,29 +2166,51 @@ mod tests {
     async fn reliable_emitter_coalesces_before_projection_and_preserves_boundaries() {
         use rpi_agent::AgentEmitter;
         let pending = Arc::new(EventQueue::default());
-        let emitter = HostEmitter { pending: Arc::clone(&pending), delta_arrival: None };
-        emitter.emit(RpiEvent::ToolExecutionStart {
-            tool_call_id: "a".into(), tool_name: "bash".into(), args: serde_json::json!({}),
-        }).await;
+        let emitter = HostEmitter {
+            pending: Arc::clone(&pending),
+            delta_arrival: None,
+        };
+        emitter
+            .emit(RpiEvent::ToolExecutionStart {
+                tool_call_id: "a".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({}),
+            })
+            .await;
         let update = |text: &str| RpiEvent::ToolExecutionUpdate {
-            tool_call_id: "a".into(), tool_name: "bash".into(), args: serde_json::json!({}),
+            tool_call_id: "a".into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({}),
             partial_result: Arc::new(rpi_agent::AgentToolResult {
-                content: vec![rpi_agent::TextContentOrImage::text(text)], ..Default::default()
+                content: vec![rpi_agent::TextContentOrImage::text(text)],
+                ..Default::default()
             }),
         };
-        for _ in 0..1000 { emitter.try_emit(update("old")); }
+        for _ in 0..1000 {
+            emitter.try_emit(update("old"));
+        }
         emitter.try_emit(update("latest"));
         assert_eq!(pending.state.lock().unwrap().events.len(), 2);
-        emitter.emit(RpiEvent::RetryScheduled {
-            attempt: 1, max_retries: 2, delay_ms: 1, error: "boundary".into(),
-        }).await;
+        emitter
+            .emit(RpiEvent::RetryScheduled {
+                attempt: 1,
+                max_retries: 2,
+                delay_ms: 1,
+                error: "boundary".into(),
+            })
+            .await;
         emitter.try_emit(update("after"));
-        emitter.emit(RpiEvent::ToolExecutionEnd {
-            tool_call_id: "a".into(), tool_name: "bash".into(), is_error: false,
-            result: rpi_agent::AgentToolResult {
-                content: vec![rpi_agent::TextContentOrImage::text("final")], ..Default::default()
-            },
-        }).await;
+        emitter
+            .emit(RpiEvent::ToolExecutionEnd {
+                tool_call_id: "a".into(),
+                tool_name: "bash".into(),
+                is_error: false,
+                result: rpi_agent::AgentToolResult {
+                    content: vec![rpi_agent::TextContentOrImage::text("final")],
+                    ..Default::default()
+                },
+            })
+            .await;
         let (raw, more) = pending.drain();
         assert!(!more);
         let events: Vec<_> = raw.into_iter().map(PendingEvent::into_session).collect();
@@ -1852,9 +2227,13 @@ mod tests {
     fn embedded_commands_bound_bytes_and_reserve_abort_shutdown_slots() {
         let (mut session, mut receiver) = test_session(Arc::new(EventQueue::default()));
         assert!(session.send_prompt(&"x".repeat(COMMAND_BYTES + 1)).is_err());
-        for _ in 0..COMMAND_RECORDS - 2 { session.set_thinking_level("medium").unwrap(); }
+        for _ in 0..COMMAND_RECORDS - 2 {
+            session.set_thinking_level("medium").unwrap();
+        }
         assert!(session.send_prompt("full").is_err());
-        for _ in 0..1000 { session.cancel().unwrap(); }
+        for _ in 0..1000 {
+            session.cancel().unwrap();
+        }
         assert_eq!(session.commands.capacity(), 1);
         drop(session);
         let mut count = 0;
@@ -1872,8 +2251,10 @@ mod tests {
         let first = PathBuf::from(format!("/auth-cache-test/{}", uuid::Uuid::new_v4()));
         let second = PathBuf::from(format!("/auth-cache-test/{}", uuid::Uuid::new_v4()));
         let provider = "project-specific-oauth-test";
-        EXTENSION_OAUTH_METHODS.write().unwrap()
-            .insert(first.clone(), Arc::new([provider.to_owned()].into_iter().collect()));
+        EXTENSION_OAUTH_METHODS.write().unwrap().insert(
+            first.clone(),
+            Arc::new([provider.to_owned()].into_iter().collect()),
+        );
         assert!(cached_auth_methods(provider, &first).oauth);
         assert!(!cached_auth_methods(provider, &second).oauth);
         assert!(!auth_methods(provider).oauth);
@@ -1920,22 +2301,28 @@ mod tests {
             "m",
             0,
         ));
-        forward_event(RpiEvent::MessageUpdate {
-            message_id: None,
-            message: Arc::clone(&partial),
-            assistant_message_event: AssistantMessageEvent::TextDelta {
-                content_index: 0,
-                delta: "hello".into(),
-                partial: Arc::clone(&partial),
+        forward_event(
+            RpiEvent::MessageUpdate {
+                message_id: None,
+                message: Arc::clone(&partial),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "hello".into(),
+                    partial: Arc::clone(&partial),
+                },
             },
-        },
-        &tx,).await;
-        forward_event(RpiEvent::ToolExecutionStart {
-            tool_call_id: "t1".into(),
-            tool_name: "bash".into(),
-            args: serde_json::json!({"command": "printf hi"}),
-        },
-        &tx,).await;
+            &tx,
+        )
+        .await;
+        forward_event(
+            RpiEvent::ToolExecutionStart {
+                tool_call_id: "t1".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({"command": "printf hi"}),
+            },
+            &tx,
+        )
+        .await;
         let result = rpi_agent::AgentToolResult {
             content: vec![rpi_agent::TextContentOrImage::text("hi")],
             details: serde_json::Value::Null,
@@ -1943,24 +2330,33 @@ mod tests {
             added_tool_names: Vec::new(),
             terminate: false,
         };
-        forward_event(RpiEvent::ToolExecutionEnd {
-            tool_call_id: "t1".into(),
-            tool_name: "bash".into(),
-            result,
-            is_error: false,
-        },
-        &tx,).await;
-        forward_event(RpiEvent::RetryScheduled {
-            attempt: 1,
-            max_retries: 3,
-            delay_ms: 250,
-            error: "busy".into(),
-        },
-        &tx,).await;
-        forward_event(RpiEvent::AgentEnd {
-            messages: Vec::new(),
-        },
-        &tx,).await;
+        forward_event(
+            RpiEvent::ToolExecutionEnd {
+                tool_call_id: "t1".into(),
+                tool_name: "bash".into(),
+                result,
+                is_error: false,
+            },
+            &tx,
+        )
+        .await;
+        forward_event(
+            RpiEvent::RetryScheduled {
+                attempt: 1,
+                max_retries: 3,
+                delay_ms: 250,
+                error: "busy".into(),
+            },
+            &tx,
+        )
+        .await;
+        forward_event(
+            RpiEvent::AgentEnd {
+                messages: Vec::new(),
+            },
+            &tx,
+        )
+        .await;
         let (events, more) = tx.drain();
         assert!(!more);
         assert!(matches!(&events[0], SessionEvent::Text(text) if text == "hello"));

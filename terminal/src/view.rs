@@ -265,7 +265,8 @@ async fn yield_to_ui() {
             cx.waker().wake_by_ref();
             std::task::Poll::Pending
         }
-    }).await;
+    })
+    .await;
 }
 
 struct OutputChunk {
@@ -326,10 +327,14 @@ impl TerminalView {
 
         let focus_handle = cx.focus_handle();
 
-        let (stdin_writer, input_errors) = QueuedWriter::new(stdin_writer, cx.background_executor());
+        let (stdin_writer, input_errors) =
+            QueuedWriter::new(stdin_writer, cx.background_executor());
         let input_error_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             while let Ok(error) = input_errors.recv_async().await {
-                if this.update(cx, |view, cx| view.report_io_error(error, cx)).is_err() {
+                if this
+                    .update(cx, |view, cx| view.report_io_error(error, cx))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -363,21 +368,27 @@ impl TerminalView {
         let reader_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             if let Some(scrollback) = scrollback.filter(|text| !text.is_empty()) {
                 for bytes in scrollback.as_bytes().chunks(MAX_COALESCE_BYTES) {
-                    if this.update(cx, |view, cx| {
-                        // Raw restoration deliberately bypasses shell markers,
-                        // agent OSC extraction and capture, like the old seed path.
-                        view.state.feed_raw(bytes);
-                        view.screen_revision.fetch_add(1, Ordering::Relaxed);
-                        cx.notify();
-                    }).is_err() {
+                    if this
+                        .update(cx, |view, cx| {
+                            // Raw restoration deliberately bypasses shell markers,
+                            // agent OSC extraction and capture, like the old seed path.
+                            view.state.feed_raw(bytes);
+                            view.screen_revision.fetch_add(1, Ordering::Relaxed);
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                     yield_to_ui().await;
                 }
-                if this.update(cx, |view, cx| {
-                    view.state.scroll_to_bottom();
-                    cx.notify();
-                }).is_err() {
+                if this
+                    .update(cx, |view, cx| {
+                        view.state.scroll_to_bottom();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -953,18 +964,23 @@ impl TerminalView {
         if self.search_refresh_task.is_some() {
             return;
         }
-        self.search_refresh_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            cx.background_executor().timer(remaining).await;
-            let _ = this.update(cx, |view, cx| {
-                view.search_refresh_task = None;
-                if view.search_refresh_pending && view.search.is_active() && view.visible_recently() {
-                    view.search.refresh(&view.state);
-                    view.search_last_refresh = Some(std::time::Instant::now());
-                    view.search_refresh_pending = false;
-                    cx.notify();
-                }
-            });
-        }));
+        self.search_refresh_task = Some(cx.spawn(
+            async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+                cx.background_executor().timer(remaining).await;
+                let _ = this.update(cx, |view, cx| {
+                    view.search_refresh_task = None;
+                    if view.search_refresh_pending
+                        && view.search.is_active()
+                        && view.visible_recently()
+                    {
+                        view.search.refresh(&view.state);
+                        view.search_last_refresh = Some(std::time::Instant::now());
+                        view.search_refresh_pending = false;
+                        cx.notify();
+                    }
+                });
+            },
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -1977,9 +1993,9 @@ impl Render for TerminalView {
         let grid_changed = grid_size != self.last_grid_size;
         self.last_grid_size = grid_size;
         let search_due = self.search_refresh_pending
-            && self.search_last_refresh.is_none_or(|last| {
-                now.duration_since(last) >= SEARCH_REFRESH_MIN_INTERVAL
-            });
+            && self
+                .search_last_refresh
+                .is_none_or(|last| now.duration_since(last) >= SEARCH_REFRESH_MIN_INTERVAL);
         if self.search.is_active() && (was_hidden || grid_changed || search_due) {
             self.search.refresh(&self.state);
             self.search_last_refresh = Some(now);

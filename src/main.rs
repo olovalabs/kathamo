@@ -909,7 +909,8 @@ fn chat_tool_output_block(text: SharedString, is_error: bool, tokens: ThemeToken
 }
 
 fn shell_command(input: &str, parsed: Option<&serde_json::Value>) -> String {
-    parsed.and_then(|value| {
+    parsed
+        .and_then(|value| {
             value
                 .get("command")
                 .or_else(|| value.get("cmd"))
@@ -1781,7 +1782,10 @@ fn chat_row_contains(row: &ChatRow, message_index: usize) -> bool {
 }
 
 fn supported_thinking_effort(level: &str) -> bool {
-    matches!(level, "auto" | "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+    matches!(
+        level,
+        "auto" | "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
 }
 
 struct PaneChat {
@@ -1896,13 +1900,18 @@ impl PaneChat {
                 count.to_string()
             }
         }
-        let cost = usage.cost.map(|cost| format!("~${cost:.4}"))
+        let cost = usage
+            .cost
+            .map(|cost| format!("~${cost:.4}"))
             .unwrap_or_else(|| "Cost —".into());
         self.usage_label = format!(
             "In {} · Out {} · Cache R {} / W {} · {cost}",
-            compact(usage.input), compact(usage.output),
-            compact(usage.cache_read), compact(usage.cache_write),
-        ).into();
+            compact(usage.input),
+            compact(usage.output),
+            compact(usage.cache_read),
+            compact(usage.cache_write),
+        )
+        .into();
         self.usage_detail = format!(
             "Conversation totals from completed model responses: {} uncached input tokens, {} output tokens, {} cache-read tokens, {} cache-write tokens. {}",
             usage.input, usage.output, usage.cache_read, usage.cache_write,
@@ -1957,14 +1966,18 @@ impl PaneChat {
     }
 
     fn ensure_agent(&mut self, cwd: PathBuf) -> Result<(), String> {
-        if self.running || (self.bridge.is_some() && self.bridge_model == self.selected_model
-            && self.cwd.as_ref() == Some(&cwd)) {
+        if self.running
+            || (self.bridge.is_some()
+                && self.bridge_model == self.selected_model
+                && self.cwd.as_ref() == Some(&cwd))
+        {
             return Ok(());
         }
         self.bridge = None;
         let selector = self.selected_model.as_ref().map(agent_model_selector);
         self.bridge_resume = self.rpi_session_id.clone();
-        let bridge = ModelBridge::spawn_resumed(&cwd, self.bridge_resume.as_deref(), selector.as_deref())?;
+        let bridge =
+            ModelBridge::spawn_resumed(&cwd, self.bridge_resume.as_deref(), selector.as_deref())?;
         if self
             .selected_model
             .as_ref()
@@ -2936,7 +2949,10 @@ impl AppState {
                     pane.restore_draft = Some(saved_pane.draft.clone());
                     pane.chat.active = saved_pane.chat_active;
                     pane.chat.fast_mode = saved_pane.chat.fast_mode;
-                    pane.chat.thinking_override = saved_pane.chat.thinking_override.clone()
+                    pane.chat.thinking_override = saved_pane
+                        .chat
+                        .thinking_override
+                        .clone()
                         .filter(|level| supported_thinking_effort(level));
                     // A pane keeps exactly the model it was using. Only panes
                     // that never had a choice adopt the app default.
@@ -3365,7 +3381,12 @@ impl AppState {
             }
             pty_session::PreparedPty::spawn(pair, cmd)
         });
-        let pty_session::PendingPty { reader, writer, control, events } = pending;
+        let pty_session::PendingPty {
+            reader,
+            writer,
+            control,
+            events,
+        } = pending;
 
         let config = TerminalConfig {
             font_family: MONO_FONT.into(),
@@ -3444,7 +3465,8 @@ impl AppState {
                     }
                 }
             }
-        }).detach();
+        })
+        .detach();
 
         // Shell-integration events arrive on the UI thread from the reader task.
         // The subscription is stored on the pane so it survives until the pane
@@ -3906,7 +3928,8 @@ impl AppState {
                     // background; shell output and cached PTY evidence cannot
                     // overwrite an agent turn.
                     if pane.chat.active || pane.chat.running {
-                        let next = if pane.chat.running && pane.chat.status != SessionStatus::Error {
+                        let next = if pane.chat.running && pane.chat.status != SessionStatus::Error
+                        {
                             SessionStatus::Working
                         } else if pane.chat.status == SessionStatus::Idle && focused {
                             SessionStatus::Active
@@ -5047,8 +5070,7 @@ impl AppState {
     }
 
     fn focus_pane(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focused_pane_id.is_some_and(|old| old != pane_id) {
-        }
+        if self.focused_pane_id.is_some_and(|old| old != pane_id) {}
         self.active_view = ActiveView::Workspace;
         self.focused_pane_id = Some(pane_id);
         if let Some(&(p_idx, s_idx, _)) = self.pane_index.get(&pane_id) {
@@ -5092,8 +5114,7 @@ impl AppState {
     }
 
     fn focus_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focused_pane_id.is_some_and(|old| old != pane_id) {
-        }
+        if self.focused_pane_id.is_some_and(|old| old != pane_id) {}
         if self
             .pane_ref(pane_id)
             .is_some_and(|p| p.chat.auth.is_some())
@@ -5768,7 +5789,9 @@ impl AppState {
         let level = pane.chat.mode_thinking_level().to_owned();
         if let Some(bridge) = pane.chat.bridge.as_mut() {
             if let Err(error) = bridge.set_thinking_level(&level) {
-                pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+                pane.chat
+                    .messages
+                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
             }
         }
         self.schedule_workspace_save(cx);
@@ -5811,7 +5834,11 @@ impl AppState {
                 state.set_highlighter("bash", cx);
             }
             state.set_placeholder(
-                if active { "Message the agent…" } else { "Run commands" },
+                if active {
+                    "Message the agent…"
+                } else {
+                    "Run commands"
+                },
                 window,
                 cx,
             );
@@ -6062,7 +6089,10 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(auth) = self.pane_ref(pane_id).and_then(|pane| pane.chat.auth.as_ref()) else {
+        let Some(auth) = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.chat.auth.as_ref())
+        else {
             return;
         };
         let methods = agent_auth::auth_methods(&provider, &auth.cwd);
@@ -6377,11 +6407,16 @@ impl AppState {
                             pane.chat.bridge = Some(bridge);
                         }
                     }
-                    if let Some(error) = pane.chat.conversation.as_mut()
+                    if let Some(error) = pane
+                        .chat
+                        .conversation
+                        .as_mut()
                         .and_then(conversations::Log::take_error)
                     {
                         // Persistence failures are visible, but never logged recursively.
-                        pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+                        pane.chat
+                            .messages
+                            .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
                         pane.chat.mark_active_dirty();
                         changed = true;
                     }
@@ -6397,12 +6432,17 @@ impl AppState {
                     }
                     if pane.chat.auth_refresh_pending && !pane.chat.running {
                         let mut retry = false;
-                        let thinking = pane.chat.bridge_model.as_ref()
+                        let thinking = pane
+                            .chat
+                            .bridge_model
+                            .as_ref()
                             .filter(|model| model.supports_reasoning_effort())
                             .map(|_| pane.chat.mode_thinking_level().to_owned());
                         if let Some(bridge) = pane.chat.bridge.as_mut() {
                             let result = bridge.restart_after_auth().and_then(|()| {
-                                thinking.as_deref().map_or(Ok(()), |level| bridge.set_thinking_level(level))
+                                thinking
+                                    .as_deref()
+                                    .map_or(Ok(()), |level| bridge.set_thinking_level(level))
                             });
                             match result {
                                 Ok(()) => {}
@@ -6557,8 +6597,12 @@ impl AppState {
         if trimmed == "/fast" {
             input.update(cx, |state, cx| state.set_value("", window, cx));
             self.toggle_fast_mode(pane_id, cx);
-            if !self.pane_ref(pane_id).is_some_and(|pane| pane.chat.selected_model.as_ref()
-                .is_some_and(|model| model.supports_reasoning_effort())) {
+            if !self.pane_ref(pane_id).is_some_and(|pane| {
+                pane.chat
+                    .selected_model
+                    .as_ref()
+                    .is_some_and(|model| model.supports_reasoning_effort())
+            }) {
                 return;
             }
             let fast = self
@@ -6585,12 +6629,20 @@ impl AppState {
             let level = trimmed.trim_start_matches("/thinking").trim();
             let status = if !supported_thinking_effort(level) {
                 "Usage: /thinking auto|inherit|off|minimal|low|medium|high|xhigh|max.".to_owned()
-            } else if !pane.chat.selected_model.as_ref().is_some_and(|model|
-                model.supports_reasoning_effort()) {
+            } else if !pane
+                .chat
+                .selected_model
+                .as_ref()
+                .is_some_and(|model| model.supports_reasoning_effort())
+            {
                 "Choose a Gemini or Claude Antigravity model to adjust reasoning effort.".to_owned()
             } else {
-                let result = pane.chat.bridge.as_mut()
-                    .map(|bridge| bridge.set_thinking_level(level)).unwrap_or(Ok(()));
+                let result = pane
+                    .chat
+                    .bridge
+                    .as_mut()
+                    .map(|bridge| bridge.set_thinking_level(level))
+                    .unwrap_or(Ok(()));
                 match result {
                     Ok(()) => {
                         pane.chat.thinking_override = Some(level.to_owned());
@@ -6600,14 +6652,19 @@ impl AppState {
                 }
             };
             input.update(cx, |state, cx| state.set_value("", window, cx));
-            pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Status, status)));
+            pane.chat
+                .messages
+                .push(Arc::new(ChatMessage::new(ChatRole::Status, status)));
             self.schedule_workspace_save(cx);
             cx.notify();
             return;
         }
-        if pane.chat.visible_running() { return; }
+        if pane.chat.visible_running() {
+            return;
+        }
         if pane.chat.conversation_title().is_none()
-            && let Some(title) = agent_title_from_prompt(trimmed) {
+            && let Some(title) = agent_title_from_prompt(trimmed)
+        {
             pane.chat.set_prompt_title(title);
         }
         pane.chat.startup_error = None;
@@ -6658,7 +6715,9 @@ impl AppState {
             }
             Err(error) => {
                 pane.chat.status = SessionStatus::Error;
-                pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+                pane.chat
+                    .messages
+                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
             }
         }
         pane.chat.autoscroll = true;
@@ -6673,18 +6732,30 @@ impl AppState {
         }
         let target = cx.entity().downgrade();
         let handle = window.window_handle();
-        let Some(pane) = self.pane_mut(pane_id) else { return };
-        if pane.input_submitting { return; }
-        let Some(input) = pane.input_state.clone() else { return };
-        let raw = input.read(cx).value().to_string();
-        if raw.is_empty() && pane.attachments.is_empty() {
-            pane.terminal.update(cx, |term, cx| term.send_bytes(b"\r", cx));
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        if pane.input_submitting {
             return;
         }
-        let submitted_files: Vec<PathBuf> = pane.attachments.iter()
-            .map(|attachment| attachment.path.clone()).collect();
-        let paths: Vec<String> = submitted_files.iter()
-            .map(|path| attachments::prompt_path(path)).collect();
+        let Some(input) = pane.input_state.clone() else {
+            return;
+        };
+        let raw = input.read(cx).value().to_string();
+        if raw.is_empty() && pane.attachments.is_empty() {
+            pane.terminal
+                .update(cx, |term, cx| term.send_bytes(b"\r", cx));
+            return;
+        }
+        let submitted_files: Vec<PathBuf> = pane
+            .attachments
+            .iter()
+            .map(|attachment| attachment.path.clone())
+            .collect();
+        let paths: Vec<String> = submitted_files
+            .iter()
+            .map(|path| attachments::prompt_path(path))
+            .collect();
         let terminal = pane.terminal.downgrade();
         let generation = pane.generation.clone();
         pane.input_submitting = true;
@@ -6695,44 +6766,58 @@ impl AppState {
             // Timers begin after physical delivery, never merely after enqueue.
             let delivery = async {
                 if paths.is_empty() {
-                    let receipt = terminal.update(cx, |term, cx| {
-                        term.send_text_with_completion(&raw, cx)
-                    }).map_err(|error| error.to_string())??;
+                    let receipt = terminal
+                        .update(cx, |term, cx| term.send_text_with_completion(&raw, cx))
+                        .map_err(|error| error.to_string())??;
                     receipt.wait().await?;
-                    cx.background_executor().timer(std::time::Duration::from_millis(25)).await;
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(25))
+                        .await;
                 } else {
                     if !raw.is_empty() {
-                        let receipt = terminal.update(cx, |term, cx| {
-                            term.send_text_with_completion(&format!("{raw} "), cx)
-                        }).map_err(|error| error.to_string())??;
+                        let receipt = terminal
+                            .update(cx, |term, cx| {
+                                term.send_text_with_completion(&format!("{raw} "), cx)
+                            })
+                            .map_err(|error| error.to_string())??;
                         receipt.wait().await?;
-                        cx.background_executor().timer(std::time::Duration::from_millis(30)).await;
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(30))
+                            .await;
                     }
                     for path in &paths {
-                        let receipt = terminal.update(cx, |term, cx| {
-                            term.paste_text_from_app_with_completion(path, cx)
-                        }).map_err(|error| error.to_string())??;
+                        let receipt = terminal
+                            .update(cx, |term, cx| {
+                                term.paste_text_from_app_with_completion(path, cx)
+                            })
+                            .map_err(|error| error.to_string())??;
                         receipt.wait().await?;
-                        cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(100))
+                            .await;
                     }
-                    cx.background_executor().timer(std::time::Duration::from_millis(300)).await;
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(300))
+                        .await;
                 }
-                let receipt = terminal.update(cx, |term, cx| {
-                    term.send_bytes_with_completion(b"\r", cx)
-                }).map_err(|error| error.to_string())??;
+                let receipt = terminal
+                    .update(cx, |term, cx| term.send_bytes_with_completion(b"\r", cx))
+                    .map_err(|error| error.to_string())??;
                 receipt.wait().await
             };
-            let delivered: std::result::Result<(), String> = smol::future::race(
-                delivery,
-                async {
-                    let _ = cancelled.recv().await;
-                    Err("PTY input submission cancelled; accepted bytes are not replayed".into())
-                },
-            ).await;
+            let delivered: std::result::Result<(), String> = smol::future::race(delivery, async {
+                let _ = cancelled.recv().await;
+                Err("PTY input submission cancelled; accepted bytes are not replayed".into())
+            })
+            .await;
             let _ = handle.update(cx, |_, window, cx| {
                 let _ = target.update(cx, |state, cx| {
-                    let Some(pane) = state.pane_mut(pane_id)
-                        .filter(|pane| pane.generation == generation) else { return };
+                    let Some(pane) = state
+                        .pane_mut(pane_id)
+                        .filter(|pane| pane.generation == generation)
+                    else {
+                        return;
+                    };
                     pane.input_submitting = false;
                     pane.input_cancel = None;
                     match delivered {
@@ -6742,20 +6827,23 @@ impl AppState {
                             }
                             pane.history_index = None;
                             // Do not erase anything typed/attached during delivery.
-                            pane.attachments.retain(|attachment| !submitted_files.contains(&attachment.path));
+                            pane.attachments
+                                .retain(|attachment| !submitted_files.contains(&attachment.path));
                             if input.read(cx).value().as_ref() == raw.as_str() {
                                 pane.pending_draft.clear();
                                 input.update(cx, |input, cx| input.set_value("", window, cx));
                             }
                         }
                         Err(error) => {
-                            pane.terminal.update(cx, |term, cx| term.report_io_error(error, cx));
+                            pane.terminal
+                                .update(cx, |term, cx| term.report_io_error(error, cx));
                         }
                     }
                     cx.notify();
                 });
             });
-        }).detach();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -6860,7 +6948,8 @@ impl AppState {
                         }
                     }
                 }
-            })).detach();
+            }))
+            .detach();
         }
 
         // 4. If an agent/command was working, interrupt and return to Idle
@@ -8085,7 +8174,8 @@ impl AppState {
         };
         pane.plus_menu_open = false;
         let accepted = pane.terminal.update(cx, |term, cx| {
-            term.send_text_with_completion(&format!("{cmd}\r"), cx).is_ok()
+            term.send_text_with_completion(&format!("{cmd}\r"), cx)
+                .is_ok()
         });
         if !accepted {
             return;
@@ -10373,7 +10463,9 @@ impl AppState {
         {
             let kind = match message.role {
                 ChatRole::Assistant => Some(crate::stream_timing::DeltaKind::Answer),
-                ChatRole::Thinking if message.expanded => Some(crate::stream_timing::DeltaKind::Reasoning),
+                ChatRole::Thinking if message.expanded => {
+                    Some(crate::stream_timing::DeltaKind::Reasoning)
+                }
                 _ => None,
             };
             if let Some(kind) = kind
@@ -10922,7 +11014,8 @@ impl AppState {
         let visible = pane.chat.visible_messages();
         if let Some(view) = &pane.chat.worker_view {
             let workers = subagent_chat::rows(visible);
-            if let Some(worker) = workers.iter()
+            if let Some(worker) = workers
+                .iter()
                 .find(|row| row.index == view.index && row.worker.id == view.id)
             {
                 return self.render_worker_view(pane, view, worker, window, cx);
@@ -11396,7 +11489,10 @@ impl AppState {
             .max_w_full()
             .flex()
             .when(pane.chat.info_open, |this| {
-                let cwd_display = pane.chat.cwd.as_deref()
+                let cwd_display = pane
+                    .chat
+                    .cwd
+                    .as_deref()
                     .map(Self::format_path_display)
                     .unwrap_or_else(|| self.pane_cwd_display(pane));
                 let branch = if let Some(cwd) = pane.chat.cwd.as_deref() {
@@ -11434,34 +11530,65 @@ impl AppState {
                                         .text_color(tokens.text_muted)
                                         .child("Environment"),
                                 )
-                                .children([
-                                    ("Working directory", "icons/folder.svg", cwd_display),
-                                    ("Git branch", "icons/git-branch.svg",
-                                        branch.unwrap_or_else(|| "Not in a Git repository".into())),
-                                ].into_iter().enumerate().map(|(index, (label, icon, value))| {
-                                    div()
-                                        .id(("agent-info-section", index))
-                                        .px(px(14.0))
-                                        .py(px(12.0))
-                                        .when(index > 0, |row| row.border_t_1()
-                                            .border_color(tokens.border_subtle))
-                                        .flex()
-                                        .items_start()
-                                        .gap(px(10.0))
-                                        .child(svg().path(icon).size(px(15.0))
-                                            .flex_shrink_0().text_color(tokens.text_secondary))
-                                        .child(
-                                            div().flex_1().min_w_0().flex().flex_col().gap(px(5.0))
-                                                .child(div().text_size(px(11.0))
-                                                    .text_color(tokens.text_muted).child(label))
-                                                .child(div().text_size(px(12.0))
-                                                    .text_color(tokens.text_primary)
-                                                    .font_family(MONO_FONT)
-                                                    .whitespace_normal()
-                                                    .overflow_hidden()
-                                                    .child(value)),
-                                        )
-                                })),
+                                .children(
+                                    [
+                                        ("Working directory", "icons/folder.svg", cwd_display),
+                                        (
+                                            "Git branch",
+                                            "icons/git-branch.svg",
+                                            branch.unwrap_or_else(|| {
+                                                "Not in a Git repository".into()
+                                            }),
+                                        ),
+                                    ]
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(
+                                        |(index, (label, icon, value))| {
+                                            div()
+                                                .id(("agent-info-section", index))
+                                                .px(px(14.0))
+                                                .py(px(12.0))
+                                                .when(index > 0, |row| {
+                                                    row.border_t_1()
+                                                        .border_color(tokens.border_subtle)
+                                                })
+                                                .flex()
+                                                .items_start()
+                                                .gap(px(10.0))
+                                                .child(
+                                                    svg()
+                                                        .path(icon)
+                                                        .size(px(15.0))
+                                                        .flex_shrink_0()
+                                                        .text_color(tokens.text_secondary),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .flex()
+                                                        .flex_col()
+                                                        .gap(px(5.0))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(11.0))
+                                                                .text_color(tokens.text_muted)
+                                                                .child(label),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(12.0))
+                                                                .text_color(tokens.text_primary)
+                                                                .font_family(MONO_FONT)
+                                                                .whitespace_normal()
+                                                                .overflow_hidden()
+                                                                .child(value),
+                                                        ),
+                                                )
+                                        },
+                                    ),
+                                ),
                         )
                         .with_animation(
                             ("agent-info-slide", pane_id),
@@ -14970,15 +15097,30 @@ mod resize_tests {
             let chat = &mut s.projects[0].sessions[0].panes[0].chat;
             chat.active = true;
             chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage {
-                input: 1200, output: 80, cache_read: 8000, cache_write: 500, cost: Some(0.012),
+                input: 1200,
+                output: 80,
+                cache_read: 8000,
+                cache_write: 500,
+                cost: Some(0.012),
             }));
             chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage {
-                input: 300, output: 20, cache_read: 1000, cache_write: 0, cost: Some(0.003),
+                input: 300,
+                output: 20,
+                cache_read: 1000,
+                cache_write: 0,
+                cost: Some(0.003),
             }));
             chat.observe_status(&AgentEvent::Done);
-            assert_eq!(chat.usage.unwrap(), rpi_embedded::AgentUsage {
-                input: 1500, output: 100, cache_read: 9000, cache_write: 500, cost: Some(0.015),
-            });
+            assert_eq!(
+                chat.usage.unwrap(),
+                rpi_embedded::AgentUsage {
+                    input: 1500,
+                    output: 100,
+                    cache_read: 9000,
+                    cache_write: 500,
+                    cost: Some(0.015),
+                }
+            );
             cx.notify();
         });
         cx.draw_frame().expect("render usage footer");
@@ -14994,15 +15136,24 @@ mod resize_tests {
         cx.update_window_entity(&state, |s, _, cx| {
             let chat = &mut s.projects[0].sessions[0].panes[0].chat;
             chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage {
-                input: 5, output: 1, ..Default::default()
+                input: 5,
+                output: 1,
+                ..Default::default()
             }));
             assert_eq!(chat.usage.unwrap().input, 1505);
-            assert_eq!(chat.usage.unwrap().cost, None, "partial pricing must not understate cost");
+            assert_eq!(
+                chat.usage.unwrap().cost,
+                None,
+                "partial pricing must not understate cost"
+            );
             chat.active = false;
             cx.notify();
         });
         cx.draw_frame().unwrap();
-        assert!(cx.debug_bounds("agent-usage").is_none(), "terminal mode hides agent metrics");
+        assert!(
+            cx.debug_bounds("agent-usage").is_none(),
+            "terminal mode hides agent metrics"
+        );
     }
 
     #[test]
@@ -15011,7 +15162,9 @@ mod resize_tests {
         let (mut cx, state) = open_app(&mut app);
         cx.draw_frame().unwrap();
         let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
-        cx.update_window_entity(&state, |s, window, cx| s.set_chat_mode(id, true, window, cx));
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(id, true, window, cx)
+        });
         cx.draw_frame().unwrap();
         let input = cx.debug_bounds("kathamo-input-bar").unwrap();
         let mode = cx.debug_bounds("input-mode-agent-pill").unwrap();
@@ -15022,7 +15175,8 @@ mod resize_tests {
         assert!((input.right() - toggle.right() - px(12.0)).abs() < px(1.0));
         cx.simulate_click(toggle.center(), Modifiers::none());
         cx.draw_frame().unwrap();
-        cx.background_executor.advance_clock(std::time::Duration::from_millis(220));
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(220));
         cx.draw_frame().unwrap();
         let panel = cx.debug_bounds("agent-info-panel").unwrap();
         assert!(panel.bottom() < input.top());
@@ -15168,7 +15322,8 @@ mod resize_tests {
             let pane = &mut s.projects[0].sessions[0].panes[0];
             pane.chat.running = true;
             pane.chat.status = SessionStatus::Working;
-            pane.chat.observe_status(&AgentEvent::Error("Provider failed".into()));
+            pane.chat
+                .observe_status(&AgentEvent::Error("Provider failed".into()));
             pane.chat.observe_status(&AgentEvent::Done);
             s.poll_sessions_status_with(&HashMap::new(), cx);
             assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Error);
@@ -15182,7 +15337,9 @@ mod resize_tests {
             pane.chat.status = SessionStatus::Working;
             s.poll_sessions_status_with(&HashMap::new(), cx);
             assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Working);
-            s.projects[0].sessions[0].panes[0].chat.observe_status(&AgentEvent::Closed);
+            s.projects[0].sessions[0].panes[0]
+                .chat
+                .observe_status(&AgentEvent::Closed);
             s.poll_sessions_status_with(&HashMap::new(), cx);
             assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Error);
         });
@@ -16709,15 +16866,25 @@ mod kathamo_bottom_input_tests {
     use gpui::{Modifiers, VisualContext, point};
     use resize_tests::{DrawFrame, TestAppContext, open_app};
 
-    fn wait_for_terminal_submission(cx: &mut gpui::VisualTestContext, state: &Entity<AppState>, pane_id: usize) {
+    fn wait_for_terminal_submission(
+        cx: &mut gpui::VisualTestContext,
+        state: &Entity<AppState>,
+        pane_id: usize,
+    ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             cx.run_until_parked();
-            if !state.read_with(cx, |state, _| state.pane_ref(pane_id).unwrap().input_submitting) {
+            if !state.read_with(cx, |state, _| {
+                state.pane_ref(pane_id).unwrap().input_submitting
+            }) {
                 return;
             }
-            assert!(std::time::Instant::now() < deadline, "PTY submission did not settle");
-            cx.background_executor.advance_clock(std::time::Duration::from_millis(50));
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PTY submission did not settle"
+            );
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(50));
             std::thread::yield_now();
         }
     }
@@ -16728,9 +16895,14 @@ mod kathamo_bottom_input_tests {
         impl std::io::Write for FailingWriter {
             fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed test PTY"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed test PTY",
+                ))
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
         let mut cx = TestAppContext::new();
         let (mut cx, app) = open_app(&mut cx);
@@ -16739,19 +16911,33 @@ mod kathamo_bottom_input_tests {
         let pane_id = app.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
         cx.update_window_entity(&app, |state, window, cx| {
             let pane = state.pane_mut(pane_id).unwrap();
-            pane.terminal = cx.new(|cx| TerminalView::new(
-                FailingWriter(writes.clone()), std::io::empty(), TerminalConfig::default(), cx,
-            ));
-            pane.input_state.as_ref().unwrap().update(cx, |input, cx| input.set_value("do not lose this", window, cx));
+            pane.terminal = cx.new(|cx| {
+                TerminalView::new(
+                    FailingWriter(writes.clone()),
+                    std::io::empty(),
+                    TerminalConfig::default(),
+                    cx,
+                )
+            });
+            pane.input_state.as_ref().unwrap().update(cx, |input, cx| {
+                input.set_value("do not lose this", window, cx)
+            });
             state.execute_pane_input(pane_id, window, cx);
         });
         wait_for_terminal_submission(&mut cx, &app, pane_id);
         app.read_with(&cx, |state, cx| {
             let pane = state.pane_ref(pane_id).unwrap();
-            assert_eq!(pane.input_state.as_ref().unwrap().read(cx).value().as_str(), "do not lose this");
+            assert_eq!(
+                pane.input_state.as_ref().unwrap().read(cx).value().as_str(),
+                "do not lose this"
+            );
             assert!(pane.command_history.is_empty());
         });
-        assert_eq!(writes.load(Ordering::Relaxed), 1, "failed input must not be replayed or followed by Enter");
+        assert_eq!(
+            writes.load(Ordering::Relaxed),
+            1,
+            "failed input must not be replayed or followed by Enter"
+        );
         cx.draw_frame().unwrap();
     }
 
@@ -16934,7 +17120,12 @@ mod kathamo_bottom_input_tests {
                     assert_eq!(format!("{}{}", view.settled, view.tail), message.text);
                     if delta.contains('\n') {
                         let (_, tail) = split_streaming_markdown(&message.text);
-                        assert_eq!(view.tail.as_ref(), tail, "size={size}, text={:?}", message.text);
+                        assert_eq!(
+                            view.tail.as_ref(),
+                            tail,
+                            "size={size}, text={:?}",
+                            message.text
+                        );
                     }
                 }
                 assert_eq!(message.text, text);
@@ -17096,7 +17287,6 @@ mod kathamo_bottom_input_tests {
         assert!(messages[2].role == ChatRole::Thinking);
     }
 
-
     #[test]
     fn completed_reasoning_collapses_when_the_answer_starts() {
         use agent_bridge::AgentEvent;
@@ -17234,7 +17424,8 @@ First report
             reasoning.origin + point(px(20.0), px(10.0)),
             Modifiers::default(),
         );
-        cx.draw_frame().expect("expand reasoning during tool execution");
+        cx.draw_frame()
+            .expect("expand reasoning during tool execution");
         let body = cx
             .debug_bounds("thinking-body-0")
             .expect("expanded reasoning stays visible during tool execution");
@@ -17341,7 +17532,10 @@ First report
             ..PaneChat::default()
         };
         assert_eq!(chat.mode_thinking_level(), "low");
-        assert_eq!(agent_model_selector(chat.selected_model.as_ref().unwrap()), "google-antigravity/gemini-3.8-flash");
+        assert_eq!(
+            agent_model_selector(chat.selected_model.as_ref().unwrap()),
+            "google-antigravity/gemini-3.8-flash"
+        );
         chat.fast_mode = false;
         assert_eq!(chat.mode_thinking_level(), "high");
 
@@ -17357,17 +17551,23 @@ First report
         cx.draw_frame().unwrap();
         let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
         let model = agent_auth::AgentModel {
-            provider: "google".into(), id: "gemini-3.8-flash".into(), backend: agent_auth::ModelBackend::Rpi,
+            provider: "google".into(),
+            id: "gemini-3.8-flash".into(),
+            backend: agent_auth::ModelBackend::Rpi,
         };
         cx.update_window_entity(&state, |s, _, _| {
             let chat = &mut s.pane_mut(id).unwrap().chat;
             chat.active = true;
             chat.selected_model = Some(model.clone());
         });
-        for effort in ["auto", "inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        for effort in [
+            "auto", "inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max",
+        ] {
             cx.update_window_entity(&state, |s, window, cx| {
                 let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
-                input.update(cx, |input, cx| input.set_value(format!("/thinking {effort}"), window, cx));
+                input.update(cx, |input, cx| {
+                    input.set_value(format!("/thinking {effort}"), window, cx)
+                });
                 s.submit_agent_prompt(id, window, cx);
             });
             state.read_with(&cx, |s, cx| {
@@ -17375,19 +17575,35 @@ First report
                 assert_eq!(chat.selected_model.as_ref(), Some(&model));
                 assert_eq!(chat.thinking_override.as_deref(), Some(effort));
                 assert_eq!(chat.mode_thinking_level(), effort);
-                assert_eq!(s.saved_workspace(cx).projects[0].sessions[0].panes[0].chat.thinking_override.as_deref(), Some(effort));
+                assert_eq!(
+                    s.saved_workspace(cx).projects[0].sessions[0].panes[0]
+                        .chat
+                        .thinking_override
+                        .as_deref(),
+                    Some(effort)
+                );
             });
         }
         cx.update_window_entity(&state, |s, window, cx| {
             let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
-            input.update(cx, |input, cx| input.set_value("/thinking invalid", window, cx));
+            input.update(cx, |input, cx| {
+                input.set_value("/thinking invalid", window, cx)
+            });
             s.submit_agent_prompt(id, window, cx);
-            assert_eq!(s.pane_ref(id).unwrap().chat.thinking_override.as_deref(), Some("max"));
+            assert_eq!(
+                s.pane_ref(id).unwrap().chat.thinking_override.as_deref(),
+                Some("max")
+            );
             s.toggle_fast_mode(id, cx);
             assert!(s.pane_ref(id).unwrap().chat.thinking_override.is_none());
-            assert_eq!(s.pane_ref(id).unwrap().chat.selected_model.as_ref(), Some(&model));
+            assert_eq!(
+                s.pane_ref(id).unwrap().chat.selected_model.as_ref(),
+                Some(&model)
+            );
             s.pane_mut(id).unwrap().chat.selected_model = None;
-            input.update(cx, |input, cx| input.set_value("/thinking high", window, cx));
+            input.update(cx, |input, cx| {
+                input.set_value("/thinking high", window, cx)
+            });
             s.submit_agent_prompt(id, window, cx);
             assert!(s.pane_ref(id).unwrap().chat.thinking_override.is_none());
         });
@@ -18890,7 +19106,8 @@ First report
 
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
-        let pane_id = app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
+        let pane_id =
+            app_state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
         wait_for_terminal_submission(&mut cx, &app_state, pane_id);
 
         app_state.read_with(&cx, |state, cx| {
@@ -19050,8 +19267,8 @@ First report
                 agent_bridge::AgentEvent::Text("Starting. ".into()),
             );
             if let Some(last) = messages.last_mut() {
-                Arc::make_mut(last).turn = crate::stream_timing::turn_started_at(turn)
-                    .map(|started| (turn, started));
+                Arc::make_mut(last).turn =
+                    crate::stream_timing::turn_started_at(turn).map(|started| (turn, started));
             }
             crate::stream_timing::turn_delta_arrived(turn, crate::stream_timing::DeltaKind::Answer);
             crate::stream_timing::turn_delta_applied(turn, crate::stream_timing::DeltaKind::Answer);
@@ -19110,7 +19327,8 @@ First report
         // Exclude font/shader/session startup from steady-stream samples.
         for _ in 0..8 {
             cx.run_until_parked();
-            cx.background_executor.advance_clock(std::time::Duration::from_millis(16));
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(16));
             cx.draw_frame().unwrap();
         }
         let id = state.read_with(&cx, |state, _| state.projects[0].sessions[0].panes[0].id);
@@ -19130,21 +19348,38 @@ First report
         let mut frames = Vec::new();
         loop {
             cx.run_until_parked();
-            cx.background_executor.advance_clock(std::time::Duration::from_millis(16));
+            cx.background_executor
+                .advance_clock(std::time::Duration::from_millis(16));
             let frame = std::time::Instant::now();
             cx.draw_frame().unwrap();
             frames.push(frame.elapsed().as_micros());
             let complete = state.read_with(&cx, |state, cx| {
-                state.pane_ref(id).unwrap().terminal.read(cx).bottom_lines(8)
-                    .iter().any(|line| line.trim() == "KATHAMO_STREAM_END")
+                state
+                    .pane_ref(id)
+                    .unwrap()
+                    .terminal
+                    .read(cx)
+                    .bottom_lines(8)
+                    .iter()
+                    .any(|line| line.trim() == "KATHAMO_STREAM_END")
             });
-            if complete { break; }
-            assert!(started.elapsed() < std::time::Duration::from_secs(15), "PTY output did not finish");
+            if complete {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "PTY output did not finish"
+            );
             std::thread::yield_now();
         }
         frames.sort_unstable();
-        println!("pty_ansi_lines=20000 elapsed_ms={} frames={} frame_us_p50={} frame_us_max={}",
-            started.elapsed().as_millis(), frames.len(), frames[frames.len()/2], frames.last().unwrap());
+        println!(
+            "pty_ansi_lines=20000 elapsed_ms={} frames={} frame_us_p50={} frame_us_max={}",
+            started.elapsed().as_millis(),
+            frames.len(),
+            frames[frames.len() / 2],
+            frames.last().unwrap()
+        );
         println!("{}", sampler.report());
     }
 
@@ -19189,7 +19424,9 @@ First report
                 push_chat_event(
                     s.pane_mut(pane_id).unwrap().chat.visible_messages_mut(),
                     AgentEvent::ToolUpdate {
-                        id: Some(id.clone()), name: "bash".into(), output: "ready".into(),
+                        id: Some(id.clone()),
+                        name: "bash".into(),
+                        output: "ready".into(),
                     },
                 );
                 cx.notify();
@@ -19198,8 +19435,11 @@ First report
             if sample == 0 {
                 if let Some(path) = std::env::var_os("KATHAMO_BENCH_SCREENSHOT") {
                     cx.update(|window, _| {
-                        window.render_to_image().expect("capture tool card")
-                            .save(path).expect("save tool card");
+                        window
+                            .render_to_image()
+                            .expect("capture tool card")
+                            .save(path)
+                            .expect("save tool card");
                     });
                 }
             }
@@ -19340,18 +19580,25 @@ First report
 
         let cwd = std::env::current_dir().unwrap();
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
-        agent_bridge::set_wake(Arc::new(move || { let _ = wake_tx.try_send(()); }));
+        agent_bridge::set_wake(Arc::new(move || {
+            let _ = wake_tx.try_send(());
+        }));
         let start = Instant::now();
         let mut bridge = agent_bridge::AgentBridge::spawn_model(
-            &cwd, Some("google-antigravity/gemini-3.8-flash"),
-        ).unwrap();
+            &cwd,
+            Some("google-antigravity/gemini-3.8-flash"),
+        )
+        .unwrap();
         bridge.set_thinking_level("low").unwrap();
         crate::stream_timing::turn_sent(bridge.trace_id(), false);
-        bridge.send_prompt("Reply with exactly OK. Answer directly without tools.").unwrap();
+        bridge
+            .send_prompt("Reply with exactly OK. Answer directly without tools.")
+            .unwrap();
         let mut answer = String::new();
         let mut first = None;
         'turn: loop {
-            let remaining = Duration::from_secs(60).checked_sub(start.elapsed())
+            let remaining = Duration::from_secs(60)
+                .checked_sub(start.elapsed())
                 .expect("Antigravity response timed out");
             wake_rx.recv_timeout(remaining).unwrap();
             for event in bridge.poll() {
@@ -19367,7 +19614,11 @@ First report
             }
         }
         assert_eq!(answer.trim(), "OK");
-        println!("Antigravity first_ms={} total_ms={}", first.unwrap().as_millis(), start.elapsed().as_millis());
+        println!(
+            "Antigravity first_ms={} total_ms={}",
+            first.unwrap().as_millis(),
+            start.elapsed().as_millis()
+        );
         crate::stream_timing::report_now();
     }
 
@@ -19379,7 +19630,9 @@ First report
 
         let cwd = PathBuf::from(std::env::var_os("KATHAMO_BENCH_CWD").unwrap());
         let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
-        agent_bridge::set_wake(Arc::new(move || { let _ = wake_tx.try_send(()); }));
+        agent_bridge::set_wake(Arc::new(move || {
+            let _ = wake_tx.try_send(());
+        }));
         let mut chat = PaneChat::default();
         chat.selected_model = Some(agent_auth::AgentModel {
             provider: "google".into(),
@@ -19399,7 +19652,12 @@ First report
                 wake_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 for event in bridge.poll() {
                     match event {
-                        AgentEvent::ToolEnd { name, output, failed, .. } => {
+                        AgentEvent::ToolEnd {
+                            name,
+                            output,
+                            failed,
+                            ..
+                        } => {
                             assert_eq!(name, "read");
                             assert!(!failed, "{output}");
                             reads.push(output);
@@ -19418,8 +19676,11 @@ First report
             assert!(reads.iter().any(|read| read.contains("113")));
             assert!(reads.iter().any(|read| read.contains("127")));
             assert_eq!(answer, "x".repeat(16));
-            println!("gemini {phase} first_us={} total_us={}",
-                first_answer.unwrap().as_micros(), started.elapsed().as_micros());
+            println!(
+                "gemini {phase} first_us={} total_us={}",
+                first_answer.unwrap().as_micros(),
+                started.elapsed().as_micros()
+            );
         }
     }
 
@@ -19864,9 +20125,19 @@ First report
         );
         let start = Instant::now();
         for _ in 0..10_000 {
-            black_box(tool_view("write", &big_input, serde_json::from_str(&big_input).ok().as_ref()));
-            black_box(shell_command(&big_input, serde_json::from_str(&big_input).ok().as_ref()));
-            black_box(tool_content_body("write", serde_json::from_str(&big_input).ok().as_ref()));
+            black_box(tool_view(
+                "write",
+                &big_input,
+                serde_json::from_str(&big_input).ok().as_ref(),
+            ));
+            black_box(shell_command(
+                &big_input,
+                serde_json::from_str(&big_input).ok().as_ref(),
+            ));
+            black_box(tool_content_body(
+                "write",
+                serde_json::from_str(&big_input).ok().as_ref(),
+            ));
         }
         let old_tool = start.elapsed();
 
@@ -19908,7 +20179,9 @@ First report
         let _ = std::fs::remove_file(&path);
 
         let mut log = conversations::Log::at_path(path.clone(), u64::MAX);
-        let conversations::Entry::Event { event } = &entry else { unreachable!() };
+        let conversations::Entry::Event { event } = &entry else {
+            unreachable!()
+        };
         let start = Instant::now();
         for _ in 0..2_000 {
             log.append_event(event);

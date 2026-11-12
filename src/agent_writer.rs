@@ -78,10 +78,15 @@ impl AgentWriter {
                         Err(error) => Err(std::io::Error::other(error)),
                     };
                     {
-                        let mut admission = writer_shared.admission.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut admission = writer_shared
+                            .admission
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
                         admission.bytes -= pending.bytes;
                         admission.commands -= 1;
-                        if admission.commands == 0 { admission.last_abort = false; }
+                        if admission.commands == 0 {
+                            admission.last_abort = false;
+                        }
                     }
                     if let Err(error) = result {
                         if !writer_shared.closed.swap(true, Ordering::AcqRel) {
@@ -111,14 +116,23 @@ impl AgentWriter {
     }
 
     fn enqueue(&self, command: WriteCommand, bytes: usize, abort: bool) -> Result<(), String> {
-        let mut admission = self.shared.admission.lock().unwrap_or_else(|e| e.into_inner());
-        if self.is_closed() { return Err("The agent process has exited".into()); }
-        if abort && admission.last_abort { return Ok(()); }
+        let mut admission = self
+            .shared
+            .admission
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.is_closed() {
+            return Err("The agent process has exited".into());
+        }
+        if abort && admission.last_abort {
+            return Ok(());
+        }
         // A reserved abort is a tiny fixed-shape record. It remains behind all
         // already admitted records, including a partially written prompt.
-        if (!abort && (admission.commands >= MAX_QUEUED_COMMANDS ||
-            admission.bytes.saturating_add(bytes) > MAX_QUEUED_BYTES)) ||
-            (abort && bytes > 1024)
+        if (!abort
+            && (admission.commands >= MAX_QUEUED_COMMANDS
+                || admission.bytes.saturating_add(bytes) > MAX_QUEUED_BYTES))
+            || (abort && bytes > 1024)
         {
             return Err("The agent input queue is full; wait for the current command".into());
         }
@@ -154,7 +168,10 @@ impl AgentWriter {
             .ok()
             .and_then(|mut thread| thread.take());
         if let Some(handle) = handle {
-            let _ = self.shared.sender.send(Pending { command: WriteCommand::Shutdown, bytes: 0 });
+            let _ = self.shared.sender.send(Pending {
+                command: WriteCommand::Shutdown,
+                bytes: 0,
+            });
             let _ = handle.join();
         }
     }
@@ -165,8 +182,13 @@ fn json_owned_bytes(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::String(text) => text.len() + std::mem::size_of::<serde_json::Value>(),
         serde_json::Value::Array(values) => values.iter().map(json_owned_bytes).sum::<usize>() + 32,
-        serde_json::Value::Object(values) => values.iter()
-            .map(|(key, value)| key.len() + json_owned_bytes(value)).sum::<usize>() + 32,
+        serde_json::Value::Object(values) => {
+            values
+                .iter()
+                .map(|(key, value)| key.len() + json_owned_bytes(value))
+                .sum::<usize>()
+                + 32
+        }
         _ => std::mem::size_of::<serde_json::Value>(),
     }
 }
@@ -309,27 +331,51 @@ mod tests {
     fn all_command_payloads_are_bounded_and_cancellation_has_reserved_admission() {
         let release = Arc::new(AtomicBool::new(false));
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        let writer = AgentWriter::spawn(SlowSink {
-            bytes: Arc::clone(&bytes), delay: Duration::ZERO, fail: false,
-            release: Some(Arc::clone(&release)),
-        }, |_| {});
-        assert!(writer.send_json(serde_json::json!({
-            "type":"extension_ui_response", "text":"x".repeat(MAX_QUEUED_BYTES + 1),
-        })).is_err());
+        let writer = AgentWriter::spawn(
+            SlowSink {
+                bytes: Arc::clone(&bytes),
+                delay: Duration::ZERO,
+                fail: false,
+                release: Some(Arc::clone(&release)),
+            },
+            |_| {},
+        );
+        assert!(
+            writer
+                .send_json(serde_json::json!({
+                    "type":"extension_ui_response", "text":"x".repeat(MAX_QUEUED_BYTES + 1),
+                }))
+                .is_err()
+        );
         for index in 0..MAX_QUEUED_COMMANDS {
-            writer.send_prompt(index.to_string(), String::new()).unwrap();
+            writer
+                .send_prompt(index.to_string(), String::new())
+                .unwrap();
         }
-        assert!(writer.send_prompt("overflow".into(), String::new()).is_err());
-        writer.send_json(serde_json::json!({"type":"abort","id":"reserved"})).unwrap();
+        assert!(
+            writer
+                .send_prompt("overflow".into(), String::new())
+                .is_err()
+        );
+        writer
+            .send_json(serde_json::json!({"type":"abort","id":"reserved"}))
+            .unwrap();
         for _ in 0..1000 {
-            writer.send_json(serde_json::json!({"type":"abort","id":"duplicate"})).unwrap();
+            writer
+                .send_json(serde_json::json!({"type":"abort","id":"duplicate"}))
+                .unwrap();
         }
-        assert_eq!(writer.shared.admission.lock().unwrap().commands, MAX_QUEUED_COMMANDS + 1);
+        assert_eq!(
+            writer.shared.admission.lock().unwrap().commands,
+            MAX_QUEUED_COMMANDS + 1
+        );
         release.store(true, Ordering::Release);
         writer.shutdown();
         let bytes = bytes.lock().unwrap();
         let records: Vec<serde_json::Value> = String::from_utf8_lossy(&bytes)
-            .lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
         assert_eq!(records.len(), MAX_QUEUED_COMMANDS + 1);
         assert_eq!(records.last().unwrap()["id"], "reserved");
     }

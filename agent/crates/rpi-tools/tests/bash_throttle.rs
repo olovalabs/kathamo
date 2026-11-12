@@ -8,10 +8,14 @@ use rpi_tools::{ExecutionEnv, ExecutionToolContext, OsExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
 fn text(result: &AgentToolResult) -> String {
-    result.content.iter().filter_map(|content| match content {
-        TextContentOrImage::Text(text) => Some(text.text.as_str()),
-        _ => None,
-    }).collect()
+    result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            TextContentOrImage::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -109,9 +113,7 @@ async fn shell_preserves_mixed_utf8_and_console_encoded_output() {
             ..Default::default()
         },
     ).await.expect("PowerShell raw output");
-    let expected = rpi_tools::output_decode::decode_output(
-        b"ascii\n\xE4\xB8\xAD\n\xff\n",
-    );
+    let expected = rpi_tools::output_decode::decode_output(b"ascii\n\xE4\xB8\xAD\n\xff\n");
     assert_eq!(output.stdout, expected);
     assert_eq!(streamed, expected);
     assert!(output.stdout.starts_with("ascii\n中\n"));

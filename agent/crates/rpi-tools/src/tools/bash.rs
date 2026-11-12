@@ -222,7 +222,9 @@ impl AgentTool for BashTool {
                         &on_update_for_cb,
                         progress.output,
                         progress.truncation.truncated.then_some(progress.truncation),
-                        progress.full_output_path.map(|path| path.to_string_lossy().into_owned()),
+                        progress
+                            .full_output_path
+                            .map(|path| path.to_string_lossy().into_owned()),
                     );
                 }
             });
@@ -245,7 +247,6 @@ impl AgentTool for BashTool {
         let capture = execute_shell_with_capture(&env, &command, capture_opts)
             .await
             .map_err(exec_err_to_agent)?;
-
 
         // Build the terminal output text + details, applying truncation notices.
         let (output_text, mut details) = build_bash_output(&capture);
@@ -327,7 +328,6 @@ impl AgentTool for BashTool {
         })
     }
 }
-
 
 /// Emit a single `on_update` payload built from the given capture snapshot.
 /// Mirrors the TS `onUpdate({ content:[{text:progress.output}], details:{...} })`.

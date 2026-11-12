@@ -38,8 +38,8 @@ pub use tools::{
 };
 
 pub use env::{
-    ExecutionEnv, FileContent, FileInfo, FileKind, FileSystem, Shell, ShellExecOptions, ShellOutput,
-    ShellOutputChunk,
+    ExecutionEnv, FileContent, FileInfo, FileKind, FileSystem, Shell, ShellExecOptions,
+    ShellOutput, ShellOutputChunk,
 };
 pub use error::{
     io_to_file_code, io_to_file_error, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,

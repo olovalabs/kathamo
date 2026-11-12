@@ -325,7 +325,8 @@ mod tests {
 
     #[test]
     fn legacy_settings_never_grant_omp_trust() {
-        let settings: AppSettings = serde_json::from_str(r#"{"version":1,"theme":"dark"}"#).unwrap();
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"version":1,"theme":"dark"}"#).unwrap();
         assert!(settings.trusted_omp_workspaces.is_empty());
         assert!(AppSettings::default().trusted_omp_workspaces.is_empty());
     }

@@ -208,8 +208,9 @@ pub(crate) fn resolve_refreshable(
     // Discovery declarations repeat the built-in primary env name. Retain that
     // provider's aliases; a different extension-owned policy remains authoritative.
     let native_policy = manifest.is_none_or(|manifest| {
-        builtin.is_some_and(|builtin| manifest.api_key_env.as_deref()
-            == builtin.env_vars.first().map(String::as_str))
+        builtin.is_some_and(|builtin| {
+            manifest.api_key_env.as_deref() == builtin.env_vars.first().map(String::as_str)
+        })
     });
     if native_policy && provider == "anthropic" {
         if let Some(key) = nonempty(values.env("ANTHROPIC_AUTH_TOKEN")) {
@@ -252,8 +253,12 @@ pub(crate) fn resolve_refreshable(
     }
     ResolvedCredential {
         key: None,
-        source: if manifest.map(|manifest| !manifest.requires_auth)
-            .unwrap_or_else(|| crate::catalog::builtin_provider(provider).is_some_and(|provider| !provider.requires_auth)) {
+        source: if manifest
+            .map(|manifest| !manifest.requires_auth)
+            .unwrap_or_else(|| {
+                crate::catalog::builtin_provider(provider)
+                    .is_some_and(|provider| !provider.requires_auth)
+            }) {
             CredentialSource::Anonymous
         } else {
             CredentialSource::Missing
@@ -287,9 +292,18 @@ mod tests {
             requires_auth: true,
         };
         let values = BTreeMap::from([("HYPER_API_KEY".into(), "test-key".into())]);
-        let credential = resolve("charm-hyper", None, &AuthStore::new(), Some(&manifest), &values);
+        let credential = resolve(
+            "charm-hyper",
+            None,
+            &AuthStore::new(),
+            Some(&manifest),
+            &values,
+        );
         assert_eq!(credential.key.as_deref(), Some("test-key"));
-        assert_eq!(credential.source, CredentialSource::Environment("HYPER_API_KEY".into()));
+        assert_eq!(
+            credential.source,
+            CredentialSource::Environment("HYPER_API_KEY".into())
+        );
     }
 
     #[test]
@@ -301,7 +315,13 @@ mod tests {
             requires_auth: true,
         };
         let values = BTreeMap::from([("HYPER_API_KEY".into(), "not-selected".into())]);
-        let credential = resolve("charm-hyper", None, &AuthStore::new(), Some(&manifest), &values);
+        let credential = resolve(
+            "charm-hyper",
+            None,
+            &AuthStore::new(),
+            Some(&manifest),
+            &values,
+        );
         assert!(credential.key.is_none());
         assert_eq!(credential.source, CredentialSource::Missing);
     }

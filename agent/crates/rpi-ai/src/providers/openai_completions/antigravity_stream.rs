@@ -102,7 +102,9 @@ pub(crate) fn stream_google_native(
             Ok(())
         }.await;
         if let Err(error) = result {
-            state.error(&mut producer, error, options.signal.is_cancelled()).await;
+            state
+                .error(&mut producer, error, options.signal.is_cancelled())
+                .await;
         }
     });
     stream

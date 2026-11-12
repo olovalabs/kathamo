@@ -120,16 +120,20 @@ impl ExecutionBinding {
         if requested.provider != self.provider_id {
             return None;
         }
-        let candidates = || self.models.iter().filter(|model| {
-            model.provider == requested.provider
-                && model.api == requested.api
-                && model.id.eq_ignore_ascii_case(&requested.id)
-        });
-        candidates().find(|model| model.id == requested.id).or_else(|| {
-            let mut candidates = candidates();
-            let first = candidates.next()?;
-            candidates.next().is_none().then_some(first)
-        })
+        let candidates = || {
+            self.models.iter().filter(|model| {
+                model.provider == requested.provider
+                    && model.api == requested.api
+                    && model.id.eq_ignore_ascii_case(&requested.id)
+            })
+        };
+        candidates()
+            .find(|model| model.id == requested.id)
+            .or_else(|| {
+                let mut candidates = candidates();
+                let first = candidates.next()?;
+                candidates.next().is_none().then_some(first)
+            })
     }
 
     pub fn binds(&self, requested: &Model) -> bool {

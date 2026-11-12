@@ -790,13 +790,19 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         let snapshot = terminal.snapshot_buffer_lines(&ColorPalette::default(), false);
-        let text: String = snapshot.lines.iter()
-            .flat_map(|line| &line.runs).map(|run| run.text.as_str()).collect();
+        let text: String = snapshot
+            .lines
+            .iter()
+            .flat_map(|line| &line.runs)
+            .map(|run| run.text.as_str())
+            .collect();
         assert!(text.contains("hello"));
         terminal.set_capture_output(true);
         terminal.process_bytes(b"\x1b]133;C\x07captured\r\n");
         let events = terminal.process_bytes(b"\x1b]133;D;0\x07");
-        assert!(matches!(&events[0], ShellEvent::CommandFinished { raw, .. } if raw.windows(8).any(|bytes| bytes == b"captured")));
+        assert!(
+            matches!(&events[0], ShellEvent::CommandFinished { raw, .. } if raw.windows(8).any(|bytes| bytes == b"captured"))
+        );
     }
 
     #[test]

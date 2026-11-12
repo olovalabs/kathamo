@@ -142,7 +142,9 @@ pub(crate) fn output_painted(pending: &parking_lot::Mutex<Option<PendingOutput>>
     if !enabled() {
         return;
     }
-    let Some(output) = pending.lock().take() else { return };
+    let Some(output) = pending.lock().take() else {
+        return;
+    };
     let now = Instant::now();
     let read_nanos = now.duration_since(output.read_at).as_nanos() as u64;
     let parse_nanos = now.duration_since(output.parsed_at).as_nanos() as u64;

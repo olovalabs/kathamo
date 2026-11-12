@@ -69,7 +69,12 @@ pub struct TruncationResult {
 }
 
 impl TruncationResult {
-    fn not_truncated(content: String, max_lines: usize, max_bytes: usize, total_lines: usize) -> Self {
+    fn not_truncated(
+        content: String,
+        max_lines: usize,
+        max_bytes: usize,
+        total_lines: usize,
+    ) -> Self {
         let total_bytes = content.len();
         Self {
             output_bytes: total_bytes,
@@ -124,7 +129,12 @@ pub fn truncate_head(content: &str, options: TruncationOptions) -> TruncationRes
     let total_lines = lines.len();
 
     if total_lines <= max_lines && total_bytes <= max_bytes {
-        return TruncationResult::not_truncated(content.to_string(), max_lines, max_bytes, total_lines);
+        return TruncationResult::not_truncated(
+            content.to_string(),
+            max_lines,
+            max_bytes,
+            total_lines,
+        );
     }
 
     // First-line check: a single oversized first line yields empty output.
@@ -195,7 +205,12 @@ pub fn truncate_tail(content: &str, options: TruncationOptions) -> TruncationRes
     let total_lines = content.bytes().filter(|byte| *byte == b'\n').count()
         + usize::from(!content.is_empty() && !content.ends_with('\n'));
     if total_lines <= max_lines && total_bytes <= max_bytes {
-        return TruncationResult::not_truncated(content.to_string(), max_lines, max_bytes, total_lines);
+        return TruncationResult::not_truncated(
+            content.to_string(),
+            max_lines,
+            max_bytes,
+            total_lines,
+        );
     }
 
     // A contiguous suffix needs no per-line allocation, insertion or recount.
@@ -388,15 +403,22 @@ mod tests {
 
     #[test]
     fn tail_byte_limit_reports_actual_rows_and_preserves_utf8_suffix() {
-        let options = TruncationOptions { max_lines: Some(10), max_bytes: Some(6) };
+        let options = TruncationOptions {
+            max_lines: Some(10),
+            max_bytes: Some(6),
+        };
         let tail = truncate_tail("old\nmiddle\nnew", options);
         assert_eq!(tail.content, "new");
         assert_eq!(tail.output_lines, 1);
         assert_eq!(tail.output_bytes, 3);
         assert_eq!(tail.truncated_by, Some(TruncationLimit::Bytes));
-        let tail = truncate_tail("prefix\n界界界", TruncationOptions {
-            max_lines: Some(10), max_bytes: Some(4),
-        });
+        let tail = truncate_tail(
+            "prefix\n界界界",
+            TruncationOptions {
+                max_lines: Some(10),
+                max_bytes: Some(4),
+            },
+        );
         assert_eq!(tail.content, "界");
         assert_eq!(tail.output_bytes, 3);
         assert!(tail.last_line_partial);

@@ -210,29 +210,38 @@ async fn persists_truncated_full_output_to_temp_file() {
 async fn complete_log_outlives_the_bounded_display_tail() {
     let (env, _) = fresh_context();
     let expected = format!("BEGIN\n{}END\n", "界abcdefghij\n".repeat(150_000));
-    env.register_shell("large-log", ShellScript::success(expected.clone())).await;
+    env.register_shell("large-log", ShellScript::success(expected.clone()))
+        .await;
     let execution_env: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
     let capture = rpi_tools::shell_output::execute_shell_with_capture(
         &execution_env,
         "large-log",
         rpi_tools::shell_output::ShellCaptureOptions::default(),
-    ).await.expect("capture");
+    )
+    .await
+    .expect("capture");
     assert!(capture.truncated);
     assert!(capture.output.len() <= DEFAULT_MAX_BYTES);
     assert_eq!(capture.truncation.total_bytes, expected.len());
     let path = capture.full_output_path.expect("complete log path");
-    let full = env.read_text_file(&path.to_string_lossy(), None).await.unwrap();
+    let full = env
+        .read_text_file(&path.to_string_lossy(), None)
+        .await
+        .unwrap();
     assert_eq!(full.len(), expected.len());
-    assert!(full == expected, "saved log must contain the prefix, middle and tail");
+    assert!(
+        full == expected,
+        "saved log must contain the prefix, middle and tail"
+    );
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn sanitizes_ansi_sequences_split_across_pipe_reads() {
     let dir = tempfile::tempdir().unwrap();
-    let env: Arc<dyn rpi_tools::ExecutionEnv> = Arc::new(
-        rpi_tools::OsExecutionEnv::with_cwd(dir.path().to_path_buf()),
-    );
+    let env: Arc<dyn rpi_tools::ExecutionEnv> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        dir.path().to_path_buf(),
+    ));
     let capture = rpi_tools::shell_output::execute_shell_with_capture(
         &env,
         "printf '\\033['; printf 'visible\\n' >&2; sleep 0.02; printf '31mred\\033]title'; sleep 0.02; printf '\\007plain\\033[0m'",
@@ -249,14 +258,16 @@ async fn sanitizes_ansi_sequences_split_across_pipe_reads() {
 #[tokio::test]
 async fn native_capture_persists_more_than_its_rolling_tail() {
     let dir = tempfile::tempdir().unwrap();
-    let env: Arc<dyn rpi_tools::ExecutionEnv> = Arc::new(
-        rpi_tools::OsExecutionEnv::with_cwd(dir.path().to_path_buf()),
-    );
+    let env: Arc<dyn rpi_tools::ExecutionEnv> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        dir.path().to_path_buf(),
+    ));
     let capture = rpi_tools::shell_output::execute_shell_with_capture(
         &env,
         "printf BEGIN; head -c 2000000 /dev/zero | tr '\\0' a; printf END",
         rpi_tools::shell_output::ShellCaptureOptions::default(),
-    ).await.expect("native capture");
+    )
+    .await
+    .expect("native capture");
     assert!(capture.output.len() <= DEFAULT_MAX_BYTES);
     assert!(capture.output.ends_with("END"));
     let path = capture.full_output_path.expect("complete native log");

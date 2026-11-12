@@ -67,7 +67,11 @@ impl TerminalNotifier {
         window_size: Arc<Mutex<WindowSize>>,
         palette: Arc<Mutex<ColorPalette>>,
     ) -> Self {
-        Self { writer: NotifierWriter::Queued(writer), window_size, palette }
+        Self {
+            writer: NotifierWriter::Queued(writer),
+            window_size,
+            palette,
+        }
     }
 
     /// Write raw bytes into the PTY.

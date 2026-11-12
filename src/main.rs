@@ -1935,7 +1935,8 @@ struct PaneChat {
     list_rows: std::cell::Cell<usize>,
     list_key: std::cell::Cell<u64>,
     active_dirty: std::cell::Cell<bool>,
-    dirty_message: std::cell::Cell<Option<usize>>,
+    activity_dirty: std::cell::Cell<bool>,
+    dirty_messages: std::cell::RefCell<HashSet<usize>>,
     scroll_handler_installed: std::cell::Cell<bool>,
     auth_refresh_pending: bool,
     auth: Option<AuthModal>,
@@ -1986,7 +1987,8 @@ impl Default for PaneChat {
             list_rows: std::cell::Cell::new(0),
             list_key: std::cell::Cell::new(0),
             active_dirty: std::cell::Cell::new(false),
-            dirty_message: std::cell::Cell::new(None),
+            activity_dirty: std::cell::Cell::new(false),
+            dirty_messages: std::cell::RefCell::new(HashSet::new()),
             scroll_handler_installed: std::cell::Cell::new(false),
             auth_refresh_pending: false,
             auth: None,
@@ -2184,16 +2186,28 @@ impl PaneChat {
     /// while every settled row keeps its cached height.
     fn mark_active_dirty(&self) {
         self.active_dirty.set(true);
+        self.activity_dirty.set(true);
     }
 
     /// A row's height changed because the reader toggled a message.
     fn invalidate_message_row(&self, index: usize) {
-        self.dirty_message.set(Some(index));
+        self.dirty_messages.borrow_mut().insert(index);
     }
 
     fn scroll_to_end(&self) {
         self.list_state.scroll_to_end();
         self.list_state.set_follow_mode(FollowMode::Tail);
+    }
+
+    /// Re-measuring an item normally resets an anchor inside it to its top.
+    /// Keep the reader's position within a growing or expanded message.
+    fn remeasure_row(&self, row: usize) {
+        let anchor =
+            (!self.list_state.is_following_tail()).then(|| self.list_state.logical_scroll_top());
+        self.list_state.splice(row..row + 1, 1);
+        if let Some(anchor) = anchor.filter(|anchor| anchor.item_ix == row) {
+            self.list_state.scroll_to(anchor);
+        }
     }
 
     /// Keep the list's item count in step with the transcript. Appending and
@@ -2214,7 +2228,7 @@ impl PaneChat {
             // example a streaming answer becomes settled Markdown), so its
             // cached height must be remeasured too.
             if old > 0 {
-                self.list_state.splice(old - 1..old, 1);
+                self.remeasure_row(old - 1);
             }
         } else if count < old {
             self.list_state.splice(count..old, 0);
@@ -6472,7 +6486,20 @@ impl AppState {
                         let drained = bridge.poll();
                         crate::stream_timing::record_since("ui.drain", drain_start);
                         if !drained.is_empty() {
-                            pane.chat.mark_active_dirty();
+                            pane.chat.active_dirty.set(true);
+                            if drained.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    agent_bridge::AgentEvent::ToolStart { .. }
+                                        | agent_bridge::AgentEvent::ToolUpdate { .. }
+                                        | agent_bridge::AgentEvent::ToolEnd { .. }
+                                        | agent_bridge::AgentEvent::Subagents { .. }
+                                        | agent_bridge::AgentEvent::Done
+                                        | agent_bridge::AgentEvent::Closed
+                                )
+                            }) {
+                                pane.chat.activity_dirty.set(true);
+                            }
                         }
                         for event in drained {
                             let apply_start = std::time::Instant::now();
@@ -6806,6 +6833,9 @@ impl AppState {
             cx.notify();
             return;
         }
+        // A submitted turn (including a startup error) belongs at the live end.
+        pane.chat.autoscroll = true;
+        pane.chat.scroll_to_end();
         if pane.chat.conversation_title().is_none()
             && let Some(title) = agent_title_from_prompt(trimmed)
         {
@@ -11247,9 +11277,9 @@ impl AppState {
         std::hash::Hash::hash(conversation, &mut hasher);
         pane.chat
             .sync_rows(row_count, std::hash::Hasher::finish(&hasher));
-        if let Some(index) = pane.chat.dirty_message.take() {
+        for index in pane.chat.dirty_messages.take() {
             if let Some(row) = rows.iter().position(|row| chat_row_contains(row, index)) {
-                pane.chat.list_state.splice(row..row + 1, 1);
+                pane.chat.remeasure_row(row);
             }
         }
         if pane.chat.active_dirty.replace(false) {
@@ -11257,18 +11287,22 @@ impl AppState {
                 rows.iter()
                     .rposition(|row| !matches!(row, ChatRow::Running))
             });
-            for (index, row) in rows.iter().enumerate().rev() {
-                if matches!(row, ChatRow::Message { message, .. } if message.role == ChatRole::User)
-                {
-                    break;
-                }
-                // A section can fold or receive more output after the reply starts.
-                if matches!(row, ChatRow::ToolGroup { .. }) && Some(index) != latest_content {
-                    pane.chat.list_state.splice(index..index + 1, 1);
+            if pane.chat.activity_dirty.replace(false) {
+                for (index, row) in rows.iter().enumerate().rev() {
+                    if matches!(row, ChatRow::Message { message, .. } if message.role == ChatRole::User)
+                    {
+                        break;
+                    }
+                    // A section can fold or receive more output after the reply starts.
+                    if matches!(row, ChatRow::ToolGroup { .. } | ChatRow::Subagents { .. })
+                        && Some(index) != latest_content
+                    {
+                        pane.chat.remeasure_row(index);
+                    }
                 }
             }
             if let Some(row) = latest_content {
-                pane.chat.list_state.splice(row..row + 1, 1);
+                pane.chat.remeasure_row(row);
             }
         }
         if !pane.chat.scroll_handler_installed.get() {
@@ -11279,7 +11313,10 @@ impl AppState {
                 .set_scroll_handler(move |event, _, cx| {
                     let _ = weak.update(cx, |this, cx| {
                         if let Some(pane) = this.pane_mut(id) {
-                            let following = event.is_following_tail;
+                            // Bottom-aligned lists report their end with no scroll
+                            // anchor; tail-follow itself is re-armed during layout,
+                            // after this callback has run.
+                            let following = event.is_following_tail || !event.is_scrolled;
                             if pane.chat.autoscroll != following {
                                 pane.chat.autoscroll = following;
                                 cx.notify();
@@ -11344,20 +11381,25 @@ impl AppState {
         });
         let row_snapshot = Arc::clone(&snapshot);
         let list_state = pane.chat.list_state.clone();
-        let chat_view = div().id(("agent-chat", pane_id)).size_full().child(
-            list(list_state.clone(), move |index, window, cx| {
-                Self::render_chat_row(&row_snapshot, index, window, cx)
-            })
+        let chat_view = div()
+            .id(("agent-chat", pane_id))
+            .debug_selector(|| "agent-chat".to_string())
             .size_full()
-            .px(px(24.0))
-            .pt(px(8.0))
-            .pb(px(20.0)),
-        );
+            .child(
+                list(list_state.clone(), move |index, window, cx| {
+                    Self::render_chat_row(&row_snapshot, index, window, cx)
+                })
+                .size_full()
+                .px(px(24.0))
+                .pt(px(8.0))
+                .pb(px(20.0)),
+            );
 
         let scroll_to_bottom_btn = if !is_autoscroll {
             Some(
                 div()
                     .id(("scroll-to-bottom-btn", pane_id))
+                    .debug_selector(|| "scroll-to-bottom-btn".to_string())
                     .absolute()
                     .bottom(px(16.0))
                     .right(px(24.0))
@@ -18075,15 +18117,14 @@ First report
                 "autoscroll must follow growing content to the new bottom"
             );
         });
-        // User scrolls up to read history -> unpins autoscroll
-        cx.update_window_entity(&state, |s, _, cx| {
-            let pane = s.pane_mut(id).unwrap();
-            pane.chat.autoscroll = false;
-            pane.chat.list_state.scroll_to(gpui::ListOffset {
-                item_ix: 0,
-                offset_in_item: px(0.0),
-            });
-            cx.notify();
+        // A real scroll gesture must release following, not just a state change.
+        let bounds = cx.debug_bounds("agent-chat").expect("chat viewport");
+        cx.simulate_event(gpui::ScrollEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(300.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            source: gpui::ScrollSource::Pointer,
         });
         cx.draw_frame()
             .expect("draw chat frame with autoscroll unpinned");
@@ -18092,17 +18133,58 @@ First report
             assert!(!pane.chat.autoscroll, "autoscroll should be unpinned");
         });
 
-        // Submitting a new prompt must re-pin autoscroll
-        cx.update_window_entity(&state, |s, window, cx| {
-            let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
-            input.update(cx, |input, cx| input.set_value("new prompt", window, cx));
-            s.execute_pane_input(id, window, cx);
+        // Streaming must preserve the reader's position until they return to the end.
+        let anchor = state.read_with(&cx, |s, _| {
+            s.pane_ref(id).unwrap().chat.list_state.logical_scroll_top()
         });
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = s.pane_mut(id).unwrap();
+            pane.chat.messages.push(Arc::new(ChatMessage::new(
+                ChatRole::Assistant,
+                "More output while reading history".into(),
+            )));
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        state.read_with(&cx, |s, _| {
+            let chat = &s.pane_ref(id).unwrap().chat;
+            assert!(!chat.autoscroll);
+            assert_eq!(chat.list_state.logical_scroll_top(), anchor);
+        });
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(-10000.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            source: gpui::ScrollSource::Pointer,
+        });
+        cx.draw_frame().unwrap();
+        state.read_with(&cx, |s, _| {
+            assert!(
+                s.pane_ref(id).unwrap().chat.autoscroll,
+                "scrolling to the end resumes following"
+            );
+        });
+        cx.simulate_event(gpui::ScrollEvent {
+            position: bounds.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(300.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+            source: gpui::ScrollSource::Pointer,
+        });
+        cx.draw_frame().unwrap();
+
+        // The jump button restores following, even after content has grown.
+        let button = cx
+            .debug_bounds("scroll-to-bottom-btn")
+            .expect("jump to bottom button");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
         state.read_with(&cx, |s, _| {
             let pane = s.pane_ref(id).unwrap();
             assert!(
                 pane.chat.autoscroll,
-                "sending a new prompt must re-pin autoscroll to the bottom"
+                "jumping to the bottom must re-pin autoscroll"
             );
             assert!(
                 pane.chat.list_state.is_following_tail(),
@@ -18110,6 +18192,57 @@ First report
             );
         });
         cx.draw_frame().unwrap();
+    }
+
+    #[test]
+    fn streaming_remeasure_preserves_offset_inside_message() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(id, true, window, cx);
+            let chat = &mut s.pane_mut(id).unwrap().chat;
+            chat.messages.clear();
+            chat.running = true;
+            push_chat_event(
+                &mut chat.messages,
+                agent_bridge::AgentEvent::Text(
+                    "A long paragraph of streaming output.\n\n".repeat(100),
+                ),
+            );
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        cx.update_window_entity(&state, |s, _, cx| {
+            let chat = &mut s.pane_mut(id).unwrap().chat;
+            chat.autoscroll = false;
+            chat.list_state.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(200.0),
+            });
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        let anchor = state.read_with(&cx, |s, _| {
+            s.pane_ref(id).unwrap().chat.list_state.logical_scroll_top()
+        });
+        assert_eq!(anchor.item_ix, 0);
+        assert!(anchor.offset_in_item > px(0.0));
+        cx.update_window_entity(&state, |s, _, cx| {
+            let chat = &mut s.pane_mut(id).unwrap().chat;
+            push_chat_event(
+                &mut chat.messages,
+                agent_bridge::AgentEvent::Text("More streaming output".into()),
+            );
+            chat.mark_active_dirty();
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        state.read_with(&cx, |s, _| {
+            let chat = &s.pane_ref(id).unwrap().chat;
+            assert!(!chat.autoscroll);
+            assert_eq!(chat.list_state.logical_scroll_top(), anchor);
+        });
     }
 
     #[test]

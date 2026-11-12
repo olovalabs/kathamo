@@ -14540,6 +14540,8 @@ fn sidebar_text_button(
 
 impl Render for AppState {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        static FIRST_RENDER: std::sync::Once = std::sync::Once::new();
+        FIRST_RENDER.call_once(|| startup_mark("first root render started"));
         let diag_render = diagnostics::render_start();
         // "Looking" needs an active window: a visible but backgrounded window
         // has not been seen, so a finish there must still become Done.
@@ -15160,10 +15162,24 @@ fn ensure_linux_desktop_entry() {
         StartupWMClass=kathamo\n"
     );
 
-    let _ = std::fs::write(apps_dir.join("kathamo.desktop"), desktop_content);
+    let desktop_path = apps_dir.join("kathamo.desktop");
+    if std::fs::read(&desktop_path).ok().as_deref() != Some(desktop_content.as_bytes()) {
+        let _ = std::fs::write(desktop_path, desktop_content);
+    }
+}
+
+fn startup_mark(label: &str) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    if std::env::var_os("KATHAMO_STARTUP_TIMINGS").is_some() {
+        eprintln!(
+            "[startup] {label}: {:.2}ms",
+            START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }
 
 fn main() -> Result<()> {
+    startup_mark("process entry");
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("report") => return cli::run_report(&args.collect::<Vec<_>>()),
@@ -15198,7 +15214,7 @@ fn main() -> Result<()> {
         .with_assets(CombinedAssets)
         .run(|cx: &mut App| {
             #[cfg(target_os = "linux")]
-            ensure_linux_desktop_entry();
+            std::thread::spawn(ensure_linux_desktop_entry);
             if let Err(error) = paths::ensure_dirs() {
                 eprintln!("failed to create app data directories: {error}");
             }
@@ -15217,9 +15233,11 @@ fn main() -> Result<()> {
                 }
             }
             let app_settings = settings::load();
+            startup_mark("settings loaded");
             let restore_enabled = app_settings.restore.sessions
                 && std::env::var_os("KATHAMO_DISABLE_RESTORE").is_none();
             let load_history = app_settings.restore.agent_history && restore_enabled;
+            let load_scrollback = app_settings.restore.scrollback;
             let window_icon = image::load_from_memory(APP_ICON_PNG).ok().map(|image| Arc::new(image.into_rgba8()));
             gpui_component::init(cx);
             // Kathamo uses two gpui-component generations: its own 0.5.1 fork
@@ -15240,6 +15258,7 @@ fn main() -> Result<()> {
                 let _ = shell_history::cached();
             });
 
+            startup_mark("components and fonts initialized");
             let palette = app_settings.theme_colors.palette(app_settings.palette_scheme, initial_mode.is_dark());
             let persistence_path = Some(paths::workspace_path());
 
@@ -15259,6 +15278,7 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
+                    startup_mark("window created");
                     let app_state = cx.new(|_| AppState {
                         projects: Vec::new(),
                         active_project_idx: 0,
@@ -15338,7 +15358,7 @@ fn main() -> Result<()> {
                                     for session in &project.sessions {
                                         for pane in &session.panes {
                                             live_uids.insert(pane.uid.clone());
-                                            if let Some(text) =
+                                            if load_scrollback && let Some(text) =
                                                 workspace_state::read_scrollback(&pane.uid)
                                             {
                                                 scrollbacks.insert(pane.uid.clone(), text);
@@ -15383,8 +15403,10 @@ fn main() -> Result<()> {
                                 }
                             })
                             .await;
+                        startup_mark("restore data loaded");
                         let _ = weak_state
                             .update(cx, |state, cx| state.apply_saved_workspace(restored, cx));
+                        startup_mark("restore applied");
                     })
                     .detach();
 

@@ -565,6 +565,7 @@ struct ToolView {
 #[derive(Clone)]
 struct ToolDisplay {
     view: ToolView,
+    activity_detail: Option<String>,
     shell_command: Option<SharedString>,
     content_body: Option<SharedString>,
     content_preview: Option<SharedString>,
@@ -591,6 +592,13 @@ impl ToolDisplay {
         };
         Self {
             view: tool_view(name, input, parsed.as_ref()),
+            activity_detail: parsed.as_ref().and_then(|value| {
+                ["path", "file_path", "filePath"]
+                    .into_iter()
+                    .find_map(|key| value.get(key).and_then(|value| value.as_str()))
+                    .filter(|path| !path.is_empty())
+                    .map(|path| clip_tool_text(first_line(path), 300).0)
+            }),
             shell_command: is_shell_tool(name)
                 .then(|| SharedString::from(shell_command(input, parsed.as_ref()))),
             content_body,
@@ -636,7 +644,10 @@ fn tool_view(name: &str, input: &str, parsed: Option<&serde_json::Value>) -> Too
     } else {
         match lower.as_str() {
             "read" | "read_file" => {
-                if let Some(path) = field("path") {
+                if let Some(path) = field("path")
+                    .or_else(|| field("file_path"))
+                    .or_else(|| field("filePath"))
+                {
                     subtitle = file_name(path).to_string();
                 }
                 if let Some(offset) = object.and_then(|map| map.get("offset")) {
@@ -649,7 +660,7 @@ fn tool_view(name: &str, input: &str, parsed: Option<&serde_json::Value>) -> Too
             "list" | "ls" | "list_dir" => {
                 subtitle = field("path").unwrap_or(".").to_string();
             }
-            "glob" | "grep" | "search" | "rg" => {
+            "glob" | "grep" | "ast_grep" | "search" | "rg" => {
                 let path = field("path").unwrap_or(".");
                 subtitle = match field("pattern")
                     .map(first_line)
@@ -676,7 +687,10 @@ fn tool_view(name: &str, input: &str, parsed: Option<&serde_json::Value>) -> Too
             }
             "edit" | "str_replace" | "str_replace_editor" | "apply_patch" | "write"
             | "write_file" | "create_file" | "patch" => {
-                if let Some(path) = field("path") {
+                if let Some(path) = field("path")
+                    .or_else(|| field("file_path"))
+                    .or_else(|| field("filePath"))
+                {
                     subtitle = file_name(path).to_string();
                 }
             }
@@ -1888,7 +1902,10 @@ enum ChatRow {
         message: Arc<ChatMessage>,
         live: bool,
     },
-    Running,
+    Running {
+        label: String,
+        tooltip: String,
+    },
 }
 
 /// Owned render data for one frame of the transcript list. It clones message
@@ -1921,7 +1938,190 @@ fn chat_row_contains(row: &ChatRow, message_index: usize) -> bool {
             start, messages, ..
         } => (*start..*start + messages.len()).contains(&message_index),
         ChatRow::Message { index, .. } => *index == message_index,
-        ChatRow::Running => false,
+        ChatRow::Running { .. } => false,
+    }
+}
+
+/// Describe only activity supported by events from the current turn.
+fn chat_activity(messages: &[Arc<ChatMessage>]) -> String {
+    let mut turn = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != ChatRole::User);
+    let mut active = turn.clone().filter_map(|message| {
+        message
+            .tool
+            .as_ref()
+            .filter(|tool| tool.state == ToolState::Running)
+    });
+    if let Some(tool) = active.next() {
+        let label = tool_activity(&tool.name);
+        let detail = if matches!(
+            tool.name.to_ascii_lowercase().as_str(),
+            "read"
+                | "read_file"
+                | "edit"
+                | "write"
+                | "write_file"
+                | "create_file"
+                | "str_replace"
+                | "str_replace_editor"
+                | "patch"
+                | "apply_patch"
+        ) {
+            tool.display
+                .activity_detail
+                .as_deref()
+                .unwrap_or(&tool.display.view.subtitle)
+        } else {
+            &tool.display.view.subtitle
+        };
+        let detail = first_line(detail);
+        let detail = clip_tool_text(detail, 80).0;
+        let extra = active.count();
+        let mut activity = label.trim_end_matches('…').to_owned();
+        if !detail.is_empty() {
+            activity.push_str(" · ");
+            activity.push_str(&detail);
+        } else if label == "Running a tool…" {
+            activity.push_str(" · ");
+            activity.push_str(&clip_tool_text(&tool.name, 40).0);
+        }
+        if extra > 0 {
+            activity.push_str(&format!(" (+{extra} active)"));
+        }
+        activity.push('…');
+        return activity;
+    }
+    match turn.next() {
+        Some(message) if message.streaming && message.role == ChatRole::Thinking => "Thinking…",
+        Some(message) if message.streaming && message.role == ChatRole::Assistant => {
+            "Writing a response…"
+        }
+        _ => "Working…",
+    }
+    .to_owned()
+}
+
+fn chat_activity_tooltip(messages: &[Arc<ChatMessage>]) -> String {
+    let tools: Vec<_> = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != ChatRole::User)
+        .filter_map(|message| {
+            message
+                .tool
+                .as_ref()
+                .filter(|tool| tool.state == ToolState::Running)
+        })
+        .collect();
+    if tools.is_empty() {
+        return chat_activity(messages);
+    }
+    tools
+        .iter()
+        .take(10)
+        .map(|tool| {
+            let detail = tool
+                .display
+                .activity_detail
+                .as_deref()
+                .filter(|_| {
+                    matches!(
+                        tool_activity(&tool.name),
+                        "Reading files…" | "Editing files…"
+                    )
+                })
+                .unwrap_or(&tool.display.view.subtitle);
+            let detail = clip_tool_text(first_line(detail), 300).0;
+            if detail.is_empty() {
+                format!(
+                    "{} · {}",
+                    tool_activity(&tool.name).trim_end_matches('…'),
+                    tool.name
+                )
+            } else {
+                format!(
+                    "{} · {}",
+                    tool_activity(&tool.name).trim_end_matches('…'),
+                    detail
+                )
+            }
+        })
+        .chain((tools.len() > 10).then(|| format!("And {} more active tools", tools.len() - 10)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_activity(name: &str) -> &'static str {
+    match name.to_ascii_lowercase().as_str() {
+        "read" | "read_file" | "cat" => "Reading files…",
+        "edit" | "write" | "write_file" | "create_file" | "str_replace" | "str_replace_editor"
+        | "patch" | "apply_patch" => "Editing files…",
+        "grep" | "glob" | "ast_grep" | "search" | "rg" | "find" | "list" | "ls" | "list_dir" => {
+            "Searching files…"
+        }
+        "bash" | "shell" | "sh" | "command" | "execute" | "exec" | "eval" | "run"
+        | "run_command" | "terminal" => "Running commands…",
+        "web_search" | "websearch" | "search_web" | "web_fetch" | "webfetch" | "fetch"
+        | "browser" => "Browsing the web…",
+        "task" | "agent" | "subagent" | "delegate" | "spawn_agent" | "spawn_subagent" => {
+            "Working with subagents…"
+        }
+        _ => "Running a tool…",
+    }
+}
+
+#[cfg(test)]
+mod chat_activity_tests {
+    use super::*;
+
+    #[test]
+    fn activity_tracks_current_turn_and_parallel_tools() {
+        use agent_bridge::AgentEvent;
+        let mut messages = vec![Arc::new(ChatMessage::new(ChatRole::User, "hello".into()))];
+        assert_eq!(chat_activity(&messages), "Working…");
+        push_chat_event(&mut messages, AgentEvent::Thinking("hmm".into()));
+        assert_eq!(chat_activity(&messages), "Thinking…");
+        push_chat_event(
+            &mut messages,
+            AgentEvent::ToolStart {
+                id: Some("1".into()),
+                name: "read".into(),
+                input: r#"{"path":"src/main.rs"}"#.into(),
+            },
+        );
+        assert_eq!(chat_activity(&messages), "Reading files · src/main.rs…");
+        push_chat_event(
+            &mut messages,
+            AgentEvent::ToolStart {
+                id: Some("2".into()),
+                name: "edit".into(),
+                input: r#"{"path":"src/theme.rs"}"#.into(),
+            },
+        );
+        assert_eq!(
+            chat_activity(&messages),
+            "Editing files · src/theme.rs (+1 active)…"
+        );
+        assert_eq!(
+            chat_activity_tooltip(&messages),
+            "Editing files · src/theme.rs\nReading files · src/main.rs"
+        );
+        push_chat_event(
+            &mut messages,
+            AgentEvent::ToolEnd {
+                id: Some("1".into()),
+                name: "read".into(),
+                output: String::new(),
+                failed: false,
+            },
+        );
+        assert_eq!(chat_activity(&messages), "Editing files · src/theme.rs…");
+        messages.push(Arc::new(ChatMessage::new(ChatRole::User, "next".into())));
+        assert_eq!(chat_activity(&messages), "Working…");
+        push_chat_event(&mut messages, AgentEvent::Text("answer".into()));
+        assert_eq!(chat_activity(&messages), "Writing a response…");
     }
 }
 
@@ -11308,7 +11508,7 @@ impl AppState {
         if pane.chat.active_dirty.replace(false) {
             let latest_content = active_row.or_else(|| {
                 rows.iter()
-                    .rposition(|row| !matches!(row, ChatRow::Running))
+                    .rposition(|row| !matches!(row, ChatRow::Running { .. }))
             });
             if pane.chat.activity_dirty.replace(false) {
                 for (index, row) in rows.iter().enumerate().rev() {
@@ -11579,7 +11779,10 @@ impl AppState {
             cursor += 1;
         }
         if running {
-            rows.push(ChatRow::Running);
+            rows.push(ChatRow::Running {
+                label: chat_activity(visible),
+                tooltip: chat_activity_tooltip(visible),
+            });
         }
         (rows, active_row)
     }
@@ -11721,12 +11924,23 @@ impl AppState {
                 window,
                 cx,
             ),
-            ChatRow::Running => div()
+            ChatRow::Running { label, tooltip } => div()
                 .flex()
                 .items_center()
                 .gap(px(6.0))
-                .px(px(4.0))
                 .py(px(2.0))
+                .id(("agent-activity", snapshot.pane_id))
+                .tooltip({
+                    let tooltip = tooltip.clone();
+                    move |_, cx| {
+                        cx.new(|_| {
+                            gpui_component::tooltip::Tooltip::new(SharedString::from(
+                                tooltip.clone(),
+                            ))
+                        })
+                        .into()
+                    }
+                })
                 .child(div().size(px(16.0)).flex_shrink_0().with_animation(
                     ("agent-waiting-spinner", snapshot.pane_id),
                     Animation::new(std::time::Duration::from_millis(650)).repeat(),
@@ -11736,7 +11950,9 @@ impl AppState {
                     div()
                         .text_color(tokens.text_muted)
                         .text_size(px(12.0))
-                        .child("Waiting for agent updates…"),
+                        .min_w_0()
+                        .truncate()
+                        .child(label.clone()),
                 )
                 .into_any_element(),
         };

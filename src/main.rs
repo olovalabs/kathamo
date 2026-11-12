@@ -5,9 +5,9 @@ use gpui::{
     CursorStyle, Div, Edges, Entity, ExternalPaths, FollowMode, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Rems, Render, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, StyledImage as _, Transformation,
-    Window, WindowControlArea, WindowDecorations, WindowOptions, actions, canvas, deferred, div,
-    img, list, percentage, px, relative, rems, rgba, size, svg,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, StyledImage as _, Window,
+    WindowControlArea, WindowDecorations, WindowOptions, actions, canvas, deferred, div, img, list,
+    px, relative, rems, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::highlighter::HighlightTheme;
@@ -97,6 +97,29 @@ pub const SIDEBAR_MIN_WIDTH: Pixels = px(180.0);
 const SIDEBAR_MAX_FRACTION: f32 = 0.5;
 /// Width of the invisible drag strip along the sidebar's right border.
 const SIDEBAR_RESIZE_HANDLE_WIDTH: Pixels = px(4.0);
+
+/// A compact chevron wave, based on the Drive loader in the supplied design.
+fn sidebar_loader(phase: f32, color: Hsla) -> Div {
+    let mut grid = div().size(px(16.0)).flex().flex_col().gap(px(1.5));
+    for row_index in 0i32..3 {
+        let mut row = div().flex().gap(px(1.5));
+        for column in 0i32..3 {
+            let delay = (column + (row_index - 1).abs()) as f32 * 90.0 / 650.0;
+            let cycle = (phase - delay).rem_euclid(1.0);
+            let pulse = (std::f32::consts::PI * cycle).sin().powi(4);
+            let opacity = 0.15 + 0.85 * pulse;
+            row = row.child(
+                div()
+                    .size(px(4.0))
+                    .rounded(px(1.0))
+                    .bg(color)
+                    .opacity(opacity),
+            );
+        }
+        grid = grid.child(row);
+    }
+    grid
+}
 
 #[cfg(unix)]
 static STATUS_BUS: std::sync::LazyLock<Option<status_bus::BusIdentity>> =
@@ -11704,7 +11727,11 @@ impl AppState {
                 .gap(px(6.0))
                 .px(px(4.0))
                 .py(px(2.0))
-                .child(div().size(px(6.0)).rounded_full().bg(tokens.block_warning))
+                .child(div().size(px(16.0)).flex_shrink_0().with_animation(
+                    ("agent-waiting-spinner", snapshot.pane_id),
+                    Animation::new(std::time::Duration::from_millis(650)).repeat(),
+                    move |element, phase| element.child(sidebar_loader(phase, tokens.text_muted)),
+                ))
                 .child(
                     div()
                         .text_color(tokens.text_muted)
@@ -13670,13 +13697,14 @@ impl AppState {
             })
             .unwrap_or_else(|| format!("{} — no pane evidence", session.status.label()));
         let indicator = match session.status {
-            SessionStatus::Working => gpui_component::Icon::new(gpui_component::IconName::Loader)
+            SessionStatus::Working => div()
                 .size(px(16.0))
-                .text_color(tokens.sidebar_muted)
                 .with_animation(
                     ("session-spinner", session.id),
-                    Animation::new(std::time::Duration::from_millis(900)).repeat(),
-                    |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+                    Animation::new(std::time::Duration::from_millis(650)).repeat(),
+                    move |element, phase| {
+                        element.child(sidebar_loader(phase, tokens.sidebar_muted))
+                    },
                 )
                 .into_any_element(),
             SessionStatus::Done => div()

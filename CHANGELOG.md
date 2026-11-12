@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - List each project's sidebar sessions newest-first, so a newly created session appears at the top and remains visible when the project already has five or more sessions.
+- Show the OpenCode provider marks on the model dialog's popular-provider cards and on every row in the provider list.
 - Restored CI formatting compliance and removed a non-looping PTY benchmark readiness loop rejected by Clippy.
 
 ### Added

@@ -40,6 +40,7 @@ impl gpui::AssetSource for CombinedAssets {
         #[cfg(debug_assertions)]
         {
             let disk_paths = [
+                std::path::Path::new("assets").join(path),
                 std::path::Path::new("assets").join(clean),
                 std::path::Path::new(clean).to_path_buf(),
                 std::path::Path::new(path).to_path_buf(),

@@ -1429,6 +1429,67 @@ fn agent_model_label(model: &agent_auth::AgentModel) -> String {
     format!("{} · {}", model.provider, model.id)
 }
 
+fn provider_icon_stems() -> &'static std::collections::HashSet<String> {
+    static STEMS: std::sync::LazyLock<std::collections::HashSet<String>> =
+        std::sync::LazyLock::new(|| {
+            let mut stems = std::collections::HashSet::new();
+            for asset in assets::AppAssets::iter() {
+                if let Some(name) = asset
+                    .strip_prefix("icons/provider/")
+                    .and_then(|name| name.strip_suffix(".svg"))
+                {
+                    stems.insert(name.to_string());
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir("assets/icons/provider") {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "svg") {
+                        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                            stems.insert(stem.to_string());
+                        }
+                    }
+                }
+            }
+            stems
+        });
+    &STEMS
+}
+
+fn provider_icon_stem(id: &str) -> &str {
+    match id {
+        "opencode" | "opencode-zen" => "opencode",
+        "google-antigravity" | "google-gemini-cli" => "google",
+        "xai-oauth" => "xai",
+        "lm-studio" => "lmstudio",
+        "ollama" => "ollama-cloud",
+        "fireworks" => "fireworks-ai",
+        "novita" => "novita-ai",
+        "together" => "togetherai",
+        "cloudflare" => "cloudflare-workers-ai",
+        "azure-openai" => "azure",
+        "bedrock" | "aws-bedrock" => "amazon-bedrock",
+        "copilot" => "github-copilot",
+        "kimi" | "kimi-code" => "kimi-for-coding",
+        "zhipu" => "zhipuai",
+        "moonshot" => "moonshotai",
+        "openai-codex" | "openai-codex-device" => "openai",
+        "gitlab-duo" | "gitlab-duo-agent" => "gitlab",
+        other => other,
+    }
+}
+
+/// Monochrome OpenCode provider mark. Unknown ids use the generic sparkle.
+fn provider_icon_path(id: &str) -> SharedString {
+    let stem = provider_icon_stem(id);
+    let stem = if provider_icon_stems().contains(stem) {
+        stem
+    } else {
+        "synthetic"
+    };
+    SharedString::from(format!("icons/provider/{stem}.svg"))
+}
+
 /// A readable conversation name from the first prompt, used to label the
 /// session in the sidebar. Backends that generate their own title replace it.
 fn agent_title_from_prompt(prompt: &str) -> Option<String> {
@@ -9668,50 +9729,43 @@ impl AppState {
                 "opencode-go",
                 "OpenCode Go",
                 "Low cost subscription for everyone",
-                "icons/provider-opencode-go.svg",
             ),
             (
                 "opencode-zen",
                 "OpenCode Console",
                 "Reliable optimized models",
-                "icons/provider-opencode.svg",
             ),
-            ("openai", "OpenAI", "", "icons/provider-openai.svg"),
-            ("anthropic", "Anthropic", "", "icons/provider-anthropic.svg"),
-            ("google", "Google", "", "icons/provider-google.svg"),
-            (
-                "github-copilot",
-                "GitHub Copilot",
-                "",
-                "icons/provider-github-copilot.svg",
-            ),
+            ("openai", "OpenAI", ""),
+            ("anthropic", "Anthropic", ""),
+            ("google", "Google", ""),
+            ("github-copilot", "GitHub Copilot", ""),
         ];
         let mut cards = Vec::new();
-        for (index, pair) in featured.chunks(2).enumerate() {
+        for pair in featured.chunks(2) {
             cards.push(div().flex().gap(px(8.0)).children(pair.iter().map(
-                |&(id, name, description, icon)| {
+                |&(id, name, description)| {
+                    let icon = provider_icon_path(id);
+                    let described = !description.is_empty();
                     div()
                         .id(SharedString::from(format!("model-provider-{id}")))
                         .debug_selector(move || format!("model-provider-{id}"))
                         .flex_1()
                         .min_w_0()
-                        .h(px(if index == 0 { 62.0 } else { 44.0 }))
+                        .h(px(if described { 58.0 } else { 40.0 }))
                         .px(px(12.0))
-                        .py(px(10.0))
                         .rounded(px(6.0))
                         .border_1()
                         .border_color(border)
                         .bg(card)
                         .flex()
-                        .items_start()
+                        .items_center()
                         .gap(px(10.0))
                         .cursor(CursorStyle::PointingHand)
                         .hover(move |view| view.bg(background))
                         .child(
                             svg()
                                 .path(icon)
-                                .size(px(14.0))
-                                .mt(px(3.0))
+                                .size(px(16.0))
                                 .flex_shrink_0()
                                 .text_color(foreground),
                         )
@@ -9720,9 +9774,16 @@ impl AppState {
                                 .min_w_0()
                                 .flex()
                                 .flex_col()
-                                .gap(px(2.0))
-                                .child(div().truncate().text_color(foreground).child(name))
-                                .when(!description.is_empty(), |view| {
+                                .justify_center()
+                                .gap(px(1.0))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(13.0))
+                                        .text_color(foreground)
+                                        .child(name),
+                                )
+                                .when(described, |view| {
                                     view.child(
                                         div()
                                             .truncate()
@@ -9751,7 +9812,7 @@ impl AppState {
         let remaining = auth
             .providers
             .iter()
-            .filter(|provider| !featured.iter().any(|(id, _, _, _)| *id == provider.id))
+            .filter(|provider| !featured.iter().any(|(id, _, _)| *id == provider.id))
             .count();
         div()
             .flex()
@@ -9830,10 +9891,11 @@ impl AppState {
                     .bg(inset)
                     .flex()
                     .flex_col()
-                    .gap(px(4.0))
+                    .gap(px(8.0))
                     .child(
                         div()
-                            .pb(px(6.0))
+                            .px(px(4.0))
+                            .text_size(px(13.0))
                             .text_color(muted)
                             .child("Add more models from popular providers"),
                     )
@@ -9842,8 +9904,9 @@ impl AppState {
                         div()
                             .id(("models-open-providers", pane_id))
                             .debug_selector(|| "agent-more-providers".into())
-                            .px(px(12.0))
-                            .py(px(6.0))
+                            .px(px(4.0))
+                            .py(px(2.0))
+                            .text_size(px(13.0))
                             .text_color(muted)
                             .cursor(CursorStyle::PointingHand)
                             .hover(move |view| view.text_color(foreground))
@@ -9936,15 +9999,11 @@ impl AppState {
                     .hover(move |view| view.bg(row_hover_bg))
                     .cursor(CursorStyle::PointingHand)
                     .child(
-                        div()
-                            .size(px(6.5))
+                        svg()
+                            .path(provider_icon_path(&id))
+                            .size(px(16.0))
                             .flex_shrink_0()
-                            .rounded_full()
-                            .bg(if ready {
-                                tokens.block_success
-                            } else {
-                                dot_unconnected
-                            }),
+                            .text_color(tokens.text_primary),
                     )
                     .child(
                         div()
@@ -17988,6 +18047,56 @@ First report
             assert_eq!(auth.models.len(), 2);
             assert_eq!(auth.providers.len(), 2);
         });
+    }
+
+    #[test]
+    fn provider_icons_resolve_to_the_downloaded_set() {
+        assert_eq!(
+            provider_icon_path("openai").as_ref(),
+            "icons/provider/openai.svg"
+        );
+        assert_eq!(
+            provider_icon_path("opencode-zen").as_ref(),
+            "icons/provider/opencode.svg"
+        );
+        assert_eq!(
+            provider_icon_path("google-antigravity").as_ref(),
+            "icons/provider/google.svg"
+        );
+        assert_eq!(
+            provider_icon_path("not-a-provider").as_ref(),
+            "icons/provider/synthetic.svg"
+        );
+    }
+
+    #[test]
+    fn popular_provider_cards_use_the_two_column_icon_grid() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.open_agent_auth(id, AgentDialogPage::Models, window, cx);
+        });
+        cx.draw_frame().expect("draw model dialog");
+
+        let go = cx.debug_bounds("model-provider-opencode-go").unwrap();
+        let console = cx.debug_bounds("model-provider-opencode-zen").unwrap();
+        let openai = cx.debug_bounds("model-provider-openai").unwrap();
+        let anthropic = cx.debug_bounds("model-provider-anthropic").unwrap();
+        let google = cx.debug_bounds("model-provider-google").unwrap();
+        let copilot = cx.debug_bounds("model-provider-github-copilot").unwrap();
+        let more = cx.debug_bounds("agent-more-providers").unwrap();
+
+        assert!((go.center().y - console.center().y).abs() < px(1.0));
+        assert!(go.right() < console.left());
+        assert!(go.top() < openai.top());
+        assert!(go.size.height > openai.size.height);
+        assert!((openai.center().y - anthropic.center().y).abs() < px(1.0));
+        assert!(openai.right() < anthropic.left());
+        assert!(openai.top() < google.top());
+        assert!((google.center().y - copilot.center().y).abs() < px(1.0));
+        assert!(google.right() < copilot.left());
+        assert!(copilot.bottom() < more.top());
     }
 
     #[test]

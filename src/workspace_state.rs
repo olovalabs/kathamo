@@ -99,6 +99,8 @@ pub struct SavedChat {
     pub thinking_override: Option<String>,
     pub thinking_by_model: std::collections::HashMap<String, String>,
     pub selected_model: Option<AgentModel>,
+    /// Provider that produced the first assistant text in this conversation.
+    pub first_response_provider: Option<String>,
     /// True when `selected_model` is a deliberate choice, so `None` can mean
     /// "Automatic (rpi)" instead of "never picked one".
     #[serde(default)]
@@ -130,6 +132,7 @@ impl Default for SavedChat {
             thinking_override: None,
             thinking_by_model: Default::default(),
             selected_model: None,
+            first_response_provider: None,
             model_explicit: false,
             agent_title: None,
             prompt_title: None,
@@ -701,6 +704,7 @@ mod tests {
                                     id: "grok-4.7".into(),
                                     backend: crate::agent_auth::ModelBackend::Kathamo,
                                 }),
+                                first_response_provider: Some("anthropic".into()),
                                 model_explicit: true,
                                 agent_title: None,
                                 prompt_title: None,

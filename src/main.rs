@@ -2179,6 +2179,7 @@ struct PaneChat {
     auth_refresh_pending: bool,
     auth: Option<AuthModal>,
     selected_model: Option<agent_auth::AgentModel>,
+    first_response_provider: Option<String>,
     /// Retained for compatibility with older saved workspaces.
     model_explicit: bool,
     agent_title: Option<String>,
@@ -2232,6 +2233,7 @@ impl Default for PaneChat {
             auth_refresh_pending: false,
             auth: None,
             selected_model: None,
+            first_response_provider: None,
             model_explicit: false,
             agent_title: None,
             prompt_title: None,
@@ -2436,6 +2438,28 @@ impl PaneChat {
             .or(self.prompt_title.as_deref())
             .map(str::trim)
             .filter(|title| !title.is_empty())
+    }
+
+    /// Lock the conversation identity to the provider of its first answer.
+    fn record_first_response_provider(&mut self, event: &agent_bridge::AgentEvent) -> bool {
+        if self.first_response_provider.is_some()
+            || !matches!(event, agent_bridge::AgentEvent::Text(text) if !text.is_empty())
+            || self
+                .messages
+                .iter()
+                .any(|message| message.role == ChatRole::Assistant && !message.text.is_empty())
+        {
+            return false;
+        }
+        let Some(provider) = self
+            .bridge_model
+            .as_ref()
+            .map(|model| model.provider.clone())
+        else {
+            return false;
+        };
+        self.first_response_provider = Some(provider);
+        true
     }
 
     fn set_prompt_title(&mut self, title: String) {
@@ -2884,6 +2908,15 @@ fn sidebar_session_indices(
     (oldest_shown..session_count).rev()
 }
 
+/// Keep the active session reachable even when it is older than the preview.
+fn sidebar_visible_sessions(count: usize, visible: usize, active: Option<usize>) -> Vec<usize> {
+    let mut indices: Vec<_> = sidebar_session_indices(count, visible).collect();
+    if let Some(active) = active.filter(|&index| index < count && !indices.contains(&index)) {
+        indices.push(active);
+    }
+    indices
+}
+
 struct AppState {
     projects: Vec<Project>,
     active_project_idx: usize,
@@ -3085,6 +3118,10 @@ impl AppState {
                                         thinking_override: pane.chat.thinking_override.clone(),
                                         thinking_by_model: pane.chat.thinking_by_model.clone(),
                                         selected_model: pane.chat.selected_model.clone(),
+                                        first_response_provider: pane
+                                            .chat
+                                            .first_response_provider
+                                            .clone(),
                                         model_explicit: pane.chat.model_explicit,
                                         agent_title: pane.chat.agent_title.clone(),
                                         prompt_title: pane.chat.prompt_title.clone(),
@@ -3386,6 +3423,8 @@ impl AppState {
                     pane.chat.agent_title = saved_pane.chat.agent_title.clone();
                     pane.chat.prompt_title = saved_pane.chat.prompt_title.clone();
                     pane.chat.selected_model = self.effective_default_agent_model().cloned();
+                    pane.chat.first_response_provider =
+                        saved_pane.chat.first_response_provider.clone();
                     pane.chat.rpi_session_id = saved_pane.chat.rpi_session_id.clone();
                     pane.chat.terminal_draft = saved_pane.draft.clone();
                     pane.chat.agent_draft = saved_pane.agent_draft.clone();
@@ -4807,20 +4846,41 @@ impl AppState {
 
                 // Sidebar title/logo follow the pane the user is working in.
                 if let Some(idx) = primary_idx {
-                    let (primary_title, primary_status, conversation_title) = {
+                    let (
+                        primary_title,
+                        primary_status,
+                        conversation_title,
+                        reported_app,
+                        first_provider,
+                    ) = {
                         let pane = &session.panes[idx];
                         (
                             pane.title.clone(),
                             pane.status,
                             pane.chat.conversation_title().map(str::to_string),
+                            (pane.osc_report_active || pane.native_status.is_some())
+                                .then(|| pane.app.clone())
+                                .flatten(),
+                            pane.chat.first_response_provider.clone(),
                         )
                     };
-                    let next_logo = logos::resolve_session_logo(
+                    let mut next_logo = logos::resolve_session_logo(
                         &primary_fg,
                         Some(&primary_title),
                         primary_status,
                         &session.logo,
                     );
+                    if next_logo == logos::default_logo() {
+                        if let Some(path) = reported_app
+                            .as_deref()
+                            .and_then(|app| logos::registry().find_logo(app))
+                        {
+                            next_logo = SharedString::from(path.to_string());
+                        }
+                    }
+                    if let Some(provider) = first_provider.as_deref() {
+                        next_logo = provider_icon_path(provider);
+                    }
                     if session.logo != next_logo {
                         session.logo = next_logo;
                         changed = true;
@@ -6818,6 +6878,7 @@ impl AppState {
                         for event in drained {
                             let apply_start = std::time::Instant::now();
                             changed = true;
+                            session_changed |= pane.chat.record_first_response_provider(&event);
                             let delta_kind = match &event {
                                 agent_bridge::AgentEvent::Thinking(text) if !text.is_empty() => {
                                     Some(crate::stream_timing::DeltaKind::Reasoning)
@@ -12738,9 +12799,47 @@ impl AppState {
                             .px(px(14.0))
                             .pt(px(12.0))
                             .pb(px(10.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
                             .text_size(px(13.0))
                             .text_color(tokens.sidebar_section_header)
-                            .child("Projects"),
+                            .child("Projects")
+                            .when(!self.projects.is_empty(), |this| {
+                                let all_expanded = self.projects.iter().all(|p| p.expanded);
+                                let label = if all_expanded {
+                                    "Collapse all projects"
+                                } else {
+                                    "Expand all projects"
+                                };
+                                this.child(
+                                    sidebar_icon_button(
+                                        "sidebar-toggle-projects",
+                                        if all_expanded {
+                                            "icons/chevron-down.svg"
+                                        } else {
+                                            "icons/chevron-right.svg"
+                                        },
+                                        14.0,
+                                        &tokens,
+                                        cx.listener(move |this, _, _, cx| {
+                                            for project in &mut this.projects {
+                                                project.expanded = !all_expanded;
+                                            }
+                                            this.schedule_workspace_save(cx);
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .tooltip(move |_, cx| {
+                                        cx.new(|_| {
+                                            gpui_component::tooltip::Tooltip::new(
+                                                SharedString::from(label),
+                                            )
+                                        })
+                                        .into()
+                                    }),
+                                )
+                            }),
                     )
                     .pb(px(10.0))
                     .children(project_rows)
@@ -13695,9 +13794,16 @@ impl AppState {
                         .into_any_element(),
                 );
             }
-            for s_idx in
-                sidebar_session_indices(project.sessions.len(), project.visible_session_count)
-            {
+            let visible_sessions = sidebar_visible_sessions(
+                project.sessions.len(),
+                project.visible_session_count,
+                is_active_project.then_some(project.active_session_idx),
+            );
+            let hidden_count = project
+                .sessions
+                .len()
+                .saturating_sub(visible_sessions.len());
+            for s_idx in visible_sessions {
                 let session = &project.sessions[s_idx];
                 let is_active_session = is_active_project && s_idx == project.active_session_idx;
                 rows.push(self.render_session_entry(
@@ -13709,16 +13815,16 @@ impl AppState {
                 ));
             }
             for (show_more, visible) in [
-                (true, project.sessions.len() > project.visible_session_count),
+                (true, hidden_count > 0),
                 (false, project.visible_session_count > 5),
             ] {
                 if !visible {
                     continue;
                 }
                 let (id, label) = if show_more {
-                    ("project-show-more", "Show more")
+                    ("project-show-more", format!("Show more ({hidden_count})"))
                 } else {
-                    ("project-show-less", "Show less")
+                    ("project-show-less", "Show less".to_string())
                 };
                 rows.push(
                     div()
@@ -13933,19 +14039,6 @@ impl AppState {
                     .group_hover(group_name.clone(), |s| s.visible())
                     .debug_selector(|| "project-new-session".to_string()),
                 )
-                .child(
-                    sidebar_icon_button(
-                        ("project-close", project.id),
-                        "icons/x.svg",
-                        12.0,
-                        &tokens,
-                        cx.listener::<MouseDownEvent>(move |this, _, window, cx| {
-                            this.close_project(project_idx, window, cx);
-                        }),
-                    )
-                    .invisible()
-                    .group_hover(group_name.clone(), |s| s.visible()),
-                )
                 .into_any_element()
         };
 
@@ -13981,8 +14074,12 @@ impl AppState {
                             .hover(move |s| s.bg(tokens.sidebar_icon_btn_hover))
                             .child(
                                 svg()
-                                    .path("icons/folder.svg")
-                                    .size(px(17.0))
+                                    .path(if project.expanded {
+                                        "icons/chevron-down.svg"
+                                    } else {
+                                        "icons/chevron-right.svg"
+                                    })
+                                    .size(px(14.0))
                                     .text_color(tokens.sidebar_icon),
                             )
                             .on_mouse_down(
@@ -14215,7 +14312,7 @@ impl AppState {
             .ml(px(6.0))
             .mr(px(6.0))
             .h(px(32.0))
-            .pl(px(12.0))
+            .pl(px(24.0))
             .pr(px(4.0))
             .rounded(px(8.0))
             .cursor(CursorStyle::PointingHand)
@@ -14239,6 +14336,7 @@ impl AppState {
                     s.bg(tokens.sidebar_item_hover)
                 }
             })
+            .child(session_logo_icon(session.logo.clone(), tokens.sidebar_icon))
             .child(
                 div()
                     .flex_1()
@@ -14791,7 +14889,7 @@ impl Render for AppState {
                                     .items_center()
                                     .justify_center()
                                     .flex_shrink_0()
-                                    .child(gpui::img(logo).size(px(14.0)).rounded(px(2.0)))
+                                    .child(session_logo_icon(logo, tokens.titlebar_fg))
                             }))
                             .child(format!("{active_project_name} — {active_title}"))
                             .children(titlebar_status.map(|status| {
@@ -14960,6 +15058,22 @@ fn truncate_title(title: &SharedString) -> SharedString {
     match title.as_str().char_indices().nth(160) {
         Some((idx, _)) => SharedString::from(format!("{}...", &title.as_str()[..idx])),
         None => title.clone(),
+    }
+}
+
+/// SVG icons follow the current theme; raster agent logos keep their own colors.
+fn session_logo_icon(logo: SharedString, color: Hsla) -> gpui::AnyElement {
+    if logo.ends_with(".svg") {
+        svg()
+            .path(logo)
+            .size(px(14.0))
+            .text_color(color)
+            .into_any_element()
+    } else {
+        gpui::img(logo)
+            .size(px(14.0))
+            .rounded(px(2.0))
+            .into_any_element()
     }
 }
 
@@ -15173,7 +15287,11 @@ fn startup_mark(label: &str) {
     if std::env::var_os("KATHAMO_STARTUP_TIMINGS").is_some() {
         eprintln!(
             "[startup] {label}: {:.2}ms",
-            START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
+            START
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_secs_f64()
+                * 1000.0
         );
     }
 }
@@ -17399,6 +17517,17 @@ mod pane_tests {
     }
 
     #[test]
+    fn sidebar_keeps_an_older_active_session_visible_without_duplicates() {
+        assert_eq!(
+            sidebar_visible_sessions(8, 5, Some(0)),
+            vec![7, 6, 5, 4, 3, 0]
+        );
+        assert_eq!(sidebar_visible_sessions(8, 5, Some(5)), vec![7, 6, 5, 4, 3]);
+        assert_eq!(sidebar_visible_sessions(2, 5, Some(9)), vec![1, 0]);
+        assert!(sidebar_visible_sessions(0, 5, Some(0)).is_empty());
+    }
+
+    #[test]
     fn new_sidebar_session_renders_first_and_stays_on_the_first_page() {
         let mut cx = TestAppContext::new();
         let (mut cx, app_state) = open_app(&mut cx);
@@ -18420,6 +18549,40 @@ First report
         assert_eq!(chat.mode_thinking_level(), "high");
         chat.selected_model = Some(model("third"));
         assert_eq!(chat.mode_thinking_level(), "low");
+    }
+
+    #[test]
+    fn first_response_provider_is_recorded_once_from_the_running_model() {
+        let model = |provider: &str| agent_auth::AgentModel {
+            provider: provider.into(),
+            id: "model".into(),
+            backend: agent_auth::ModelBackend::Kathamo,
+        };
+        let mut chat = PaneChat {
+            bridge_model: Some(model("anthropic")),
+            selected_model: Some(model("openai")),
+            ..Default::default()
+        };
+        assert!(
+            !chat.record_first_response_provider(&agent_bridge::AgentEvent::Thinking(
+                "thinking".into()
+            ))
+        );
+        assert!(
+            !chat.record_first_response_provider(&agent_bridge::AgentEvent::Text(String::new()))
+        );
+        assert!(
+            chat.record_first_response_provider(&agent_bridge::AgentEvent::Text("Hello".into()))
+        );
+        chat.bridge_model = Some(model("openai"));
+        assert!(
+            !chat.record_first_response_provider(&agent_bridge::AgentEvent::Text("Next".into()))
+        );
+        assert_eq!(chat.first_response_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            provider_icon_path(chat.first_response_provider.as_deref().unwrap()).as_ref(),
+            "icons/provider/anthropic.svg"
+        );
     }
 
     #[test]

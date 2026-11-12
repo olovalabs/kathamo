@@ -8,7 +8,7 @@ use crate::agent_rules;
 use crate::assets::AppAssets;
 use crate::status::SessionStatus;
 
-pub const DEFAULT_LOGO: &str = "logos/cmd.png";
+pub const DEFAULT_LOGO: &str = "icons/terminal.svg";
 
 pub fn default_logo() -> SharedString {
     SharedString::from(DEFAULT_LOGO)
@@ -95,6 +95,10 @@ impl LogoRegistry {
     pub fn find_logo_normalized(&self, key: &str) -> Option<&str> {
         if key.is_empty() {
             return None;
+        }
+
+        if matches!(key, "commandcode" | "command-code") {
+            return self.stems.get("cmd").map(String::as_str);
         }
 
         // 1. Exact match on stem (e.g. "claude", "openclaw", "omp", "freebuff", "agy", "herdr", "cursor")
@@ -216,7 +220,7 @@ pub fn resolve_session_logo(
         return SharedString::from(current_logo.to_string());
     }
 
-    // 4. Default fallback: command prompt icon
+    // 4. Default fallback: a neutral terminal icon.
     default_logo()
 }
 
@@ -258,6 +262,8 @@ mod tests {
         assert_eq!(reg.find_logo("hermes-agent"), Some("logos/hermes.png"));
         assert_eq!(reg.find_logo("grok-build"), Some("logos/grok.png"));
         assert_eq!(reg.find_logo(".cline"), Some("logos/cline.png"));
+        assert_eq!(reg.find_logo("command-code"), Some("logos/cmd.png"));
+        assert_eq!(reg.find_logo("commandcode"), Some("logos/cmd.png"));
     }
 
     #[test]
@@ -272,6 +278,14 @@ mod tests {
         let fg: Vec<String> = vec![];
         let logo = resolve_session_logo(&fg, Some("terminal 1"), SessionStatus::Idle, DEFAULT_LOGO);
         assert_eq!(logo.as_ref(), DEFAULT_LOGO);
+        assert_ne!(logo.as_ref(), "logos/cmd.png");
+    }
+
+    #[test]
+    fn command_code_uses_its_own_logo_when_detected() {
+        let fg = vec!["command-code".to_string()];
+        let logo = resolve_session_logo(&fg, None, SessionStatus::Working, DEFAULT_LOGO);
+        assert_eq!(logo.as_ref(), "logos/cmd.png");
     }
 
     #[test]

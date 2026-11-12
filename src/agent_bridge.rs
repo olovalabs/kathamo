@@ -36,6 +36,8 @@ pub enum AgentEvent {
     Text(String),
     Thinking(String),
     Status(String),
+    /// Usage delta for one finalized assistant message, retained in JSONL.
+    Usage(rpi_embedded::AgentUsage),
     Tool(String),
     ToolStart {
         id: Option<String>,
@@ -73,6 +75,7 @@ impl QueuedEvent for AgentEvent {
             Self::ToolStart { id, name, input } => id.as_ref().map_or(0, String::len) + name.len() + input.len(),
             Self::ToolUpdate { id, name, output } | Self::ToolEnd { id, name, output, .. } =>
                 id.as_ref().map_or(0, String::len) + name.len() + output.len(),
+            Self::Usage(_) => std::mem::size_of::<rpi_embedded::AgentUsage>(),
             Self::Subagents { tool_id, workers } => tool_id.len() + workers.iter().map(|worker| {
                 worker.id.len() + worker.title.len() + worker.status.len() +
                 worker.result.as_ref().map_or(0, String::len) +
@@ -323,6 +326,7 @@ impl EmbeddedBridge {
                 SessionEvent::Text(text) => events.push(AgentEvent::Text(text)),
                 SessionEvent::Thinking(text) => events.push(AgentEvent::Thinking(text)),
                 SessionEvent::Status(text) => events.push(AgentEvent::Status(text)),
+                SessionEvent::Usage(usage) => events.push(AgentEvent::Usage(usage)),
                 SessionEvent::ToolStart { id, name, input } => {
                     events.push(AgentEvent::ToolStart { id, name, input })
                 }
@@ -536,6 +540,18 @@ fn decode_event(record: &Value) -> Vec<AgentEvent> {
         }
         "message_end" => {
             let message = &record["message"];
+            if message["role"] == "assistant" && message["usage"].is_object() {
+                let usage = &message["usage"];
+                let cost = usage["cost"]["total"].as_f64()
+                    .filter(|cost| cost.is_finite() && *cost > 0.0);
+                events.push(AgentEvent::Usage(rpi_embedded::AgentUsage {
+                    input: usage["input"].as_i64().unwrap_or_default(),
+                    output: usage["output"].as_i64().unwrap_or_default(),
+                    cache_read: usage["cacheRead"].as_i64().unwrap_or_default(),
+                    cache_write: usage["cacheWrite"].as_i64().unwrap_or_default(),
+                    cost,
+                }));
+            }
             if message["role"] == "assistant" && message["stopReason"] == "error" {
                 let error = message["errorMessage"]
                     .as_str()

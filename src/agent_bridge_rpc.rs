@@ -342,6 +342,18 @@ fn decode_event(record: &Value) -> Vec<AgentEvent> {
         }
         "message_end" => {
             let message = &record["message"];
+            if message["role"] == "assistant" && let Some(usage) = message["usage"].as_object() {
+                let count = |key: &str| usage.get(key).and_then(Value::as_i64).unwrap_or(0);
+                let cost = usage.get("cost").and_then(|cost| cost["total"].as_f64())
+                    .filter(|cost| cost.is_finite() && *cost > 0.0);
+                events.push(AgentEvent::Usage(rpi_embedded::AgentUsage {
+                    input: count("input"),
+                    output: count("output"),
+                    cache_read: count("cacheRead"),
+                    cache_write: count("cacheWrite"),
+                    cost,
+                }));
+            }
             if message["role"] == "assistant" && message["stopReason"] == "error" {
                 let error = message["errorMessage"]
                     .as_str()
@@ -369,6 +381,29 @@ fn decode_event(record: &Value) -> Vec<AgentEvent> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_finalized_rpc_message_includes_failed_request_tokens() {
+        let events = decode_event(&json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant", "stopReason": "error", "errorMessage": "interrupted",
+                "usage": {
+                    "input": 10, "output": 3, "cacheRead": 20, "cacheWrite": 5,
+                    "cost": {"total": 0.001}
+                }
+            }
+        }));
+        assert!(matches!(&events[..], [
+            AgentEvent::Usage(usage), AgentEvent::Error(error)
+        ] if usage.input == 10 && usage.output == 3 && usage.cache_read == 20
+            && usage.cache_write == 5 && usage.cost == Some(0.001) && error == "interrupted"));
+        let events = decode_event(&json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "usage": {"input": 2, "cost": {"total": 0.0}}}
+        }));
+        assert!(matches!(&events[..], [AgentEvent::Usage(usage)] if usage.cost.is_none()));
+    }
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 

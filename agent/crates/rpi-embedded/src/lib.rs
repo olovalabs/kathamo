@@ -199,13 +199,24 @@ pub fn set_tool_output_hook(hook: fn(&str)) {
     let _ = TOOL_OUTPUT_HOOK.set(hook);
 }
 
+/// Usage delta for one finalized assistant message. Unknown pricing is not free.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AgentUsage {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub cost: Option<f64>,
+}
+
 /// Events delivered to the host. This mirrors Kathamo's existing chat event
 /// consumer so the subprocess bridge can be replaced without changing the UI.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SessionEvent {
     Text(String),
     Thinking(String),
     Status(String),
+    Usage(AgentUsage),
     ToolStart {
         id: Option<String>,
         name: String,
@@ -480,6 +491,7 @@ impl QueuedEvent for SessionEvent {
             Self::ToolStart { id, name, input } => id.as_ref().map_or(0, String::len) + name.len() + input.len(),
             Self::ToolUpdate { id, name, output } | Self::ToolEnd { id, name, output, .. } =>
                 id.as_ref().map_or(0, String::len) + name.len() + output.len(),
+            Self::Usage(_) => std::mem::size_of::<AgentUsage>(),
             Self::Done | Self::Closed => 0,
         }
     }
@@ -558,6 +570,7 @@ struct HostEmitter {
 impl rpi_agent::AgentEmitter for HostEmitter {
     fn emit(&self, event: RpiEvent) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         let pending = Arc::clone(&self.pending);
+        let usage = finalized_usage(&event);
         let event = pending_event(event);
         if let (Some(hook), Some(PendingEvent::Ready(event))) = (&self.delta_arrival, &event) {
             match event {
@@ -567,6 +580,11 @@ impl rpi_agent::AgentEmitter for HostEmitter {
             }
         }
         Box::pin(async move {
+            if let Some(usage) = usage {
+                if pending.send(PendingEvent::Ready(SessionEvent::Usage(usage))).await.is_err() {
+                    return;
+                }
+            }
             if let Some(event) = event { let _ = pending.send(event).await; }
         })
     }
@@ -1175,6 +1193,20 @@ async fn send_fatal(events: &EventQueue<SessionEvent>, wake: &Wake, message: Str
     }
 }
 
+fn finalized_usage(event: &RpiEvent) -> Option<AgentUsage> {
+    let RpiEvent::MessageEnd { message: AgentMessage::Assistant(assistant), .. } = event else {
+        return None;
+    };
+    let usage = &assistant.usage;
+    Some(AgentUsage {
+        input: usage.input,
+        output: usage.output,
+        cache_read: usage.cache_read,
+        cache_write: usage.cache_write,
+        cost: (usage.cost.total.is_finite() && usage.cost.total > 0.0).then_some(usage.cost.total),
+    })
+}
+
 fn pending_event(event: RpiEvent) -> Option<PendingEvent> {
     let event = match event {
         RpiEvent::MessageUpdate { assistant_message_event, .. } => match assistant_message_event {
@@ -1232,9 +1264,15 @@ fn tool_output_arrived(id: &str, result: &rpi_agent::AgentToolResult) {
 
 #[cfg(test)]
 async fn forward_event(event: RpiEvent, events: &EventQueue<SessionEvent>) -> bool {
+    let sent_usage = if let Some(usage) = finalized_usage(&event) {
+        if events.send(SessionEvent::Usage(usage)).await.is_err() { return false; }
+        true
+    } else {
+        false
+    };
     match pending_event(event) {
         Some(event) => events.send(event.into_session()).await.is_ok(),
-        None => false,
+        None => sent_usage,
     }
 }
 
@@ -1556,6 +1594,51 @@ fn run_oauth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn finalized_usage_is_emitted_once_with_partial_failures_and_unknown_prices() {
+        let pending = Arc::new(EventQueue::default());
+        let emitter = HostEmitter { pending: Arc::clone(&pending), delta_arrival: None };
+        for (stop_reason, cost) in [
+            (StopReason::Stop, 0.25),
+            (StopReason::Error, 0.0),
+            (StopReason::Aborted, 0.0),
+        ] {
+            let mut assistant = rpi_ai::AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "m", 0);
+            assistant.usage.input = 9_007_199_254_740_993;
+            assistant.usage.output = 12;
+            assistant.usage.cache_read = 34;
+            assistant.usage.cache_write = 56;
+            assistant.usage.cost.total = cost;
+            assistant.stop_reason = stop_reason;
+            assistant.error_message = Some("provider failed".into());
+            let partial = Arc::new(assistant.clone());
+            rpi_agent::AgentEmitter::emit(&emitter, RpiEvent::MessageUpdate {
+                message_id: None,
+                message: Arc::clone(&partial),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0, delta: "partial".into(), partial,
+                },
+            }).await;
+            rpi_agent::AgentEmitter::emit(&emitter, RpiEvent::MessageEnd {
+                message: AgentMessage::Assistant(Box::new(assistant)), message_id: None,
+            }).await;
+            let (raw, more) = pending.drain();
+            assert!(!more);
+            let events: Vec<_> = raw.into_iter().map(PendingEvent::into_session).collect();
+            assert_eq!(events[0], SessionEvent::Text("partial".into()));
+            assert_eq!(events[1], SessionEvent::Usage(AgentUsage {
+                input: 9_007_199_254_740_993, output: 12, cache_read: 34, cache_write: 56,
+                cost: (cost > 0.0).then_some(cost),
+            }));
+            if stop_reason == StopReason::Error {
+                assert_eq!(events[2], SessionEvent::Error("provider failed".into()));
+                assert_eq!(events.len(), 3);
+            } else {
+                assert_eq!(events.len(), 2);
+            }
+        }
+    }
 
     fn test_session(events: Arc<EventQueue<SessionEvent>>) -> (EmbeddedSession, tokio::sync::mpsc::Receiver<QueuedCommand>) {
         let (commands, receiver) = tokio::sync::mpsc::channel(COMMAND_RECORDS);

@@ -1632,6 +1632,7 @@ fn push_chat_event(messages: &mut Vec<Arc<ChatMessage>>, event: agent_bridge::Ag
         agent_bridge::AgentEvent::Error(text) => (ChatRole::Error, text),
         // The session title is metadata, not transcript content.
         agent_bridge::AgentEvent::Title(_)
+        | agent_bridge::AgentEvent::Usage(_)
         | agent_bridge::AgentEvent::Done
         | agent_bridge::AgentEvent::Closed => return,
     };
@@ -1799,6 +1800,9 @@ struct PaneChat {
     status: SessionStatus,
     /// Completed turns in this conversation.
     completed_turns: u64,
+    usage: Option<rpi_embedded::AgentUsage>,
+    usage_label: SharedString,
+    usage_detail: SharedString,
     terminal_draft: String,
     agent_draft: String,
     /// Virtualized transcript state. Only rows near the viewport are built.
@@ -1846,6 +1850,9 @@ impl Default for PaneChat {
             running: false,
             status: SessionStatus::Idle,
             completed_turns: 0,
+            usage: None,
+            usage_label: "In — · Out — · Cache R — / W — · Cost —".into(),
+            usage_detail: "Conversation usage appears after a model response completes.".into(),
             terminal_draft: String::new(),
             agent_draft: String::new(),
             list_state: {
@@ -1879,9 +1886,49 @@ impl Default for PaneChat {
 }
 
 impl PaneChat {
+    fn set_usage(&mut self, usage: rpi_embedded::AgentUsage) {
+        fn compact(count: i64) -> String {
+            if count >= 1_000_000 {
+                format!("{:.1}m", count as f64 / 1_000_000.0)
+            } else if count >= 1_000 {
+                format!("{:.1}k", count as f64 / 1_000.0)
+            } else {
+                count.to_string()
+            }
+        }
+        let cost = usage.cost.map(|cost| format!("~${cost:.4}"))
+            .unwrap_or_else(|| "Cost —".into());
+        self.usage_label = format!(
+            "In {} · Out {} · Cache R {} / W {} · {cost}",
+            compact(usage.input), compact(usage.output),
+            compact(usage.cache_read), compact(usage.cache_write),
+        ).into();
+        self.usage_detail = format!(
+            "Conversation totals from completed model responses: {} uncached input tokens, {} output tokens, {} cache-read tokens, {} cache-write tokens. {}",
+            usage.input, usage.output, usage.cache_read, usage.cache_write,
+            if usage.cost.is_some() {
+                "Estimated USD cost from model rates; not an account balance or invoice."
+            } else {
+                "Cost unavailable for one or more responses; not assumed free."
+            },
+        ).into();
+        self.usage = Some(usage);
+    }
+
     fn observe_status(&mut self, event: &agent_bridge::AgentEvent) {
         use agent_bridge::AgentEvent;
         match event {
+            AgentEvent::Usage(usage) => {
+                let mut total = self.usage.unwrap_or(*usage);
+                if self.usage.is_some() {
+                    total.input = total.input.saturating_add(usage.input);
+                    total.output = total.output.saturating_add(usage.output);
+                    total.cache_read = total.cache_read.saturating_add(usage.cache_read);
+                    total.cache_write = total.cache_write.saturating_add(usage.cache_write);
+                    total.cost = total.cost.zip(usage.cost).map(|(a, b)| a + b);
+                }
+                self.set_usage(total);
+            }
             AgentEvent::Error(_) => self.status = SessionStatus::Error,
             AgentEvent::Done => {
                 if self.running && self.status != SessionStatus::Error {
@@ -2503,6 +2550,7 @@ struct RestoreData {
     workspace: workspace_state::SavedWorkspace,
     scrollbacks: HashMap<String, String>,
     transcripts: HashMap<String, Vec<Arc<ChatMessage>>>,
+    usage: HashMap<String, rpi_embedded::AgentUsage>,
 }
 
 fn transcript_key(uid: &str, key: &str) -> String {
@@ -2816,6 +2864,7 @@ impl AppState {
             workspace,
             scrollbacks,
             transcripts,
+            usage,
         } = restored;
         let max_id = workspace.max_id();
         let active_project_path = workspace.active_project.clone();
@@ -2927,6 +2976,9 @@ impl AppState {
                         pane.chat.conversation = Some(conversations::Log::open(&pane.uid, key));
                         if let Some(messages) = transcripts.get(&transcript_key(&pane.uid, key)) {
                             pane.chat.messages = messages.clone();
+                        }
+                        if let Some(total) = usage.get(&transcript_key(&pane.uid, key)) {
+                            pane.chat.set_usage(*total);
                         }
                     }
 
@@ -9065,6 +9117,20 @@ impl AppState {
                         hint.child(
                             "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images",
                         )
+                    })
+                    .when(pane.chat.active && pane.chat.worker_view.is_none(), |hint| {
+                        let detail = pane.chat.usage_detail.clone();
+                        hint.child(
+                            div()
+                                .id(("agent-usage", pane_id))
+                                .debug_selector(|| "agent-usage".into())
+                                .min_w_0()
+                                .truncate()
+                                .child(pane.chat.usage_label.clone())
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
+                                }),
+                        )
                     }),
             )
             .when(pane.chat.active && pane.chat.info_open, |this| {
@@ -14434,6 +14500,7 @@ fn main() -> Result<()> {
                                         workspace: workspace_state::SavedWorkspace::default(),
                                         scrollbacks: HashMap::new(),
                                         transcripts: HashMap::new(),
+                                        usage: HashMap::new(),
                                     };
                                 };
                                 let workspace = if restore_enabled {
@@ -14443,6 +14510,7 @@ fn main() -> Result<()> {
                                 };
                                 let mut scrollbacks = HashMap::new();
                                 let mut transcripts = HashMap::new();
+                                let mut usage = HashMap::new();
                                 let mut live_uids = HashSet::new();
                                 for project in &workspace.projects {
                                     for session in &project.sessions {
@@ -14466,6 +14534,9 @@ fn main() -> Result<()> {
                                                         .join(&pane.uid)
                                                         .join(format!("{key}.jsonl"));
                                                     let messages = conversations::load(&conversation_path);
+                                                    if let Some(total) = conversations::load_usage(&conversation_path) {
+                                                        usage.insert(transcript_key(&pane.uid, &key), total);
+                                                    }
                                                     if !messages.is_empty() {
                                                         transcripts.insert(
                                                             transcript_key(&pane.uid, &key),
@@ -14486,6 +14557,7 @@ fn main() -> Result<()> {
                                     workspace,
                                     scrollbacks,
                                     transcripts,
+                                    usage,
                                 }
                             })
                             .await;
@@ -14887,6 +14959,50 @@ mod resize_tests {
         let cx = VisualTestContext::from_window(*handle.deref(), cx);
         cx.run_until_parked();
         (cx, state)
+    }
+
+    #[test]
+    fn usage_composer_accumulates_finalized_responses_and_preserves_unknown_cost() {
+        use agent_bridge::AgentEvent;
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        cx.update_window_entity(&state, |s, _, cx| {
+            let chat = &mut s.projects[0].sessions[0].panes[0].chat;
+            chat.active = true;
+            chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage {
+                input: 1200, output: 80, cache_read: 8000, cache_write: 500, cost: Some(0.012),
+            }));
+            chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage {
+                input: 300, output: 20, cache_read: 1000, cache_write: 0, cost: Some(0.003),
+            }));
+            chat.observe_status(&AgentEvent::Done);
+            assert_eq!(chat.usage.unwrap(), rpi_embedded::AgentUsage {
+                input: 1500, output: 100, cache_read: 9000, cache_write: 500, cost: Some(0.015),
+            });
+            cx.notify();
+        });
+        cx.draw_frame().expect("render usage footer");
+        let footer = cx.debug_bounds("agent-usage").expect("agent usage visible");
+        let editor = cx.debug_bounds("agent-composer-input").unwrap();
+        let bar = cx.debug_bounds("kathamo-input-bar").unwrap();
+        assert!(footer.top() >= editor.bottom());
+        assert!(footer.bottom() <= bar.bottom());
+        assert!(footer.right() <= bar.right());
+        if let Some(path) = std::env::var_os("KATHAMO_USAGE_SCREENSHOT") {
+            cx.update(|window, _| window.render_to_image().unwrap().save(path).unwrap());
+        }
+        cx.update_window_entity(&state, |s, _, cx| {
+            let chat = &mut s.projects[0].sessions[0].panes[0].chat;
+            chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage {
+                input: 5, output: 1, ..Default::default()
+            }));
+            assert_eq!(chat.usage.unwrap().input, 1505);
+            assert_eq!(chat.usage.unwrap().cost, None, "partial pricing must not understate cost");
+            chat.active = false;
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-usage").is_none(), "terminal mode hides agent metrics");
     }
 
     #[test]
@@ -15453,6 +15569,7 @@ Done."#
                     workspace: workspace.clone(),
                     scrollbacks: HashMap::new(),
                     transcripts,
+                    usage: HashMap::new(),
                 },
                 cx,
             );
@@ -15538,6 +15655,7 @@ Done."#
                     workspace,
                     scrollbacks: HashMap::new(),
                     transcripts: HashMap::new(),
+                    usage: HashMap::new(),
                 },
                 cx,
             );

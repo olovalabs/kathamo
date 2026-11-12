@@ -319,6 +319,7 @@ fn project_event(event: &AgentEvent) -> AgentEvent {
         },
         AgentEvent::Error(text) => AgentEvent::Error(capped(text, MAX_ENTRY_BYTES)),
         AgentEvent::Title(text) => AgentEvent::Title(capped(text, 200)),
+        AgentEvent::Usage(usage) => AgentEvent::Usage(*usage),
         AgentEvent::Done => AgentEvent::Done,
         AgentEvent::Closed => AgentEvent::Closed,
     }
@@ -393,6 +394,30 @@ pub fn load(path: &Path) -> Vec<std::sync::Arc<ChatMessage>> {
     }
     normalize_replay(&mut messages);
     messages
+}
+
+/// Restore cumulative usage from the same bounded history as the transcript.
+/// Missing usage or files yield `None`; any unknown message cost stays unknown.
+pub fn load_usage(path: &Path) -> Option<rpi_embedded::AgentUsage> {
+    let text = read_bounded(path)?;
+    let mut total: Option<rpi_embedded::AgentUsage> = None;
+    for line in text.lines() {
+        let Ok(Entry::Event { event: AgentEvent::Usage(usage) }) =
+            serde_json::from_str::<Entry>(line.trim())
+        else {
+            continue;
+        };
+        if let Some(total) = total.as_mut() {
+            total.input = total.input.saturating_add(usage.input);
+            total.output = total.output.saturating_add(usage.output);
+            total.cache_read = total.cache_read.saturating_add(usage.cache_read);
+            total.cache_write = total.cache_write.saturating_add(usage.cache_write);
+            total.cost = total.cost.zip(usage.cost).map(|(total, cost)| total + cost);
+        } else {
+            total = Some(usage);
+        }
+    }
+    total
 }
 
 fn read_bounded(path: &Path) -> Option<String> {
@@ -517,6 +542,116 @@ mod tests {
         let path = log.path().to_path_buf();
         drop(log);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn usage_replays_multiple_finalized_messages() {
+        let mut log = temp_log("usage-messages", MAX_FILE_BYTES);
+        log.append_user("first");
+        log.append_event(&AgentEvent::Text("answer".into()));
+        log.append_event(&AgentEvent::Usage(rpi_embedded::AgentUsage {
+            input: 100, output: 20, cache_read: 40, cache_write: 10, cost: Some(0.125),
+        }));
+        log.append_event(&AgentEvent::Done);
+        log.append_user("second");
+        log.append_event(&AgentEvent::Text("another answer".into()));
+        log.append_event(&AgentEvent::Usage(rpi_embedded::AgentUsage {
+            input: 200, output: 30, cache_read: 80, cache_write: 15, cost: Some(0.25),
+        }));
+        log.append_event(&AgentEvent::Done);
+        log.flush();
+
+        assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
+            input: 300, output: 50, cache_read: 120, cache_write: 25, cost: Some(0.375),
+        }));
+        let messages = load(log.path());
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].text, "answer");
+        assert_eq!(messages[3].text, "another answer");
+        assert!(messages.iter().all(|message| !message.streaming));
+        // Replaying is read-only and never adds the deltas a second time.
+        assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
+            input: 300, output: 50, cache_read: 120, cache_write: 25, cost: Some(0.375),
+        }));
+
+        let path = log.path().to_path_buf();
+        drop(log);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn usage_replay_preserves_unknown_cost() {
+        for costs in [[Some(0.25), None, Some(0.5)], [None, Some(0.25), Some(0.5)]] {
+            let mut log = temp_log("usage-unknown-cost", MAX_FILE_BYTES);
+            for cost in costs {
+                log.append_event(&AgentEvent::Usage(rpi_embedded::AgentUsage {
+                    input: 10, output: 2, cache_read: 3, cache_write: 4, cost,
+                }));
+            }
+            log.flush();
+            assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
+                input: 30, output: 6, cache_read: 9, cache_write: 12, cost: None,
+            }));
+            let path = log.path().to_path_buf();
+            drop(log);
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn usage_replay_skips_corrupt_lines_and_absent_usage() {
+        let mut log = temp_log("usage-corrupt", MAX_FILE_BYTES);
+        assert_eq!(load_usage(log.path()), None);
+        log.append_user("hello");
+        log.flush();
+        assert_eq!(load_usage(log.path()), None);
+
+        let usage = rpi_embedded::AgentUsage {
+            input: 15, output: 5, cache_read: 2, cache_write: 1, cost: Some(0.0),
+        };
+        let entry = serde_json::to_string(&Entry::Event {
+            event: AgentEvent::Usage(usage),
+        }).unwrap();
+        fs::write(log.path(), format!(
+            "not json\n\n{entry}\n{{\"t\":\"event\",\"event\":null}}\n{entry}\n{{"
+        )).unwrap();
+        assert_eq!(load_usage(log.path()), Some(rpi_embedded::AgentUsage {
+            input: 30, output: 10, cache_read: 4, cache_write: 2, cost: Some(0.0),
+        }));
+        assert!(load(log.path()).is_empty());
+
+        let path = log.path().to_path_buf();
+        drop(log);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn usage_replay_uses_the_transcript_read_bound() {
+        let log = temp_log("usage-bounded", MAX_FILE_BYTES);
+        let usage = rpi_embedded::AgentUsage {
+            input: 10, output: 2, cache_read: 3, cache_write: 4, cost: Some(0.125),
+        };
+        let entry = serde_json::to_string(&Entry::Event {
+            event: AgentEvent::Usage(usage),
+        }).unwrap();
+        let mut file = File::create(log.path()).unwrap();
+        writeln!(file, "{entry}").unwrap();
+        // A sparse oversized line puts the first usage outside the read window.
+        file.seek(SeekFrom::Start(MAX_FILE_BYTES + 1024)).unwrap();
+        writeln!(file).unwrap();
+        writeln!(file, "{entry}").unwrap();
+        writeln!(file, "{}", serde_json::to_string(&Entry::User {
+            text: "retained".into(),
+        }).unwrap()).unwrap();
+        drop(file);
+
+        assert_eq!(load_usage(log.path()), Some(usage));
+        let messages = load(log.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "retained");
+        let path = log.path().to_path_buf();
+        drop(log);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

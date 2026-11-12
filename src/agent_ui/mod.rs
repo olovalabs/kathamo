@@ -165,6 +165,7 @@ pub(crate) fn split_ui_segments(text: &str) -> Vec<Segment<'_>> {
     let mut markdown_start = 0usize;
     let mut offset = 0usize;
     let mut open: Option<(u8, usize, usize)> = None;
+    let mut markdown_fence: Option<(u8, usize)> = None;
 
     for line in text.split_inclusive('\n') {
         let start = offset;
@@ -173,13 +174,22 @@ pub(crate) fn split_ui_segments(text: &str) -> Vec<Segment<'_>> {
         let indent = line.len() - trimmed.len();
 
         if let Some((marker, len, content_start)) = open {
-            if crate::fence_close(trimmed, marker, len) {
+            if indent <= 3 && crate::fence_close(trimmed, marker, len) {
                 segments.push(Segment::Ui {
                     raw: &text[content_start..start],
                     closed: true,
                 });
                 markdown_start = offset;
                 open = None;
+            }
+            continue;
+        }
+
+        // A UI-looking fence inside a regular code block is literal code.
+        // Track the outer fence so it cannot turn an example into a live card.
+        if let Some((marker, len)) = markdown_fence {
+            if indent <= 3 && crate::fence_close(trimmed, marker, len) {
+                markdown_fence = None;
             }
             continue;
         }
@@ -195,6 +205,8 @@ pub(crate) fn split_ui_segments(text: &str) -> Vec<Segment<'_>> {
                 }
                 markdown_start = offset;
                 open = Some((marker, len, offset));
+            } else {
+                markdown_fence = Some((marker, len));
             }
         }
     }
@@ -1838,6 +1850,23 @@ mod tests {
             matches!(segments[1], Segment::Ui { raw, closed: true } if raw.trim() == "{\"a\":1}")
         );
         assert!(matches!(segments[2], Segment::Markdown(text) if text.contains("After")));
+    }
+
+    #[test]
+    fn ui_fences_inside_code_examples_remain_markdown() {
+        let text = "~~~~markdown\n```ui\n{\"root\":\"example\"}\n```\n~~~~\n\n```ui\n{}\n```";
+        let segments = split_ui_segments(text);
+        assert_eq!(segments.len(), 2);
+        assert!(matches!(segments[0], Segment::Markdown(code) if code.contains("```ui")));
+        assert!(matches!(segments[1], Segment::Ui { raw, closed: true } if raw.trim() == "{}"));
+    }
+
+    #[test]
+    fn indented_fence_does_not_close_ui_block() {
+        let segments = split_ui_segments("```ui\n    ```\n{}\n```\n");
+        assert!(
+            matches!(segments.as_slice(), [Segment::Ui { raw, closed: true }] if raw.contains("    ```\n{}"))
+        );
     }
 
     #[test]

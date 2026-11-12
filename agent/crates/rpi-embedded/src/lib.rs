@@ -113,6 +113,29 @@ pub fn auth_methods_for_cwd(provider: &str, cwd: &Path) -> AuthMethods {
 pub struct ModelInfo {
     pub provider: String,
     pub id: String,
+    pub thinking_levels: Vec<String>,
+}
+
+fn model_thinking_levels(model: &rpi_ai::Model) -> Vec<String> {
+    if !model.reasoning {
+        return Vec::new();
+    }
+    model
+        .supported_thinking_levels()
+        .into_iter()
+        .filter(|level| {
+            !matches!(
+                level,
+                rpi_ai::ThinkingLevel::Off | rpi_ai::ThinkingLevel::Minimal
+            )
+        })
+        .filter_map(|level| {
+            serde_json::to_value(level)
+                .ok()?
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Local provider readiness. No credential material is exposed.
@@ -135,14 +158,22 @@ fn catalog_filtered(chat_only: bool) -> Result<Vec<ModelInfo>, String> {
                 .into_iter()
                 .filter(|model| !chat_only || rpi_runtime::catalog::is_chat_model(model))
                 .map(|model| ModelInfo {
+                    thinking_levels: model_thinking_levels(&model),
                     provider: model.provider,
                     id: model.id,
                 })
                 .collect();
             rows.retain(|model| model.provider != ANTIGRAVITY);
-            rows.extend(antigravity::models().into_iter().map(|model| ModelInfo {
-                provider: ANTIGRAVITY.into(),
-                id: model.id,
+            rows.extend(antigravity::models().into_iter().map(|model| {
+                ModelInfo {
+                    // This adapter maps every request to these three wire tiers.
+                    thinking_levels: ["low", "medium", "high"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                    provider: ANTIGRAVITY.into(),
+                    id: model.id,
+                }
             }));
             rows
         })

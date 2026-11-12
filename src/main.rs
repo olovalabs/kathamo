@@ -10,8 +10,10 @@ use gpui::{
     px, relative, rems, rgba, size, svg,
 };
 use gpui_component::WindowExt as _;
+use gpui_component::button::Button;
 use gpui_component::highlighter::HighlightTheme;
 use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::notification::{Notification, NotificationType};
 use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
@@ -308,7 +310,7 @@ fn split_streaming_markdown(text: &str) -> (&str, &str) {
         let indent = line.len() - trimmed.len();
 
         if let Some((marker, len)) = fence {
-            if fence_close(trimmed, marker, len) {
+            if indent <= 3 && fence_close(trimmed, marker, len) {
                 fence = None;
             }
             continue;
@@ -2128,8 +2130,21 @@ mod chat_activity_tests {
 fn supported_thinking_effort(level: &str) -> bool {
     matches!(
         level,
-        "auto" | "inherit" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        "auto" | "inherit" | "low" | "medium" | "high" | "xhigh" | "max"
     )
+}
+
+fn reasoning_effort_label(level: &str) -> &str {
+    match level {
+        "off" => "Off",
+        "minimal" => "Minimal",
+        "low" => "Light",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra high",
+        "max" => "Maximum",
+        _ => level,
+    }
 }
 
 struct PaneChat {
@@ -2172,6 +2187,7 @@ struct PaneChat {
     legacy_models: Vec<workspace_state::SavedModelChat>,
     fast_mode: bool,
     thinking_override: Option<String>,
+    thinking_by_model: HashMap<String, String>,
     pub autoscroll: bool,
     expanded_tool_groups: HashMap<String, HashSet<usize>>,
     rpi_session_id: Option<String>,
@@ -2223,6 +2239,7 @@ impl Default for PaneChat {
             legacy_models: Vec::new(),
             fast_mode: true,
             thinking_override: None,
+            thinking_by_model: HashMap::new(),
             autoscroll: true,
             expanded_tool_groups: HashMap::new(),
             rpi_session_id: None,
@@ -2300,13 +2317,48 @@ impl PaneChat {
     }
 
     fn mode_thinking_level(&self) -> &str {
-        if let Some(level) = self.thinking_override.as_deref() {
-            return level;
+        if let Some(model) = &self.selected_model {
+            let key = agent_model_selector(model);
+            if let Some(level) = self.thinking_by_model.get(&key) {
+                return level;
+            }
         }
-        if !self.fast_mode {
-            return "high";
+        if self.thinking_by_model.is_empty() {
+            if let Some(level) = self.thinking_override.as_deref() {
+                return level;
+            }
         }
-        "low"
+        if self.fast_mode { "low" } else { "high" }
+    }
+
+    fn effective_thinking_level(&self) -> String {
+        let requested = match self.mode_thinking_level() {
+            "off" | "minimal" => "low",
+            level => level,
+        };
+        let Some(model) = &self.selected_model else {
+            return requested.to_owned();
+        };
+        let levels = model.thinking_levels();
+        if levels.is_empty()
+            || levels.iter().any(|level| level == requested)
+            || matches!(requested, "auto" | "inherit")
+        {
+            return requested.to_owned();
+        }
+        // Match the backend's nearest-lower clamping when switching models.
+        let order = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+        let requested_index = order
+            .iter()
+            .position(|level| *level == requested)
+            .unwrap_or(0);
+        order[..=requested_index]
+            .iter()
+            .rev()
+            .find(|level| levels.iter().any(|supported| supported == **level))
+            .copied()
+            .unwrap_or(levels[0].as_str())
+            .to_owned()
     }
 
     fn ensure_agent(&mut self, cwd: PathBuf) -> Result<(), String> {
@@ -2322,12 +2374,13 @@ impl PaneChat {
         self.bridge_resume = self.rpi_session_id.clone();
         let bridge =
             ModelBridge::spawn_resumed(&cwd, self.bridge_resume.as_deref(), selector.as_deref())?;
-        if self
-            .selected_model
-            .as_ref()
-            .is_some_and(agent_auth::AgentModel::supports_reasoning_effort)
-        {
-            bridge.set_thinking_level(self.mode_thinking_level())?;
+        if self.selected_model.as_ref().is_some_and(|model| {
+            model.supports_reasoning_effort()
+                || self
+                    .thinking_by_model
+                    .contains_key(&agent_model_selector(model))
+        }) {
+            bridge.set_thinking_level(&self.effective_thinking_level())?;
         }
         self.cwd = Some(cwd);
         self.worker_view = None;
@@ -3030,6 +3083,7 @@ impl AppState {
                                     chat: workspace_state::SavedChat {
                                         fast_mode: pane.chat.fast_mode,
                                         thinking_override: pane.chat.thinking_override.clone(),
+                                        thinking_by_model: pane.chat.thinking_by_model.clone(),
                                         selected_model: pane.chat.selected_model.clone(),
                                         model_explicit: pane.chat.model_explicit,
                                         agent_title: pane.chat.agent_title.clone(),
@@ -3326,6 +3380,7 @@ impl AppState {
                         .thinking_override
                         .clone()
                         .filter(|level| supported_thinking_effort(level));
+                    pane.chat.thinking_by_model = saved_pane.chat.thinking_by_model.clone();
                     // The app-wide selection is authoritative for every pane.
                     pane.chat.model_explicit = false;
                     pane.chat.agent_title = saved_pane.chat.agent_title.clone();
@@ -6155,6 +6210,37 @@ impl AppState {
         pane.chat.startup_error = pane.chat.ensure_agent(cwd).err();
     }
 
+    fn set_reasoning_effort(&mut self, pane_id: usize, level: &str, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        if !pane.chat.selected_model.as_ref().is_some_and(|model| {
+            model
+                .thinking_levels()
+                .iter()
+                .any(|supported| supported == level)
+        }) {
+            return;
+        }
+        if let Some(bridge) = pane.chat.bridge.as_mut()
+            && let Err(error) = bridge.set_thinking_level(level)
+        {
+            pane.chat
+                .messages
+                .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+            cx.notify();
+            return;
+        }
+        pane.chat.thinking_override = Some(level.to_owned());
+        if let Some(model) = &pane.chat.selected_model {
+            pane.chat
+                .thinking_by_model
+                .insert(agent_model_selector(model), level.to_owned());
+        }
+        self.schedule_workspace_save(cx);
+        cx.notify();
+    }
+
     fn toggle_fast_mode(&mut self, pane_id: usize, cx: &mut Context<Self>) {
         let Some(pane) = self.pane_mut(pane_id) else {
             return;
@@ -6169,6 +6255,11 @@ impl AppState {
         }
         pane.chat.fast_mode = !pane.chat.fast_mode;
         pane.chat.thinking_override = None;
+        if let Some(model) = &pane.chat.selected_model {
+            pane.chat
+                .thinking_by_model
+                .remove(&agent_model_selector(model));
+        }
         let level = pane.chat.mode_thinking_level().to_owned();
         if let Some(bridge) = pane.chat.bridge.as_mut() {
             if let Err(error) = bridge.set_thinking_level(&level) {
@@ -6826,7 +6917,7 @@ impl AppState {
                             .bridge_model
                             .as_ref()
                             .filter(|model| model.supports_reasoning_effort())
-                            .map(|_| pane.chat.mode_thinking_level().to_owned());
+                            .map(|_| pane.chat.effective_thinking_level());
                         if let Some(bridge) = pane.chat.bridge.as_mut() {
                             let result = bridge.restart_after_auth().and_then(|()| {
                                 thinking
@@ -7017,14 +7108,14 @@ impl AppState {
         if trimmed == "/thinking" || trimmed.starts_with("/thinking ") {
             let level = trimmed.trim_start_matches("/thinking").trim();
             let status = if !supported_thinking_effort(level) {
-                "Usage: /thinking auto|inherit|off|minimal|low|medium|high|xhigh|max.".to_owned()
+                "Usage: /thinking auto|inherit|low|medium|high|xhigh|max.".to_owned()
             } else if !pane
                 .chat
                 .selected_model
                 .as_ref()
                 .is_some_and(|model| model.supports_reasoning_effort())
             {
-                "Choose a Gemini or Claude Antigravity model to adjust reasoning effort.".to_owned()
+                "The selected model does not advertise adjustable reasoning effort.".to_owned()
             } else {
                 let result = pane
                     .chat
@@ -7035,6 +7126,11 @@ impl AppState {
                 match result {
                     Ok(()) => {
                         pane.chat.thinking_override = Some(level.to_owned());
+                        if let Some(model) = &pane.chat.selected_model {
+                            pane.chat
+                                .thinking_by_model
+                                .insert(agent_model_selector(model), level.to_owned());
+                        }
                         format!("Reasoning effort: {level}.")
                     }
                     Err(error) => format!("Could not set reasoning effort: {error}"),
@@ -7078,6 +7174,30 @@ impl AppState {
                 .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
             cx.notify();
             return;
+        }
+        // Capabilities may have loaded after a bridge was warmed. Queue the
+        // effective choice before every prompt so the displayed tier is used.
+        if pane
+            .chat
+            .selected_model
+            .as_ref()
+            .is_some_and(agent_auth::AgentModel::supports_reasoning_effort)
+        {
+            let level = pane.chat.effective_thinking_level();
+            if let Err(error) = pane
+                .chat
+                .bridge
+                .as_ref()
+                .unwrap()
+                .set_thinking_level(&level)
+            {
+                pane.chat.status = SessionStatus::Error;
+                pane.chat
+                    .messages
+                    .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+                cx.notify();
+                return;
+            }
         }
         let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
         let warm = pane.chat.completed_turns > 0 && !pane.chat.bridge_needs_context;
@@ -9467,24 +9587,26 @@ impl AppState {
                             }))
                     ))
                     .when(pane.chat.active && pane.chat.selected_model.as_ref()
-                        .is_some_and(agent_auth::AgentModel::supports_reasoning_effort), |row| row.child(
-                        div().id(("agent-speed-toggle", pane_id))
-                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
-                            .text_size(px(11.0))
-                            .text_color(if pane.chat.fast_mode { tokens.text_primary } else { tokens.text_muted })
-                            .bg(if pane.chat.fast_mode { badge_bg } else { bar_bg })
-                            .border_1()
-                            .border_color(if pane.chat.fast_mode { badge_border } else { tokens.border_subtle })
-                            .cursor(CursorStyle::PointingHand)
-                            .hover(|view| view.bg(tokens.pane_header_btn_hover))
-                            .child(pane.chat.thinking_override.as_ref().map(|level|
-                                format!("Effort: {level}")).unwrap_or_else(||
-                                if pane.chat.fast_mode { "⚡ Fast".into() } else { "🧠 Deep".into() }))
-                            .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.toggle_fast_mode(pane_id, cx);
+                        .is_some_and(agent_auth::AgentModel::supports_reasoning_effort), |row| {
+                        let levels = pane.chat.selected_model.as_ref().unwrap().thinking_levels();
+                        let current = pane.chat.effective_thinking_level();
+                        let label = format!("Reasoning: {}", reasoning_effort_label(&current));
+                        let app = cx.weak_entity();
+                        row.child(Button::new(("agent-reasoning", pane_id))
+                            .label(label).xsmall().dropdown_menu(move |mut menu, _, _| {
+                                for level in &levels {
+                                    let level = level.clone();
+                                    let app = app.clone();
+                                    let selected = current == level;
+                                    let label = reasoning_effort_label(&level).to_owned();
+                                    menu = menu.item(PopupMenuItem::new(label).checked(selected)
+                                        .on_click(move |_, _, cx| {
+                                            let _ = app.update(cx, |this, cx| this.set_reasoning_effort(pane_id, &level, cx));
+                                        }));
+                                }
+                                menu
                             }))
-                    ))
+                    })
                     .when(pane.chat.active && pane.chat.visible_running(), |row| row.child(
                         div().id(("agent-stop", pane_id))
                             .size(px(28.0)).flex_shrink_0().rounded_full()
@@ -15303,6 +15425,15 @@ fn main() -> Result<()> {
                             let _ = wake_tx.try_send(());
                         })
                     });
+                    // Populate model capabilities off the UI thread, including
+                    // for a model restored before the picker is opened.
+                    let catalog_updated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let catalog_ready = catalog_updated.clone();
+                    std::thread::spawn(move || {
+                        let _ = agent_auth::available_models(std::path::Path::new("."));
+                        catalog_ready.store(true, std::sync::atomic::Ordering::Release);
+                        crate::agent_bridge::signal_wake();
+                    });
                     let agent_streaming =
                         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     {
@@ -15339,7 +15470,12 @@ fn main() -> Result<()> {
                             // The capacity-one channel coalesces pending wakes.
                             // Leave any new wake queued while applying this batch.
                             match agent_state_weak
-                                .update(cx, |state, cx| state.poll_agent_events(cx))
+                                .update(cx, |state, cx| {
+                                    if catalog_updated.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                                        cx.notify();
+                                    }
+                                    state.poll_agent_events(cx)
+                                })
                             {
                                 Ok(active) => agent_streaming
                                     .store(active, std::sync::atomic::Ordering::Relaxed),
@@ -17757,6 +17893,10 @@ mod kathamo_bottom_input_tests {
         let (settled, tail) = split_streaming_markdown("Intro\n\n- one\n- two\n- three");
         assert_eq!(settled.trim_end(), "Intro");
         assert_eq!(tail, "- one\n- two\n- three");
+
+        let (settled, tail) = split_streaming_markdown("Intro\n\n```\n    ```\n\ninside");
+        assert_eq!(settled.trim_end(), "Intro");
+        assert!(tail.contains("inside"));
     }
 
     #[test]
@@ -18241,6 +18381,51 @@ First report
     }
 
     #[test]
+    fn reasoning_preferences_follow_the_selected_model() {
+        let mut chat = PaneChat::default();
+        let model = |id: &str| agent_auth::AgentModel {
+            provider: "test".into(),
+            id: id.into(),
+            backend: agent_auth::ModelBackend::Rpi,
+        };
+        chat.thinking_by_model
+            .insert("test/first".into(), "medium".into());
+        chat.thinking_by_model
+            .insert("test/second".into(), "high".into());
+        chat.selected_model = Some(model("first"));
+        assert_eq!(chat.mode_thinking_level(), "medium");
+        chat.selected_model = Some(model("second"));
+        assert_eq!(chat.mode_thinking_level(), "high");
+        chat.selected_model = Some(model("third"));
+        assert_eq!(chat.mode_thinking_level(), "low");
+    }
+
+    #[test]
+    fn reasoning_selection_is_saved_and_rejects_unsupported_levels() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, _, cx| {
+            s.pane_mut(id).unwrap().chat.selected_model = Some(agent_auth::AgentModel {
+                provider: "google-antigravity".into(),
+                id: "gemini-3.8-flash".into(),
+                backend: agent_auth::ModelBackend::Rpi,
+            });
+            s.set_reasoning_effort(id, "medium", cx);
+            s.set_reasoning_effort(id, "unsupported", cx);
+            assert_eq!(s.pane_ref(id).unwrap().chat.mode_thinking_level(), "medium");
+            assert_eq!(
+                s.saved_workspace(cx).projects[0].sessions[0].panes[0]
+                    .chat
+                    .thinking_by_model
+                    .get("google-antigravity/gemini-3.8-flash")
+                    .map(String::as_str),
+                Some("medium")
+            );
+        });
+    }
+
+    #[test]
     fn explicit_effort_preserves_model_and_fast_deep_clears_override() {
         let mut app = TestAppContext::new();
         let (mut cx, state) = open_app(&mut app);
@@ -18256,9 +18441,7 @@ First report
             chat.active = true;
             chat.selected_model = Some(model.clone());
         });
-        for effort in [
-            "auto", "inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max",
-        ] {
+        for effort in ["auto", "inherit", "low", "medium", "high", "xhigh", "max"] {
             cx.update_window_entity(&state, |s, window, cx| {
                 let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
                 input.update(cx, |input, cx| {
@@ -18610,32 +18793,8 @@ First report
         assert_eq!(auth_val, "my-secret-key-123");
         assert_eq!(bottom_val, "");
 
-        cx.update_window_entity(&state, |s, window, cx| {
-            s.submit_agent_auth(id, window, cx);
-        });
-        cx.draw_frame().unwrap();
-
-        let output = state.read_with(&cx, |s, _| {
-            let pane = s.pane_ref(id).unwrap();
-            let auth = pane.chat.auth.as_ref().unwrap();
-            auth.output.clone()
-        });
-        assert!(output.contains("Connected to commandcode"));
-
-        // Now test disconnecting
-        cx.update_window_entity(&state, |s, window, cx| {
-            s.disconnect_agent_provider(id, "commandcode".into(), window, cx);
-        });
-        cx.draw_frame().unwrap();
-
-        let is_now_ready = state.read_with(&cx, |s, _| {
-            let pane = s.pane_ref(id).unwrap();
-            let auth = pane.chat.auth.as_ref().unwrap();
-            auth.providers
-                .iter()
-                .any(|p| p.id == "commandcode" && p.ready)
-        });
-        assert!(!is_now_ready, "commandcode must be disconnected");
+        // Saving and disconnecting use the real credential store. Exercise those
+        // operations in isolated processes, never against the user's account.
     }
 
     #[test]

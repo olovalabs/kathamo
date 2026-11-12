@@ -97,6 +97,7 @@ pub struct SavedChat {
     pub fast_mode: bool,
     /// Exact OMP reasoning effort; absent means the Fast/Deep preset.
     pub thinking_override: Option<String>,
+    pub thinking_by_model: std::collections::HashMap<String, String>,
     pub selected_model: Option<AgentModel>,
     /// True when `selected_model` is a deliberate choice, so `None` can mean
     /// "Automatic (rpi)" instead of "never picked one".
@@ -127,6 +128,7 @@ impl Default for SavedChat {
         Self {
             fast_mode: true,
             thinking_override: None,
+            thinking_by_model: Default::default(),
             selected_model: None,
             model_explicit: false,
             agent_title: None,
@@ -693,6 +695,7 @@ mod tests {
                             chat: SavedChat {
                                 fast_mode: false,
                                 thinking_override: Some("max".into()),
+                                thinking_by_model: Default::default(),
                                 selected_model: Some(AgentModel {
                                     provider: "xai-oauth".into(),
                                     id: "grok-4.7".into(),

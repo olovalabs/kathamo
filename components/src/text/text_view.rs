@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -9,7 +9,6 @@ use gpui::{
     KeyBinding, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     Pixels, Point, RenderOnce, SharedString, Size, StyleRefinement, Styled, Window, div, px,
 };
-use smol::Timer;
 
 use crate::highlighter::HighlightTheme;
 use crate::scroll::ScrollableElement;
@@ -312,13 +311,9 @@ async fn parse_updates(
 ) {
     let mut last_generation = None;
     while wake.recv().await.is_ok() {
-        if last_generation.is_some() {
-            // Throttle, not debounce: continuously arriving text cannot reset
-            // this deadline. A final update also owns a pending wakeup.
-            Timer::after(Duration::from_millis(10)).await;
-        }
         // Capacity is one. Consume its token before snapshotting, so an update
-        // arriving during a parse always schedules another pass.
+        // arriving during a parse always schedules another pass. The mailbox
+        // coalesces bursts without delaying an update that is ready to parse.
         let _ = wake.try_recv();
         let (generation, epoch, request, submitted_at) = {
             let mailbox = mailbox.lock().unwrap_or_else(|error| error.into_inner());

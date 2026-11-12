@@ -1940,9 +1940,7 @@ struct PaneChat {
     auth_refresh_pending: bool,
     auth: Option<AuthModal>,
     selected_model: Option<agent_auth::AgentModel>,
-    /// The user has chosen a model for this pane (including "Automatic (rpi)",
-    /// which is `selected_model == None`). Without this, a pane deliberately
-    /// set to Automatic is re-pinned to the app default on the next launch.
+    /// Retained for compatibility with older saved workspaces.
     model_explicit: bool,
     agent_title: Option<String>,
     prompt_title: Option<String>,
@@ -2613,8 +2611,6 @@ struct AppState {
     /// Terminal color palette / block chrome (Warp by default).
     pub palette_scheme: PaletteScheme,
     default_agent_model: Option<agent_auth::AgentModel>,
-    /// The Kathamo provider's configured default, used when no Kathamo default is set.
-    fallback_agent_model: Option<agent_auth::AgentModel>,
     pub sidebar_visible: bool,
     integration_panel_visible: bool,
     integration_feedback: SharedString,
@@ -3007,6 +3003,10 @@ impl AppState {
             .palette(self.palette_scheme, mode.is_dark());
         theme::apply_component_theme(mode, None, cx);
         sync_component_fonts(cx);
+        agent_ui::sync_theme(
+            self.settings.theme_colors.tokens(mode, self.palette_scheme),
+            cx,
+        );
 
         let RestoreData {
             workspace,
@@ -3089,16 +3089,11 @@ impl AppState {
                         .thinking_override
                         .clone()
                         .filter(|level| supported_thinking_effort(level));
-                    // A pane keeps exactly the model it was using. Only panes
-                    // that never had a choice adopt the app default.
-                    pane.chat.model_explicit = saved_pane.chat.model_explicit;
+                    // The app-wide selection is authoritative for every pane.
+                    pane.chat.model_explicit = false;
                     pane.chat.agent_title = saved_pane.chat.agent_title.clone();
                     pane.chat.prompt_title = saved_pane.chat.prompt_title.clone();
-                    pane.chat.selected_model = match saved_pane.chat.selected_model.clone() {
-                        Some(model) => Some(model),
-                        None if saved_pane.chat.model_explicit => None,
-                        None => self.effective_default_agent_model().cloned(),
-                    };
+                    pane.chat.selected_model = self.effective_default_agent_model().cloned();
                     pane.chat.rpi_session_id = saved_pane.chat.rpi_session_id.clone();
                     pane.chat.terminal_draft = saved_pane.draft.clone();
                     pane.chat.agent_draft = saved_pane.agent_draft.clone();
@@ -3364,6 +3359,10 @@ impl AppState {
             .palette(self.palette_scheme, is_dark);
         theme::apply_component_theme(mode, window, cx);
         sync_component_fonts(cx);
+        agent_ui::sync_theme(
+            self.settings.theme_colors.tokens(mode, self.palette_scheme),
+            cx,
+        );
 
         for project in &mut self.projects {
             for session in &mut project.sessions {
@@ -5288,12 +5287,9 @@ impl AppState {
         cx.notify();
     }
 
-    /// The model new and unpinned panes should use: the user's saved default,
-    /// otherwise the private provider default.
+    /// The model selected for all agent panes, if any.
     fn effective_default_agent_model(&self) -> Option<&agent_auth::AgentModel> {
-        self.default_agent_model
-            .as_ref()
-            .or(self.fallback_agent_model.as_ref())
+        self.default_agent_model.as_ref()
     }
 
     fn pane_ref(&self, pane_id: usize) -> Option<&TerminalPane> {
@@ -5910,6 +5906,9 @@ impl AppState {
         let Some(pane) = self.pane_mut(pane_id) else {
             return;
         };
+        if pane.chat.selected_model.is_none() {
+            return;
+        }
         if save_history && pane.chat.conversation.is_none() {
             pane.chat.conversation = Some(conversations::Log::open(
                 &pane.uid,
@@ -6129,36 +6128,22 @@ impl AppState {
         &mut self,
         pane_id: usize,
         model: Option<agent_auth::AgentModel>,
-        make_default: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(pane) = self.pane_mut(pane_id) {
-            pane.chat.startup_error = None;
-            pane.chat.model_explicit = true;
-            pane.chat.selected_model = model.clone();
+        if self.pane_ref(pane_id).is_none() {
+            return;
         }
-        if make_default {
-            if model.is_some() {
-                self.default_agent_model = model;
-            } else {
-                self.default_agent_model = None;
-                self.fallback_agent_model = None;
-            }
-            if let Some(default) = self.effective_default_agent_model().cloned() {
-                for project in &mut self.projects {
-                    for session in &mut project.sessions {
-                        for pane in &mut session.panes {
-                            if pane.chat.selected_model.is_none() && !pane.chat.model_explicit {
-                                pane.chat.selected_model = Some(default.clone());
-                            }
-                        }
-                    }
+        self.default_agent_model = model.clone();
+        for project in &mut self.projects {
+            for session in &mut project.sessions {
+                for pane in &mut session.panes {
+                    pane.chat.startup_error = None;
+                    pane.chat.model_explicit = false;
+                    pane.chat.selected_model = model.clone();
                 }
             }
         }
-        // Persist the pane's own choice right away, not on the next 30 s
-        // autosave: reopening must show the same model this pane had.
         self.schedule_workspace_save(cx);
         self.warm_agent_bridge(pane_id);
         self.close_agent_auth(pane_id, window, cx);
@@ -6347,7 +6332,7 @@ impl AppState {
             login.cancel();
         }
 
-        match agent_auth::disconnect_provider(&provider) {
+        let disconnected = match agent_auth::disconnect_provider(&provider) {
             Ok(()) => {
                 auth.error = None;
                 auth.output = format!("Disconnected from {provider}.");
@@ -6360,23 +6345,30 @@ impl AppState {
                     }
                 }
 
-                // If currently selected model belongs to this provider, clear it
-                if pane
-                    .chat
-                    .selected_model
-                    .as_ref()
-                    .is_some_and(|m| m.provider == provider)
-                {
-                    pane.chat.selected_model = None;
-                    pane.chat.model_explicit = true;
-                }
-
                 // Refresh providers and models off the UI thread.
                 auth.discover();
+                true
             }
             Err(error) => {
                 auth.error = Some(format!("Could not disconnect {provider}: {error}"));
+                false
             }
+        };
+        if disconnected
+            && self
+                .default_agent_model
+                .as_ref()
+                .is_some_and(|model| model.provider == provider)
+        {
+            self.default_agent_model = None;
+            for project in &mut self.projects {
+                for session in &mut project.sessions {
+                    for pane in &mut session.panes {
+                        pane.chat.selected_model = None;
+                    }
+                }
+            }
+            self.schedule_workspace_save(cx);
         }
         cx.notify();
     }
@@ -6807,6 +6799,11 @@ impl AppState {
             return;
         }
         if pane.chat.visible_running() {
+            return;
+        }
+        if pane.chat.selected_model.is_none() {
+            pane.chat.startup_error = Some("Select a model to start chatting.".into());
+            cx.notify();
             return;
         }
         if pane.chat.conversation_title().is_none()
@@ -8810,13 +8807,17 @@ impl AppState {
         } else {
             self.pane_git_branch(pane)
         };
-        let model_pill = match pane.chat.selected_model.as_ref() {
-            Some(model) if self.effective_default_agent_model() == Some(model) => {
-                format!("{} · default", agent_model_label(model))
-            }
-            Some(model) => agent_model_label(model),
-            None => "Automatic (rpi)".to_string(),
-        };
+        let model_pill = pane
+            .chat
+            .selected_model
+            .as_ref()
+            .map(|model| model.id.clone())
+            .unwrap_or_else(|| "No model selected".to_string());
+        let model_provider_icon = pane
+            .chat
+            .selected_model
+            .as_ref()
+            .map(|model| provider_icon_path(&model.provider));
 
         let bar_border: Hsla = if tokens.is_dark {
             rgba(0x1d1d1dff).into()
@@ -9196,6 +9197,9 @@ impl AppState {
                             .border_color(badge_border)
                             .cursor(CursorStyle::PointingHand)
                             .hover(|view| view.bg(tokens.pane_header_btn_hover))
+                            .when_some(model_provider_icon, |pill, icon| {
+                                pill.child(svg().path(icon).size(px(13.0)).flex_shrink_0().text_color(tokens.text_primary))
+                            })
                             .child(div().max_w(px(280.0)).truncate().child(model_pill))
                             .child(
                                 svg()
@@ -9230,9 +9234,15 @@ impl AppState {
                     ))
                     .when(pane.chat.active && pane.chat.visible_running(), |row| row.child(
                         div().id(("agent-stop", pane_id))
-                            .px(px(8.0)).py(px(3.0)).rounded(px(5.0))
-                            .text_size(px(12.0)).text_color(tokens.text_secondary)
-                            .cursor(CursorStyle::PointingHand).child("Stop")
+                            .size(px(28.0)).flex_shrink_0().rounded_full()
+                            .flex().items_center().justify_center()
+                            .bg(tokens.text_primary)
+                            .hover(|button| button.bg(tokens.text_secondary))
+                            .cursor(CursorStyle::PointingHand)
+                            .tooltip(|window, cx| {
+                                gpui_component::tooltip::Tooltip::new("Stop").build(window, cx)
+                            })
+                            .child(div().size(px(9.0)).flex_shrink_0().rounded(px(1.0)).bg(bar_bg))
                             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.handle_pane_ctrl_c(pane_id, window, cx);
@@ -9785,13 +9795,7 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.select_agent_model(
-                                pane_id,
-                                Some(choice.clone()),
-                                false,
-                                window,
-                                cx,
-                            );
+                            this.select_agent_model(pane_id, Some(choice.clone()), window, cx);
                         }),
                     )
                     .into_any_element(),
@@ -14821,6 +14825,7 @@ fn main() -> Result<()> {
             theme::apply_component_theme(initial_mode, None, cx);
             load_embedded_fonts(cx);
             sync_component_fonts(cx);
+            agent_ui::sync_theme(app_settings.theme_colors.tokens(initial_mode, app_settings.palette_scheme), cx);
 
             std::thread::spawn(|| {
                 completion::prewarm();
@@ -14859,7 +14864,6 @@ fn main() -> Result<()> {
                         theme_preference: app_settings.theme,
                         palette_scheme: app_settings.palette_scheme,
                         default_agent_model: app_settings.default_agent_model.clone(),
-                        fallback_agent_model: None,
                         integration_panel_visible: false,
                         integration_feedback: SharedString::from("Setup is opt-in. Status becomes Reporting only after a live event arrives."),
                         sidebar_width: px(app_settings.sidebar.width.max(120.0)),
@@ -15301,7 +15305,6 @@ mod resize_tests {
             theme_preference: ThemePreference::System,
             palette_scheme: PaletteScheme::default(),
             default_agent_model: None,
-            fallback_agent_model: None,
             integration_panel_visible: false,
             integration_feedback: SharedString::from(
                 "Setup is opt-in. Status becomes Reporting only after a live event arrives.",
@@ -15520,22 +15523,44 @@ mod resize_tests {
     }
 
     #[test]
-    fn new_panes_adopt_the_fallback_model() {
+    fn new_panes_start_without_a_model() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.create_new_session_in_project(0, window, cx);
+        });
+        state.read_with(&cx, |s, _| {
+            assert_eq!(s.effective_default_agent_model(), None);
+            let pane = &s.projects[0].sessions.last().unwrap().panes[0];
+            assert_eq!(pane.chat.selected_model, None);
+        });
+    }
+
+    #[test]
+    fn selecting_a_model_updates_all_panes_and_new_panes() {
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         let model = agent_auth::AgentModel {
             provider: "google-antigravity".into(),
-            id: "gemini-default".into(),
+            id: "gemini-test".into(),
             backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, window, cx| {
-            s.fallback_agent_model = Some(model.clone());
             s.create_new_session_in_project(0, window, cx);
-        });
-        state.read_with(&cx, |s, _| {
-            assert_eq!(s.effective_default_agent_model(), Some(&model));
-            let pane = &s.projects[0].sessions.last().unwrap().panes[0];
-            assert_eq!(pane.chat.selected_model.as_ref(), Some(&model));
+            let pane_id = s.projects[0].sessions[0].panes[0].id;
+            s.select_agent_model(pane_id, Some(model.clone()), window, cx);
+            s.create_new_session_in_project(0, window, cx);
+            assert_eq!(
+                s.saved_settings().default_agent_model.as_ref(),
+                Some(&model)
+            );
+            assert!(
+                s.projects
+                    .iter()
+                    .flat_map(|p| &p.sessions)
+                    .flat_map(|s| &s.panes)
+                    .all(|pane| pane.chat.selected_model.as_ref() == Some(&model))
+            );
         });
     }
 
@@ -15698,7 +15723,7 @@ mod resize_tests {
             )));
             let input = pane.input_state.as_ref().unwrap().clone();
             input.update(cx, |state, cx| state.set_value("Unsent draft", window, cx));
-            s.select_agent_model(pane_id, Some(grok.clone()), false, window, cx);
+            s.select_agent_model(pane_id, Some(grok.clone()), window, cx);
             let pane = s.pane_ref(pane_id).unwrap();
             assert_eq!(pane.chat.selected_model.as_ref(), Some(&grok));
             assert!(pane.chat.running);
@@ -15781,7 +15806,7 @@ mod resize_tests {
 
 ```ui
 {"root":"card","elements":{
- "card":{"type":"Card","props":{"title":"Weekly report","footer":"generated"},"children":["heading","intro","code","divider","tags","alert","progress","check","switch","radio","rating","spinner","skeleton","avatar","icon","kbd","desc","table","list","steps","tabs","crumb","toggle","marker","pagination","bubble","diff","accordion","collapsible","grid","chart","actions"]},
+ "card":{"type":"Card","props":{"title":"Weekly report","footer":"generated"},"children":["heading","intro","code","divider","tags","alert","progress","check","switch","radio","rating","spinner","skeleton","avatar","icon","kbd","desc","table","list","steps","tabs","crumb","toggle","marker","pagination","bubble","diff","accordion","collapsible","grid","chart","metrics","heatmap","stacked","actions"]},
  "heading":{"type":"Heading","props":{"text":"Weekly report","level":2}},
  "intro":{"type":"Text","props":{"text":"A **markdown** intro."}},
  "code":{"type":"Code","props":{"text":"let x = 1;","lang":"rust"}},
@@ -15815,6 +15840,9 @@ mod resize_tests {
  "collapsible":{"type":"Collapsible","props":{"title":"More","content":"Collapsed content."}},
  "grid":{"type":"Grid","props":{"cols":2,"gap":8},"children":["ok","warn"]},
  "chart":{"type":"Chart","props":{"kind":"bar","height":120,"data":[{"label":"Mon","value":3},{"label":"Tue","value":5}]}},
+ "metrics":{"type":"Metrics","props":{"items":[{"label":"Turns","value":"24M"}]}},
+ "heatmap":{"type":"Heatmap","props":{"columns":["9am","10am"],"rows":[{"label":"Mon","values":[1,4]},{"label":"Tue","values":[3,2]}]}},
+ "stacked":{"type":"StackedBar","props":{"series":["Low","High"],"rows":[{"label":"Codex","values":[30,70]}]}},
  "actions":{"type":"Row","props":{"gap":8},"children":["refresh"]},
  "refresh":{"type":"Button","props":{"label":"Refresh","tone":"primary","action":"Refresh the report"}}
 }}
@@ -15833,10 +15861,47 @@ Done."#
                 s.set_theme_preference(preference, Some(window), cx);
                 assert_eq!(s.tokens(cx).is_dark, is_dark);
                 assert_eq!(gpui_kit::component::Theme::global(cx).is_dark(), is_dark);
+                let colors = &gpui_kit::component::Theme::global(cx).colors;
+                let tokens = s.tokens(cx);
+                assert_eq!(colors.group_box, tokens.card_bg);
+                assert_eq!(colors.primary, tokens.primary_btn_bg);
             });
             cx.draw_frame()
                 .expect("redraw the card after a theme change");
         }
+    }
+
+    #[test]
+    fn ai_ui_renders_native_inputs_and_new_primitives() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut cx);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            s.pane_mut(pane_id).unwrap().chat.messages.push(Arc::new(ChatMessage::new(
+                ChatRole::Assistant,
+                r#"```ui
+{"root":"root","elements":{
+"root":{"type":"Column","children":["field","password","number","slider","select","meter","segments","toolbar","carousel","timeline"]},
+"field":{"type":"Field","props":{"label":"Name"},"children":["input"]},
+"input":{"type":"Input","props":{"placeholder":"Your name"}},
+"password":{"type":"PasswordInput","props":{"label":"Password"}},
+"number":{"type":"NumberInput","props":{"label":"Count","value":4,"min":0,"max":10}},
+"slider":{"type":"Slider","props":{"label":"Volume","value":5,"max":10}},
+"select":{"type":"Select","props":{"label":"Choice","options":["One","Two"],"selected":0,"searchable":true}},
+"meter":{"type":"Meter","props":{"min":0,"max":10,"value":4}},
+"segments":{"type":"SegmentedControl","props":{"options":["One","Two"]},"children":["first","second"]},
+"first":{"type":"Label","props":{"text":"First"}},
+"second":{"type":"Label","props":{"text":"Second"}},
+"toolbar":{"type":"Toolbar","children":["button"]},
+"carousel":{"type":"Carousel","children":["first","second"]},
+"timeline":{"type":"Timeline","props":{"items":[{"title":"Started","description":"Created"}]}},
+"button":{"type":"Button","props":{"label":"Action"}}
+}}
+```"#.into(),
+            )));
+        });
+        cx.draw_frame().expect("draw native agent UI primitives");
     }
 
     #[test]
@@ -15913,7 +15978,7 @@ Done."#
     }
 
     #[test]
-    fn restored_panes_keep_their_own_model() {
+    fn restored_panes_use_the_global_model() {
         // The reported bug: pick deepseek in pane A and grok in pane B, restart,
         // and both came back pinned to the app default instead of their own.
         let mut workspace = workspace_state::SavedWorkspace {
@@ -16001,7 +16066,7 @@ Done."#
             backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, _, cx| {
-            s.default_agent_model = Some(default.clone());
+            s.settings.default_agent_model = Some(default.clone());
             s.startup_loaded = false;
             s.settings.restore.agent_history = true;
             s.apply_saved_workspace(
@@ -16031,23 +16096,12 @@ Done."#
                 .iter()
                 .map(|pane| pane.chat.selected_model.clone())
                 .collect();
-            assert_eq!(
-                models[0].as_ref().map(agent_model_label),
-                Some("commandcode · deepseek/deepseek-v4-flash".to_string())
-            );
-            assert_eq!(
-                models[1].as_ref().map(agent_model_label),
-                Some("xai-oauth · grok-4.7".to_string())
-            );
-            assert!(
-                models.iter().all(|model| model.as_ref() != Some(&default)),
-                "restored panes must not be re-pinned to the app default"
-            );
+            assert!(models.iter().all(|model| model.as_ref() == Some(&default)));
         });
     }
 
     #[test]
-    fn explicit_automatic_pane_does_not_adopt_the_default_on_restore() {
+    fn restored_pane_adopts_the_global_model() {
         let workspace = workspace_state::SavedWorkspace {
             version: workspace_state::CURRENT_VERSION,
             active_project: Some(std::env::current_dir().unwrap()),
@@ -16084,7 +16138,7 @@ Done."#
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);
         cx.update_window_entity(&state, |s, _, cx| {
-            s.default_agent_model = Some(agent_auth::AgentModel {
+            s.settings.default_agent_model = Some(agent_auth::AgentModel {
                 provider: "xai-oauth".into(),
                 id: "grok-4.7".into(),
                 backend: agent_auth::ModelBackend::Kathamo,
@@ -16103,10 +16157,10 @@ Done."#
         state.read_with(&cx, |s, _| {
             let pane = &s.projects[0].sessions[0].panes[0];
             assert_eq!(
-                pane.chat.selected_model, None,
-                "an explicit Automatic stays Automatic"
+                pane.chat.selected_model.as_ref(),
+                s.default_agent_model.as_ref()
             );
-            assert!(pane.chat.model_explicit);
+            assert!(!pane.chat.model_explicit);
         });
     }
 

@@ -7,10 +7,17 @@
 
 use std::collections::{HashMap, HashSet};
 
+mod numeric;
+mod selection;
+mod streaming;
+mod theme;
+pub(crate) use theme::sync as sync_theme;
+
 use gpui::{
     AnyElement, Hsla, InteractiveElement as _, IntoElement, OperatingSystem, ParentElement, Pixels,
     Rems, SharedString, Styled, Window, div, prelude::FluentBuilder, px, relative,
 };
+use gpui_component::input::{Input, InputState};
 use gpui_kit::component::{
     Disableable as _, Icon, IconName, Sizable as _, Size,
     accordion::Accordion,
@@ -48,7 +55,10 @@ const MAX_SPEC_BYTES: usize = 256 * 1024;
 
 pub(crate) const CATALOG_PROMPT: &str = r#"## Kathamo UI cards
 
-When the user asks for Kathamo UI or a `ui` fence, use the format below.
+When a visual, chart, comparison, or dashboard would help the user, render it
+inline using the format below. Use the components creatively for the user's
+data and goals; do not invent measurements or imply interactions that are not
+provided. Explain any important limitations in the surrounding text.
 The fence must contain a single valid JSON object. Do not use YAML,
 component names as keys (such as `Card:`), or a nested code fence.
 
@@ -84,6 +94,18 @@ Components and props:
 - Grid: gap?, cols? (1-6), children
 - Heading: text, level? (1-4)
 - Text: text, muted?, markdown? (default true)
+- Input: label?, placeholder?, value?, disabled?, multiline? (editable locally)
+- PasswordInput: label?, placeholder?, value?, disabled? (editable locally)
+- NumberInput: label?, value?, min?, max?, step?, disabled? (editable locally; bounds apply when stepping)
+- Slider: label?, value?, min?, max?, step?, disabled? (editable locally)
+- Select: options (array of strings), selected? (index), label?, placeholder?, searchable?, disabled? (selection is local)
+- Field: label?, description?, children
+- Label: text
+- Meter: value, min?, max?, label?
+- SegmentedControl: options (array of strings), selected? (index), children? (one panel per option)
+- Toolbar: gap?, children
+- Carousel: selected? (index), children (slides; previous/next buttons)
+- Timeline: items (array of {title, description?})
 - Code: text, lang?
 - Divider: label?
 - Tag: text, tone? ("primary"|"secondary"|"success"|"warning"|"danger"|"info"), outline?
@@ -110,6 +132,9 @@ Components and props:
 - Collapsible: title, content, open?
 - Pagination: page?, total?
 - Chart: kind ("line"|"bar"|"pie"), data (array of {label, value}), height? (px)
+- Metrics: items (array of {label, value})
+- Heatmap: columns (array of labels), rows (array of {label, values: [numbers]}), min?, max?; useful for activity by day and hour
+- StackedBar: series (array of labels), rows (array of {label, values: [nonnegative numbers]}); useful for proportional comparisons
 - List: items (array of strings), ordered?
 - Diff: patch (unified diff text)
 - Link: text, href
@@ -190,14 +215,14 @@ pub(crate) fn split_ui_segments(text: &str) -> Vec<Segment<'_>> {
     segments
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct UiSpec {
     root: String,
     #[serde(default)]
     elements: HashMap<String, UiNode>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct UiNode {
     #[serde(rename = "type")]
     kind: String,
@@ -224,7 +249,8 @@ fn parse_spec(raw: &str) -> Result<UiSpec, String> {
         return Err(format!("root `{}` is not in elements", spec.root));
     }
     let mut seen = HashSet::new();
-    check_cycle(&spec, &spec.root, 0, &mut seen)?;
+    let mut visited = 0;
+    check_cycle(&spec, &spec.root, 0, &mut seen, &mut visited)?;
     Ok(spec)
 }
 
@@ -233,7 +259,12 @@ fn check_cycle(
     id: &str,
     depth: usize,
     seen: &mut HashSet<String>,
+    visited: &mut usize,
 ) -> Result<(), String> {
+    *visited += 1;
+    if *visited > MAX_NODES {
+        return Err(format!("UI expands to more than {MAX_NODES} elements"));
+    }
     if depth > MAX_DEPTH {
         return Err(format!("UI nesting is deeper than {MAX_DEPTH}"));
     }
@@ -245,7 +276,7 @@ fn check_cycle(
             if !spec.elements.contains_key(child) {
                 return Err(format!("element `{id}` references missing child `{child}`"));
             }
-            check_cycle(spec, child, depth + 1, seen)?;
+            check_cycle(spec, child, depth + 1, seen, visited)?;
         }
     }
     seen.remove(id);
@@ -288,28 +319,52 @@ fn state_indices(ctx: &UiCtx, key: &str, default: Vec<usize>) -> Vec<usize> {
 enum PreparedSegment {
     Markdown(SharedString),
     PendingUi,
-    Ui(Result<UiSpec, (String, SharedString)>),
+    Ui(Result<std::sync::Arc<UiSpec>, (String, SharedString)>),
 }
 
 #[derive(Default)]
 struct AssistantBody {
     source: SharedString,
     segments: std::sync::Arc<Vec<Option<PreparedSegment>>>,
+    pending: HashMap<usize, (usize, Option<std::sync::Arc<UiSpec>>)>,
 }
 
 impl AssistantBody {
     fn prepare(&mut self, text: &str) {
+        if !text.starts_with(self.source.as_ref()) {
+            self.pending.clear();
+        }
         self.segments = std::sync::Arc::new(
             split_ui_segments(text)
                 .into_iter()
-                .map(|segment| match segment {
+                .enumerate()
+                .map(|(index, segment)| match segment {
                     Segment::Markdown(markdown) if !markdown.trim().is_empty() => {
                         Some(PreparedSegment::Markdown(SharedString::from(markdown)))
                     }
-                    Segment::Ui { closed: false, .. } => Some(PreparedSegment::PendingUi),
-                    Segment::Ui { raw, closed: true } => Some(PreparedSegment::Ui(
-                        parse_spec(raw).map_err(|error| (error, SharedString::from(raw))),
-                    )),
+                    Segment::Ui { raw, closed: false } => {
+                        // A streamed JSON object is often complete before its closing
+                        // Markdown fence arrives. Show it immediately when valid;
+                        // incomplete or invalid objects remain pending until closure.
+                        let cached = self.pending.entry(index).or_default();
+                        let appended = raw.get(cached.0..).unwrap_or(raw);
+                        if cached.0 > raw.len() || appended.contains('}') {
+                            cached.1 = streaming::partial_spec(raw).map(std::sync::Arc::new);
+                        }
+                        cached.0 = raw.len();
+                        match cached.1.clone() {
+                            Some(spec) => Some(PreparedSegment::Ui(Ok(spec))),
+                            None => Some(PreparedSegment::PendingUi),
+                        }
+                    }
+                    Segment::Ui { raw, closed: true } => {
+                        self.pending.remove(&index);
+                        Some(PreparedSegment::Ui(
+                            parse_spec(raw)
+                                .map(std::sync::Arc::new)
+                                .map_err(|error| (error, SharedString::from(raw))),
+                        ))
+                    }
                     _ => None,
                 })
                 .collect(),
@@ -365,6 +420,8 @@ pub(crate) fn render_assistant_body(
                     pane_id,
                     state,
                     host,
+                    window,
+                    cx,
                 ));
             }
             None => {}
@@ -380,6 +437,8 @@ fn render_ui_block(
     pane_id: usize,
     state: Option<&HashMap<String, UiStateValue>>,
     host: &crate::UiHost,
+    window: &mut Window,
+    cx: &mut gpui::App,
 ) -> AnyElement {
     let debug_id = id.clone();
     let chrome = |inner: AnyElement| {
@@ -387,10 +446,11 @@ fn render_ui_block(
             .debug_selector(move || format!("ai-ui-block-{debug_id}"))
             .w_full()
             .min_w_0()
-            .rounded(px(10.0))
+            .rounded(px(8.0))
             .border_1()
             .border_color(tokens.border_subtle)
             .bg(tokens.card_bg)
+            .text_color(tokens.text_primary)
             .p(px(12.0))
             .child(inner)
             .into_any_element()
@@ -419,7 +479,7 @@ fn render_ui_block(
                 tokens,
                 state,
             };
-            let content = render_node(&ctx, &spec.root, 0, host);
+            let content = render_node(&ctx, &spec.root, 0, host, window, cx);
             chrome(content)
         }
         Err((error, raw)) => chrome(
@@ -582,7 +642,14 @@ fn icon_from(name: &str) -> Icon {
     Icon::new(icon)
 }
 
-fn render_node(ctx: &UiCtx, id: &str, depth: usize, host: &crate::UiHost) -> AnyElement {
+fn render_node(
+    ctx: &UiCtx,
+    id: &str,
+    depth: usize,
+    host: &crate::UiHost,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) -> AnyElement {
     if depth > MAX_DEPTH {
         return error_chip(ctx.tokens, format!("Nesting deeper than {MAX_DEPTH}"));
     }
@@ -595,7 +662,7 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, host: &crate::UiHost) -> Any
 
     let mut kids: Vec<AnyElement> = Vec::with_capacity(node.children.len());
     for child in &node.children {
-        kids.push(render_node(ctx, child, depth + 1, host));
+        kids.push(render_node(ctx, child, depth + 1, host, window, cx));
     }
 
     let element_id = SharedString::from(format!("{}-{}", ctx.id_prefix, id));
@@ -604,6 +671,197 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, host: &crate::UiHost) -> Any
     let tokens = ctx.tokens;
 
     match node.kind.to_ascii_lowercase().as_str() {
+        "numberinput" | "number-input" => numeric::number_input(element_id, props, window, cx),
+        "slider" => numeric::slider(element_id, props, window, cx),
+        "select" => selection::select(element_id, props, window, cx),
+        "input" | "passwordinput" => {
+            let placeholder = prop_str(props, "placeholder").unwrap_or_default();
+            let value = prop_str(props, "value").unwrap_or_default();
+            let masked = node.kind.eq_ignore_ascii_case("passwordinput");
+            let multiline = !masked && prop_bool(props, "multiline").unwrap_or(false);
+            let input = window.use_keyed_state(element_id, cx, |window, cx| {
+                InputState::new(window, cx)
+                    .placeholder(placeholder)
+                    .default_value(value)
+                    .masked(masked)
+                    .multi_line(multiline)
+            });
+            let mut content = div().w_full().flex().flex_col().gap(px(4.0));
+            if let Some(label) = prop_str(props, "label") {
+                content = content.child(div().text_size(px(12.0)).child(label));
+            }
+            content
+                .child(Input::new(&input).disabled(prop_bool(props, "disabled").unwrap_or(false)))
+                .into_any_element()
+        }
+        "label" => div()
+            .text_size(px(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(tokens.text_primary)
+            .child(prop_str(props, "text").unwrap_or_default())
+            .into_any_element(),
+        "field" => {
+            let mut field = div().w_full().flex().flex_col().gap(px(4.0));
+            if let Some(label) = prop_str(props, "label") {
+                field = field.child(div().text_size(px(12.0)).child(label));
+            }
+            field = field.children(kids);
+            if let Some(description) = prop_str(props, "description") {
+                field = field.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(tokens.text_muted)
+                        .child(description),
+                );
+            }
+            field.into_any_element()
+        }
+        "toolbar" => div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(
+                prop_f64(props, "gap").unwrap_or(8.0).clamp(0.0, 64.0) as f32
+            ))
+            .children(kids)
+            .into_any_element(),
+        "meter" => {
+            let min = prop_f64(props, "min").unwrap_or(0.0);
+            let max = prop_f64(props, "max").unwrap_or(100.0);
+            let value = prop_f64(props, "value").unwrap_or(min);
+            let percent = if max > min {
+                ((value - min) / (max - min) * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
+            let mut meter = div().w_full().flex().flex_col().gap(px(4.0));
+            if let Some(label) = prop_str(props, "label") {
+                meter = meter.child(div().text_size(px(12.0)).child(label));
+            }
+            meter
+                .child(Progress::new(element_id).value(percent as f32).w_full())
+                .into_any_element()
+        }
+        "segmentedcontrol" | "segmented-control" => {
+            let options = prop_strings(props, "options");
+            let selected = state_index(ctx, &node_key, prop_usize(props, "selected").unwrap_or(0))
+                .min(options.len().saturating_sub(1));
+            let pane_id = ctx.pane_id;
+            let handler_key = node_key.clone();
+            let bar = TabBar::new(element_id)
+                .children(options.into_iter().map(|label| Tab::new().label(label)))
+                .selected_index(selected)
+                .on_click(
+                    host.listener(move |this: &mut AppState, value: &usize, _window, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            handler_key.clone(),
+                            UiStateValue::Index(*value),
+                            cx,
+                        );
+                    }),
+                );
+            let panel = kids.into_iter().nth(selected);
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(bar)
+                .when_some(panel, |container, panel| container.child(panel))
+                .into_any_element()
+        }
+        "carousel" => {
+            let count = kids.len();
+            let selected = state_index(ctx, &node_key, prop_usize(props, "selected").unwrap_or(0))
+                .min(count.saturating_sub(1));
+            let pane_id = ctx.pane_id;
+            let previous_key = node_key.clone();
+            let next_key = node_key.clone();
+            let previous = Button::new(SharedString::from(format!("{element_id}-prev")))
+                .label("Previous")
+                .disabled(selected == 0 || count == 0)
+                .on_click(host.listener(
+                    move |this: &mut AppState, _: &gpui::ClickEvent, _, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            previous_key.clone(),
+                            UiStateValue::Index(selected.saturating_sub(1)),
+                            cx,
+                        );
+                    },
+                ));
+            let next = Button::new(SharedString::from(format!("{element_id}-next")))
+                .label("Next")
+                .disabled(selected + 1 >= count)
+                .on_click(host.listener(
+                    move |this: &mut AppState, _: &gpui::ClickEvent, _, cx| {
+                        this.set_ui_state(
+                            pane_id,
+                            next_key.clone(),
+                            UiStateValue::Index(selected + 1),
+                            cx,
+                        );
+                    },
+                ));
+            let panel = kids.into_iter().nth(selected);
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .when_some(panel, |container, panel| container.child(panel))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(previous)
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(tokens.text_muted)
+                                .child(format!(
+                                    "{} / {}",
+                                    if count == 0 { 0 } else { selected + 1 },
+                                    count
+                                )),
+                        )
+                        .child(next),
+                )
+                .into_any_element()
+        }
+        "timeline" => {
+            let mut timeline = div().w_full().flex().flex_col().gap(px(12.0));
+            if let Some(items) = props.get("items").and_then(serde_json::Value::as_array) {
+                for item in items.iter().take(MAX_NODES) {
+                    let mut content = div().flex().flex_col().gap(px(3.0)).child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(prop_str(item, "title").unwrap_or_default()),
+                    );
+                    if let Some(description) = prop_str(item, "description") {
+                        content = content.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(tokens.text_muted)
+                                .child(description),
+                        );
+                    }
+                    timeline = timeline.child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(8.0))
+                            .child(div().text_color(tokens.text_muted).child("•"))
+                            .child(content),
+                    );
+                }
+            }
+            timeline.into_any_element()
+        }
         "card" | "group" | "section" => {
             let mut card = GroupBox::new().id(element_id.clone());
             if let Some(title) = prop_str(props, "title") {
@@ -1191,6 +1449,9 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, host: &crate::UiHost) -> Any
                 .into_any_element()
         }
         "chart" => render_chart(ctx, props, element_id),
+        "metrics" => render_metrics(ctx, props),
+        "heatmap" => render_heatmap(ctx, props),
+        "stackedbar" => render_stacked_bar(ctx, props),
         "list" => {
             let ordered = prop_bool(props, "ordered").unwrap_or(false);
             let items = prop_strings(props, "items");
@@ -1275,6 +1536,206 @@ fn render_node(ctx: &UiCtx, id: &str, depth: usize, host: &crate::UiHost) -> Any
         "divider-line" => div().into_any_element(),
         other => error_chip(tokens, format!("Unknown UI component `{other}`")),
     }
+}
+
+fn render_metrics(ctx: &UiCtx, props: &serde_json::Value) -> AnyElement {
+    let Some(items) = props.get("items").and_then(|v| v.as_array()) else {
+        return error_chip(ctx.tokens, "Metrics needs an `items` array".into());
+    };
+    let mut row = div().w_full().flex().flex_wrap().gap(px(16.0));
+    for item in items.iter().take(12) {
+        let value = prop_str(item, "value")
+            .unwrap_or_else(|| item.get("value").map(|v| v.to_string()).unwrap_or_default());
+        let label = prop_str(item, "label").unwrap_or_default();
+        row = row.child(
+            div()
+                .min_w(px(95.0))
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_size(px(20.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(ctx.tokens.text_primary)
+                        .child(value),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(ctx.tokens.text_muted)
+                        .child(label),
+                ),
+        );
+    }
+    row.into_any_element()
+}
+
+fn render_heatmap(ctx: &UiCtx, props: &serde_json::Value) -> AnyElement {
+    let columns = prop_strings(props, "columns");
+    let Some(rows) = props.get("rows").and_then(|v| v.as_array()) else {
+        return error_chip(ctx.tokens, "Heatmap needs a `rows` array".into());
+    };
+    let values: Vec<f64> = rows
+        .iter()
+        .take(32)
+        .flat_map(|row| {
+            row.get("values")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .take(64)
+                .filter_map(|v| v.as_f64())
+        })
+        .collect();
+    if values.is_empty() {
+        return error_chip(ctx.tokens, "Heatmap needs numeric values".into());
+    }
+    let min = prop_f64(props, "min")
+        .unwrap_or_else(|| values.iter().copied().fold(f64::INFINITY, f64::min));
+    let max = prop_f64(props, "max")
+        .unwrap_or_else(|| values.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    let palette = [
+        0x112c52ff, 0x174782ff, 0x1e5da8ff, 0x347bdcff, 0x72a7eaff, 0xb8d5f8ff,
+    ];
+    let mut content = div().w_full().flex().flex_col().gap(px(2.0));
+    for row in rows.iter().take(32) {
+        let mut line = div().w_full().flex().items_center().gap(px(2.0)).child(
+            div()
+                .w(px(48.0))
+                .flex_shrink_0()
+                .text_size(px(10.0))
+                .text_color(ctx.tokens.text_muted)
+                .truncate()
+                .child(prop_str(row, "label").unwrap_or_default()),
+        );
+        if let Some(cells) = row.get("values").and_then(|v| v.as_array()) {
+            for cell in cells.iter().take(64) {
+                let color = cell.as_f64().map(|value| {
+                    let intensity = if max > min {
+                        ((value - min) / (max - min)).clamp(0.0, 1.0)
+                    } else {
+                        0.5
+                    };
+                    gpui::rgba(palette[(intensity * 5.0).round() as usize])
+                });
+                line = line.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(18.0))
+                        .rounded(px(2.0))
+                        .bg(color.map(Hsla::from).unwrap_or(ctx.tokens.border_subtle)),
+                );
+            }
+        }
+        content = content.child(line);
+    }
+    if !columns.is_empty() {
+        let mut labels = div()
+            .w_full()
+            .flex()
+            .gap(px(2.0))
+            .child(div().w(px(48.0)).flex_shrink_0());
+        for label in columns.into_iter().take(64) {
+            labels = labels.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(9.0))
+                    .text_color(ctx.tokens.text_muted)
+                    .child(label),
+            );
+        }
+        content = content.child(labels);
+    }
+    content.into_any_element()
+}
+
+fn render_stacked_bar(ctx: &UiCtx, props: &serde_json::Value) -> AnyElement {
+    let colors = theme::visual_colors(ctx.tokens.is_dark);
+    let series = prop_strings(props, "series");
+    let Some(rows) = props.get("rows").and_then(|v| v.as_array()) else {
+        return error_chip(ctx.tokens, "StackedBar needs a `rows` array".into());
+    };
+    let mut content = div().w_full().flex().flex_col().gap(px(8.0));
+    let mut legend = div().flex().flex_wrap().gap(px(12.0));
+    for (i, label) in series.iter().take(colors.len()).enumerate() {
+        legend = legend.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .text_size(px(10.0))
+                .text_color(ctx.tokens.text_secondary)
+                .child(
+                    div()
+                        .size(px(8.0))
+                        .rounded(px(2.0))
+                        .bg(gpui::rgba(colors[i])),
+                )
+                .child(label.clone()),
+        );
+    }
+    content = content.child(legend);
+    for row in rows.iter().take(32) {
+        let values: Vec<f64> = row
+            .get("values")
+            .and_then(|v| v.as_array())
+            .map(|v| {
+                v.iter()
+                    .take(colors.len())
+                    .map(|x| x.as_f64().unwrap_or(0.0).max(0.0))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let total: f64 = values.iter().sum();
+        let mut bar = div().flex_1().min_w_0().h(px(24.0)).flex().gap(px(1.0));
+        if total > 0.0 {
+            for (i, value) in values.iter().enumerate() {
+                if *value > 0.0 {
+                    let fraction = (*value / total) as f32;
+                    let mut segment = div()
+                        .h_full()
+                        .w(relative(fraction))
+                        .rounded(px(2.0))
+                        .bg(gpui::rgba(colors[i]))
+                        .flex()
+                        .items_center()
+                        .justify_center();
+                    if fraction >= 0.12 {
+                        segment = segment.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(gpui::rgba(0xffffffff))
+                                .child(format!("{:.0}%", fraction * 100.0)),
+                        );
+                    }
+                    bar = bar.child(segment);
+                }
+            }
+        }
+        content = content.child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .w(px(72.0))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(ctx.tokens.text_primary)
+                        .child(prop_str(row, "label").unwrap_or_default()),
+                )
+                .child(bar),
+        );
+    }
+    content.into_any_element()
 }
 
 fn render_chart(ctx: &UiCtx, props: &serde_json::Value, id: SharedString) -> AnyElement {
@@ -1384,6 +1845,59 @@ mod tests {
         let segments = split_ui_segments("Hi\n```ui\n{\"root\":\"x\"");
         assert!(matches!(segments[0], Segment::Markdown(text) if text.contains("Hi")));
         assert!(matches!(segments[1], Segment::Ui { closed: false, .. }));
+    }
+
+    #[test]
+    fn renders_complete_spec_before_closing_fence() {
+        let mut body = AssistantBody::default();
+        body.prepare("```ui\n{\"root\":\"a\",\"elements\":{\"a\":{\"type\":\"Text\"}}}");
+        assert!(matches!(body.segments[0], Some(PreparedSegment::Ui(Ok(_)))));
+
+        body.prepare("```ui\n{\"root\":\"a\"");
+        assert!(matches!(body.segments[0], Some(PreparedSegment::PendingUi)));
+    }
+
+    #[test]
+    fn previews_complete_nodes_while_later_nodes_stream() {
+        let raw = r#"{"root":"a","elements":{"a":{"type":"Card","children":["b"]},"b":{"type":"Text","props":{"text":"hello } world"}},"c":{"type":"Text"#;
+        let spec = streaming::partial_spec(raw).expect("complete nodes can be previewed");
+        assert_eq!(spec.elements.len(), 2);
+        assert_eq!(spec.elements["a"].children, ["b"]);
+
+        let parent_only =
+            r#"{"root":"a","elements":{"a":{"type":"Card","children":["b"]},"b":{"type":"Text"#;
+        let spec = streaming::partial_spec(parent_only).expect("parent can be previewed");
+        assert!(spec.elements["a"].children.is_empty());
+    }
+
+    #[test]
+    fn keeps_preview_during_an_unfinished_next_node() {
+        let mut body = AssistantBody::default();
+        let first = "```ui\n{\"root\":\"a\",\"elements\":{\"a\":{\"type\":\"Card\"}";
+        body.prepare(first);
+        assert!(matches!(body.segments[0], Some(PreparedSegment::Ui(Ok(_)))));
+        body.prepare(&format!("{first},\"b\":{{\"type\":\"Text\""));
+        assert!(matches!(body.segments[0], Some(PreparedSegment::Ui(Ok(_)))));
+        body.prepare("```ui\n{\"root\":");
+        assert!(matches!(body.segments[0], Some(PreparedSegment::PendingUi)));
+    }
+
+    #[test]
+    fn rejects_exponentially_expanding_element_graph() {
+        let mut elements = serde_json::Map::new();
+        for index in 0..10 {
+            let children = if index == 9 {
+                vec![]
+            } else {
+                vec![format!("n{}", index + 1); 2]
+            };
+            elements.insert(
+                format!("n{index}"),
+                serde_json::json!({"type":"Column", "children": children}),
+            );
+        }
+        let raw = serde_json::json!({"root":"n0", "elements":elements}).to_string();
+        assert!(parse_spec(&raw).unwrap_err().contains("expands"));
     }
 
     #[test]

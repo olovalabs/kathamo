@@ -3112,7 +3112,7 @@ impl AppState {
                             legacy.model.is_some() && legacy.model == saved.selected_model
                         })
                     {
-                        let key = conversations::conversation_key(legacy.model.as_ref());
+                        let key = conversations::legacy_conversation_key(legacy.model.as_ref());
                         if legacy.rpi_session_id.is_some()
                             || transcripts.contains_key(&transcript_key(&pane.uid, &key))
                         {
@@ -14937,7 +14937,7 @@ fn main() -> Result<()> {
                                                         .map(str::to_owned)
                                                         .unwrap_or_else(|| conversations::conversation_key(None)),
                                                 ).chain(pane.chat.models.iter().map(|legacy| {
-                                                    conversations::conversation_key(legacy.model.as_ref())
+                                                    conversations::legacy_conversation_key(legacy.model.as_ref())
                                                 }));
                                                 for key in keys {
                                                     let conversation_path = paths::conversations_dir()
@@ -15979,7 +15979,7 @@ Done."#
             }],
         };
         let saved_chat = &mut workspace.projects[0].sessions[0].panes[0].chat;
-        let legacy_key = conversations::conversation_key(saved_chat.selected_model.as_ref());
+        let legacy_key = conversations::legacy_conversation_key(saved_chat.selected_model.as_ref());
         saved_chat.models.push(workspace_state::SavedModelChat {
             model: saved_chat.selected_model.clone(),
             conversation: legacy_key.clone(),

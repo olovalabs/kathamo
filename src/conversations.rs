@@ -386,11 +386,20 @@ pub fn conversation_key(model: Option<&AgentModel>) -> String {
         Some(model) => {
             let backend = match model.backend {
                 ModelBackend::Rpi => "rpi",
-                // Keep the filename stem for existing Kathamo conversations.
-                ModelBackend::Kathamo => "omp",
+                ModelBackend::Kathamo => "kathamo",
             };
             sanitize(&format!("{backend}_{}_{}", model.provider, model.id))
         }
+    }
+}
+
+/// Historical model-specific transcripts used the former backend name.
+pub fn legacy_conversation_key(model: Option<&AgentModel>) -> String {
+    match model {
+        Some(model) if model.backend == ModelBackend::Kathamo => {
+            sanitize(&format!("omp_{}_{}", model.provider, model.id))
+        }
+        _ => conversation_key(model),
     }
 }
 
@@ -825,7 +834,7 @@ mod tests {
             backend: ModelBackend::Kathamo,
         };
         let key = conversation_key(Some(&model));
-        assert_eq!(key, "omp_google_antigravity_gemini_3.1");
+        assert_eq!(key, "kathamo_google_antigravity_gemini_3.1");
         assert_eq!(conversation_key(None), "default");
     }
 

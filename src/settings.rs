@@ -124,8 +124,9 @@ pub struct AppSettings {
     pub palette_scheme: PaletteScheme,
     pub theme_colors: ThemeColors,
     pub default_agent_model: Option<AgentModel>,
-    /// Explicit OMP-only execution opt-ins, scoped to canonical workspace paths.
-    pub trusted_omp_workspaces: Vec<PathBuf>,
+    /// Explicit Kathamo execution opt-ins, scoped to canonical workspace paths.
+    #[serde(alias = "trusted_omp_workspaces")]
+    pub trusted_kathamo_workspaces: Vec<PathBuf>,
     pub sidebar: SavedSidebar,
     pub window: Option<SavedWindow>,
     pub restore: RestoreOptions,
@@ -139,7 +140,7 @@ impl Default for AppSettings {
             palette_scheme: PaletteScheme::default(),
             theme_colors: ThemeColors::default(),
             default_agent_model: None,
-            trusted_omp_workspaces: Vec::new(),
+            trusted_kathamo_workspaces: Vec::new(),
             sidebar: SavedSidebar::default(),
             window: None,
             restore: RestoreOptions::default(),
@@ -331,7 +332,7 @@ mod tests {
         let settings = AppSettings {
             theme: ThemePreference::Dark,
             palette_scheme: PaletteScheme::Github,
-            trusted_omp_workspaces: vec![PathBuf::from("/tmp/explicit-workspace")],
+            trusted_kathamo_workspaces: vec![PathBuf::from("/tmp/explicit-workspace")],
             sidebar: SavedSidebar {
                 visible: false,
                 width: 300.0,
@@ -356,11 +357,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_settings_never_grant_omp_trust() {
+    fn legacy_settings_never_grant_kathamo_trust() {
         let settings: AppSettings =
             serde_json::from_str(r#"{"version":1,"theme":"dark"}"#).unwrap();
-        assert!(settings.trusted_omp_workspaces.is_empty());
-        assert!(AppSettings::default().trusted_omp_workspaces.is_empty());
+        assert!(settings.trusted_kathamo_workspaces.is_empty());
+        assert!(AppSettings::default().trusted_kathamo_workspaces.is_empty());
+    }
+
+    #[test]
+    fn legacy_workspace_trust_key_is_read_and_renamed_on_save() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"trusted_omp_workspaces":["/tmp/explicit-workspace"]}"#)
+                .unwrap();
+        assert_eq!(
+            settings.trusted_kathamo_workspaces,
+            vec![PathBuf::from("/tmp/explicit-workspace")]
+        );
+        let saved = serde_json::to_value(settings).unwrap();
+        assert!(saved.get("trusted_kathamo_workspaces").is_some());
+        assert!(saved.get("trusted_omp_workspaces").is_none());
     }
 
     #[test]

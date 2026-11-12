@@ -511,6 +511,15 @@ impl InputState {
         cx.notify();
     }
 
+    /// Clear optional syntax highlighting from an auto-growing input.
+    pub fn clear_highlighter(&mut self, cx: &mut Context<Self>) {
+        if let InputMode::AutoGrow { language, highlighter, .. } = &mut self.mode {
+            *language = None;
+            *highlighter.borrow_mut() = None;
+            cx.notify();
+        }
+    }
+
     fn reset_highlighter(&mut self, cx: &mut Context<Self>) {
         match &mut self.mode {
             InputMode::CodeEditor { highlighter, .. } => {

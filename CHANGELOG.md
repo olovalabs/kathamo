@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Multi-line programmatic edits now leave the cursor at the end of the line.
 
 ### Changed
+- Show built-in Agent activity, completion and failure in the sidebar's existing status indicators, independently of hidden terminal output. Unseen completions stay marked until viewed or acknowledged.
+- Match terminal and Agent pane frames with 0.5px slate outlines and 10px rounded corners, with focused and inactive colors shared across palettes in dark and light mode.
 - Moved the Agent composer's working-directory and Git-branch badges into a compact Environment panel. Click the info icon at the toolbar's top-right, on the same row as Agent and the model picker, to slide it open directly above the input, aligned to its right edge; click again or press Escape from the composer to close it. Terminal badges remain inline.
 - Moved initial Markdown/HTML parsing and syntax highlighting off GPUI; bounded pending documents/results with latest-state mailboxes and monotonic compatible-prefix publication during continuous streaming.
 - Coalesced embedded-session wake callbacks before mutex/channel work, scanned only unfinished Markdown boundaries, and removed per-cell snapshot strings and whole-match-list searches from terminal painting.
@@ -66,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed the bottom input toggle; a previously saved `bottom_input` preference no longer disables the input.
 
 ### Fixed
+- Keep Agent input text uniformly colored instead of treating the first word as a shell command; terminal mode retains Bash highlighting.
 - Deliver the terminal's trailing throttled search refresh even when output stops; coalesce resize and visibility rescans.
 - Fix duplicate Antigravity model-route registration causing false ambiguous-model errors; host-declared transports now replace bundled routes for the same model identity.
 - Keep Markdown agent replies updating during continuous streams and reduce OMP streaming payloads.

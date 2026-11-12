@@ -228,8 +228,6 @@ impl ThemeTokens {
             self.sidebar_footer_border = rgba(0xffffff0d).into();
 
             self.pane_bg = bg.into();
-            self.pane_border = rgba(0xffffff0d).into();
-            self.pane_border_focused = rgba(0x19aad866).into();
             self.pane_header_bg = bg.into();
             self.pane_header_fg = text_disabled.into();
             self.pane_header_btn_hover = surface_2.into();
@@ -306,8 +304,6 @@ impl ThemeTokens {
             self.sidebar_footer_border = rgba(0x1111110d).into();
 
             self.pane_bg = bg.into();
-            self.pane_border = rgba(0x1111110d).into();
-            self.pane_border_focused = rgba(0x00c2ff66).into();
             self.pane_header_bg = bg.into();
             self.pane_header_fg = text_disabled.into();
             self.pane_header_btn_hover = surface_2.into();
@@ -376,8 +372,8 @@ impl ThemeTokens {
             sidebar_footer_border: rgba(0x242531ff).into(),
 
             pane_bg: rgba(0x0c0d12ff).into(),
-            pane_border: rgba(0x22232cff).into(),
-            pane_border_focused: rgba(0x38394eff).into(),
+            pane_border: rgba(0x3c4149ff).into(),
+            pane_border_focused: rgba(0x8799adff).into(),
             pane_header_bg: rgba(0x0c0d12ff).into(),
             pane_header_fg: rgba(0x918995ff).into(),
             pane_header_btn_hover: rgba(0x23242cff).into(),
@@ -446,8 +442,8 @@ impl ThemeTokens {
             sidebar_footer_border: rgba(0xd1d9e0ff).into(),
 
             pane_bg: rgba(0xffffffff).into(),
-            pane_border: rgba(0xd1d9e0ff).into(),
-            pane_border_focused: rgba(0x0969daff).into(),
+            pane_border: rgba(0xc0c6ceff).into(),
+            pane_border_focused: rgba(0x71849aff).into(),
             pane_header_bg: rgba(0xf6f8faff).into(),
             pane_header_fg: rgba(0x59636eff).into(),
             pane_header_btn_hover: rgba(0xeaeef2ff).into(),

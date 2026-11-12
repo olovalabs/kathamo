@@ -1795,6 +1795,8 @@ struct PaneChat {
     cwd: Option<PathBuf>,
     messages: Vec<Arc<ChatMessage>>,
     running: bool,
+    /// Native agent lifecycle, independent of the pane's hidden shell.
+    status: SessionStatus,
     /// Completed turns in this conversation.
     completed_turns: u64,
     terminal_draft: String,
@@ -1842,6 +1844,7 @@ impl Default for PaneChat {
             cwd: None,
             messages: Vec::new(),
             running: false,
+            status: SessionStatus::Idle,
             completed_turns: 0,
             terminal_draft: String::new(),
             agent_draft: String::new(),
@@ -1876,6 +1879,26 @@ impl Default for PaneChat {
 }
 
 impl PaneChat {
+    fn observe_status(&mut self, event: &agent_bridge::AgentEvent) {
+        use agent_bridge::AgentEvent;
+        match event {
+            AgentEvent::Error(_) => self.status = SessionStatus::Error,
+            AgentEvent::Done => {
+                if self.running && self.status != SessionStatus::Error {
+                    self.status = SessionStatus::Done;
+                }
+                self.running = false;
+            }
+            AgentEvent::Closed => {
+                if self.running {
+                    self.status = SessionStatus::Error;
+                }
+                self.running = false;
+            }
+            _ => {}
+        }
+    }
+
     fn mode_thinking_level(&self) -> &str {
         if let Some(level) = self.thinking_override.as_deref() {
             return level;
@@ -3827,6 +3850,29 @@ impl AppState {
                         changed = true;
                     }
 
+                    // Native chat owns its status while shown or running in the
+                    // background; shell output and cached PTY evidence cannot
+                    // overwrite an agent turn.
+                    if pane.chat.active || pane.chat.running {
+                        let next = if pane.chat.running && pane.chat.status != SessionStatus::Error {
+                            SessionStatus::Working
+                        } else if pane.chat.status == SessionStatus::Idle && focused {
+                            SessionStatus::Active
+                        } else {
+                            pane.chat.status
+                        };
+                        changed |= pane.status != next;
+                        pane.status = next;
+                        pane.is_agent = true;
+                        pane.detection = status::DetectionResult::new(
+                            next,
+                            status::EvidenceSource::AgentLifecycle,
+                            status::Confidence::High,
+                        );
+                        pane.poll_cache = None;
+                        continue;
+                    }
+
                     // Idle fast path: the screen revision changes on PTY output
                     // and resize, while focus, exit state, and foreground-group
                     // changes are checked independently. Stable panes therefore
@@ -4319,6 +4365,7 @@ impl AppState {
                         && resolved.status != SessionStatus::Done
                     {
                         pane.native_status = None;
+                        pane.chat.status = SessionStatus::Idle;
                         pane.native_acknowledged = true;
                         pane.ack_screen =
                             Some(screen_fingerprint(&pane.screen_scratch, &pane.title));
@@ -5078,6 +5125,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         let (input, subscription) = build_pane_input(pane_id, window, cx);
+        if self.pane_ref(pane_id).is_some_and(|pane| pane.chat.active) {
+            input.update(cx, |state, cx| state.clear_highlighter(cx));
+        }
         let restore = self
             .pane_mut(pane_id)
             .and_then(|pane| pane.restore_draft.take());
@@ -5703,6 +5753,11 @@ impl AppState {
         pane.history_index = None;
         pane.pending_draft.clear();
         input.update(cx, |state, cx| {
+            if active {
+                state.clear_highlighter(cx);
+            } else {
+                state.set_highlighter("bash", cx);
+            }
             state.set_placeholder(
                 if active { "Message the agent…" } else { "Run commands" },
                 window,
@@ -6213,6 +6268,7 @@ impl AppState {
                             let startup_error = pane.chat.messages.is_empty()
                                 && !pane.chat.running
                                 && matches!(event, agent_bridge::AgentEvent::Error(_));
+                            pane.chat.observe_status(&event);
                             if save_history && !startup_error {
                                 if let Some(log) = pane.chat.conversation.as_mut() {
                                     if !matches!(
@@ -6227,7 +6283,6 @@ impl AppState {
                             }
                             match event {
                                 agent_bridge::AgentEvent::Done => {
-                                    pane.chat.running = false;
                                     pane.chat.completed_turns =
                                         pane.chat.completed_turns.saturating_add(1);
                                     crate::stream_timing::turn_settled(trace);
@@ -6235,7 +6290,6 @@ impl AppState {
                                     finish_chat_streaming(&mut pane.chat.messages);
                                 }
                                 agent_bridge::AgentEvent::Closed => {
-                                    pane.chat.running = false;
                                     crate::stream_timing::turn_settled(trace);
                                     finish_chat_tools(&mut pane.chat.messages);
                                     finish_chat_streaming(&mut pane.chat.messages);
@@ -6512,6 +6566,7 @@ impl AppState {
             ));
         }
         if let Err(error) = pane.chat.ensure_agent(cwd) {
+            pane.chat.status = SessionStatus::Error;
             pane.chat
                 .messages
                 .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
@@ -6545,13 +6600,14 @@ impl AppState {
                     .messages
                     .push(Arc::new(ChatMessage::new(ChatRole::User, prompt)));
                 pane.chat.running = true;
+                pane.chat.status = SessionStatus::Working;
                 pane.attachments.clear();
                 input.update(cx, |state, cx| state.set_value("", window, cx));
             }
-            Err(error) => pane
-                .chat
-                .messages
-                .push(Arc::new(ChatMessage::new(ChatRole::Error, error))),
+            Err(error) => {
+                pane.chat.status = SessionStatus::Error;
+                pane.chat.messages.push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+            }
         }
         pane.chat.autoscroll = true;
         pane.chat.scroll_to_end();
@@ -11368,8 +11424,8 @@ impl AppState {
             .flex_col()
             .size_full()
             .bg(tokens.pane_bg)
-            .rounded(px(8.0))
-            .border_1()
+            .rounded(px(10.0))
+            .border(px(0.5))
             .border_color(if is_focused {
                 tokens.pane_border_focused
             } else {
@@ -13143,6 +13199,7 @@ impl AppState {
                                 if matches!(pane.status, SessionStatus::Done | SessionStatus::Error)
                                 {
                                     pane.status = SessionStatus::Idle;
+                                    pane.chat.status = SessionStatus::Idle;
                                     pane.native_status = None;
                                     pane.native_acknowledged = true;
                                     pane.attention.seen = true;
@@ -13212,6 +13269,7 @@ impl AppState {
                                 if matches!(pane.status, SessionStatus::Done | SessionStatus::Error)
                                 {
                                     pane.status = SessionStatus::Idle;
+                                    pane.chat.status = SessionStatus::Idle;
                                     pane.native_status = None;
                                     pane.native_acknowledged = true;
                                     pane.attention.seen = true;
@@ -14942,6 +15000,76 @@ mod resize_tests {
         let title = agent_title_from_prompt(&long).unwrap();
         assert!(title.ends_with('…'));
         assert_eq!(title.chars().count(), 65);
+    }
+
+    #[test]
+    fn native_agent_sidebar_lifecycle_ignores_hidden_shell() {
+        use agent_bridge::AgentEvent;
+
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        cx.draw_frame().unwrap();
+        state.update(&mut cx, |s, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            pane.chat.active = true;
+            pane.chat.running = true;
+            pane.chat.status = SessionStatus::Working;
+            // A stale shell failure must not mask native chat activity.
+            pane.native_status = Some(SessionStatus::Error);
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Working);
+            assert_eq!(
+                s.projects[0].sessions[0].panes[0].detection.evidence,
+                status::EvidenceSource::AgentLifecycle,
+            );
+        });
+        cx.draw_frame().unwrap();
+
+        // Switching to the terminal must not hide a still-running agent.
+        state.update(&mut cx, |s, cx| {
+            s.projects[0].sessions[0].panes[0].chat.active = false;
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Working);
+            s.window_active = false;
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            pane.chat.active = true;
+            pane.chat.observe_status(&AgentEvent::Done);
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Done);
+        });
+        cx.draw_frame().unwrap();
+
+        // Looking acknowledges completion permanently, including after leaving.
+        state.update(&mut cx, |s, cx| {
+            s.window_active = true;
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Active);
+            s.window_active = false;
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_ne!(s.projects[0].sessions[0].status, SessionStatus::Done);
+
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            pane.chat.running = true;
+            pane.chat.status = SessionStatus::Working;
+            pane.chat.observe_status(&AgentEvent::Error("Provider failed".into()));
+            pane.chat.observe_status(&AgentEvent::Done);
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Error);
+        });
+        cx.draw_frame().unwrap();
+
+        // New work clears a prior failure; closing mid-turn fails the new turn.
+        state.update(&mut cx, |s, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            pane.chat.running = true;
+            pane.chat.status = SessionStatus::Working;
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Working);
+            s.projects[0].sessions[0].panes[0].chat.observe_status(&AgentEvent::Closed);
+            s.poll_sessions_status_with(&HashMap::new(), cx);
+            assert_eq!(s.projects[0].sessions[0].status, SessionStatus::Error);
+        });
     }
 
     #[test]

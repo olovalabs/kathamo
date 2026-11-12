@@ -73,6 +73,23 @@ Kathamo uses the platform-native application directories (the same convention as
 | macOS | `~/Library/Application Support/Kathamo` | `~/.config/kathamo/settings.json` |
 | Windows | `%LOCALAPPDATA%\Kathamo` | `%APPDATA%\Kathamo\settings.json` |
 
+### Custom theme colors
+
+On first launch Kathamo writes a complete default `theme_colors` object into
+the user settings file listed above. Edit `theme_colors.light.style` and
+`theme_colors.dark.style` to change colors, using dotted keys such as
+`window.bg` and `terminal.ansi.red`. `theme` selects `light`, `dark`, or
+`system`. Colors use `#RRGGBB` or `#RRGGBBAA`; terminal colors must be opaque.
+In Settings, choose **Open settings.json**, edit and save the file, then choose
+**Reload theme** to apply theme changes. For an existing
+settings file, add `theme_colors` with `light` and `dark` objects containing
+`style` maps; omitted values use the selected palette defaults.
+
+The structure is inspired by Zed's dotted theme styles, but Kathamo's token
+names are its own and it does not yet support importing Zed theme files. These
+tokens cover Kathamo's existing UI tokens and terminal palette; some component
+library styles and colors defined directly in views are not yet configurable.
+
 The data folder holds `workspace.json` (projects, tabs, split layout, cwd), `sessions/` (per-pane terminal output), `conversations/` (agent transcripts), and `backups/`. Manage or clear it from **Settings → Data & Sessions**, or override the location with `KATHAMO_DATA_DIR=/absolute/path`. Set `KATHAMO_DISABLE_RESTORE=1` for a clean launch without reading saved state.
 
 Processes are not resurrected: a restored pane starts a fresh shell in the saved working directory with the previous output shown above the new prompt.

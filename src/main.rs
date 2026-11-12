@@ -57,7 +57,7 @@ mod subagent_chat;
 mod theme;
 mod workspace_state;
 
-use theme::{PaletteScheme, ThemePreference, ThemeTokens, load_palette};
+use theme::{PaletteScheme, ThemePreference, ThemeTokens};
 
 /// Key context of the Kathamo input bar.
 ///
@@ -2897,7 +2897,7 @@ impl AppState {
                     Ok(false) => return,
                     Err(error) => eprintln!("failed to save workspace state: {error}"),
                 }
-                if let Err(error) = settings::save_atomic(&settings) {
+                if let Err(error) = settings::save_preserving_theme(&settings) {
                     eprintln!("failed to save settings: {error}");
                 }
             })
@@ -2947,7 +2947,7 @@ impl AppState {
                 eprintln!("failed to save workspace state: {error}");
             }
         }
-        if let Err(error) = settings::save_atomic(&settings) {
+        if let Err(error) = settings::save_preserving_theme(&settings) {
             eprintln!("failed to save settings: {error}");
         }
 
@@ -3001,7 +3001,10 @@ impl AppState {
         self.palette_scheme = self.settings.palette_scheme;
         self.default_agent_model = self.settings.default_agent_model.clone();
         let mode = self.theme_preference.resolve_mode(cx.window_appearance());
-        self.palette = load_palette(self.palette_scheme, mode.is_dark());
+        self.palette = self
+            .settings
+            .theme_colors
+            .palette(self.palette_scheme, mode.is_dark());
         theme::apply_component_theme(mode, None, cx);
         sync_component_fonts(cx);
 
@@ -3292,13 +3295,13 @@ impl AppState {
 
     pub fn tokens(&self, cx: &App) -> ThemeTokens {
         let mode = gpui_component::Theme::global(cx).mode;
-        ThemeTokens::from_mode_with_scheme(mode, self.palette_scheme)
+        self.settings.theme_colors.tokens(mode, self.palette_scheme)
     }
 
     #[allow(dead_code)]
     pub fn tokens_with_appearance(&self, appearance: gpui::WindowAppearance) -> ThemeTokens {
         let mode = self.theme_preference.resolve_mode(appearance);
-        ThemeTokens::from_mode_with_scheme(mode, self.palette_scheme)
+        self.settings.theme_colors.tokens(mode, self.palette_scheme)
     }
 
     /// Switch the terminal palette / block chrome scheme (Warp / GitHub).
@@ -3311,7 +3314,13 @@ impl AppState {
         if self.palette_scheme == scheme {
             return;
         }
+        self.settings
+            .theme_colors
+            .change_scheme(self.palette_scheme, scheme);
         self.palette_scheme = scheme;
+        if let Err(error) = settings::save_atomic(&self.saved_settings()) {
+            eprintln!("failed to save theme: {error}");
+        }
         self.apply_theme_preference(window, cx);
         self.schedule_workspace_save(cx);
     }
@@ -3326,6 +3335,9 @@ impl AppState {
             return;
         }
         self.theme_preference = preference;
+        if let Err(error) = settings::save_atomic(&self.saved_settings()) {
+            eprintln!("failed to save theme preference: {error}");
+        }
         self.apply_theme_preference(window, cx);
         self.schedule_workspace_save(cx);
     }
@@ -3346,7 +3358,10 @@ impl AppState {
             .unwrap_or_else(|| cx.window_appearance());
         let mode = self.theme_preference.resolve_mode(appearance);
         let is_dark = mode.is_dark();
-        self.palette = load_palette(self.palette_scheme, is_dark);
+        self.palette = self
+            .settings
+            .theme_colors
+            .palette(self.palette_scheme, is_dark);
         theme::apply_component_theme(mode, window, cx);
         sync_component_fonts(cx);
 
@@ -12714,7 +12729,85 @@ impl AppState {
                             )
                             .child(div().flex().gap(px(12.0)).children(cards))
                             .child(self.render_palette_scheme_picker(cx))
+                            .child(self.render_theme_file_section(cx))
                             .child(self.render_data_section(cx)),
+                    ),
+            )
+    }
+
+    fn render_theme_file_section(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let tokens = self.tokens(cx);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(14.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(tokens.card_border)
+            .bg(tokens.card_bg)
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(tokens.text_primary)
+                    .child("Theme settings file"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(tokens.text_secondary)
+                    .child("Edit settings.json, save it, then reload to apply your theme."),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .id("open-theme-settings")
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(tokens.secondary_btn_bg)
+                            .text_color(tokens.secondary_btn_fg)
+                            .cursor(CursorStyle::PointingHand)
+                            .on_click(cx.listener(|_, _, _, _| {
+                                if let Err(error) =
+                                    paths::open_in_file_manager(&paths::settings_path())
+                                {
+                                    eprintln!("failed to open settings file: {error}");
+                                }
+                            }))
+                            .child("Open settings.json"),
+                    )
+                    .child(
+                        div()
+                            .id("reload-theme-settings")
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .rounded(px(6.0))
+                            .bg(tokens.secondary_btn_bg)
+                            .text_color(tokens.secondary_btn_fg)
+                            .cursor(CursorStyle::PointingHand)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                match settings::reload() {
+                                    Ok(settings) => {
+                                        this.settings.theme_colors = settings.theme_colors;
+                                        this.theme_preference = settings.theme;
+                                        this.palette_scheme = settings.palette_scheme;
+                                        this.apply_theme_preference(Some(window), cx);
+                                    }
+                                    Err(error) => window.push_notification(
+                                        Notification::new()
+                                            .title("Could not reload settings")
+                                            .message(error)
+                                            .with_type(NotificationType::Error),
+                                        cx,
+                                    ),
+                                }
+                            }))
+                            .child("Reload theme"),
                     ),
             )
     }
@@ -12941,7 +13034,7 @@ impl AppState {
             _ => return,
         }
         self.clear_data_confirm = false;
-        if let Err(error) = settings::save_atomic(&self.settings) {
+        if let Err(error) = settings::save_preserving_theme(&self.settings) {
             eprintln!("failed to save settings: {error}");
         }
         cx.notify();
@@ -14734,7 +14827,7 @@ fn main() -> Result<()> {
                 let _ = shell_history::cached();
             });
 
-            let palette = load_palette(app_settings.palette_scheme, initial_mode.is_dark());
+            let palette = app_settings.theme_colors.palette(app_settings.palette_scheme, initial_mode.is_dark());
             let persistence_path = Some(paths::workspace_path());
 
             let displays: Vec<Bounds<Pixels>> = cx

@@ -6,7 +6,7 @@
 
 use crate::agent_auth::AgentModel;
 use crate::paths;
-use crate::theme::{PaletteScheme, ThemePreference};
+use crate::theme::{PaletteScheme, ThemeColors, ThemePreference};
 use gpui::{Bounds, Pixels, Size, WindowBounds, point, px, size};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -122,6 +122,7 @@ pub struct AppSettings {
     pub version: u32,
     pub theme: ThemePreference,
     pub palette_scheme: PaletteScheme,
+    pub theme_colors: ThemeColors,
     pub default_agent_model: Option<AgentModel>,
     /// Explicit OMP-only execution opt-ins, scoped to canonical workspace paths.
     pub trusted_omp_workspaces: Vec<PathBuf>,
@@ -136,6 +137,7 @@ impl Default for AppSettings {
             version: 1,
             theme: ThemePreference::default(),
             palette_scheme: PaletteScheme::default(),
+            theme_colors: ThemeColors::default(),
             default_agent_model: None,
             trusted_omp_workspaces: Vec::new(),
             sidebar: SavedSidebar::default(),
@@ -190,9 +192,10 @@ pub fn load() -> AppSettings {
             .sidebar_width
             .filter(|width| width.is_finite() && *width > 0.0)
             .unwrap_or_else(default_sidebar_width);
-        if let Err(error) = save_atomic(&settings) {
-            eprintln!("failed to write migrated settings: {error}");
-        }
+    }
+    settings.theme_colors = ThemeColors::complete_defaults(settings.palette_scheme);
+    if let Err(error) = save_atomic(&settings) {
+        eprintln!("failed to write initial settings: {error}");
     }
     settings
 }
@@ -232,15 +235,19 @@ fn load_legacy_settings() -> Option<LegacySettings> {
 }
 
 pub fn save_atomic(settings: &AppSettings) -> io::Result<()> {
+    let _guard = WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    save_unlocked(settings)
+}
+
+fn save_unlocked(settings: &AppSettings) -> io::Result<()> {
     let path = paths::settings_path();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
-    let _guard = WRITE_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
     let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     fs::write(&temp, bytes)?;
     if let Err(error) = paths::atomic_replace(&temp, &path) {
@@ -248,6 +255,31 @@ pub fn save_atomic(settings: &AppSettings) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Preserve theme edits made by an external editor during routine autosaves.
+pub fn save_preserving_theme(settings: &AppSettings) -> io::Result<()> {
+    let _guard = WRITE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let path = paths::settings_path();
+    let mut merged = settings.clone();
+    if path.exists() {
+        let text = fs::read_to_string(&path)?;
+        let disk: AppSettings = parse_jsonc(&text).map_err(io::Error::other)?;
+        merged.theme_colors = disk.theme_colors;
+        merged.theme = disk.theme;
+        merged.palette_scheme = disk.palette_scheme;
+    }
+    save_unlocked(&merged)
+}
+
+/// Read the user's file without silently replacing invalid settings with defaults.
+pub fn reload() -> Result<AppSettings, String> {
+    let path = paths::settings_path();
+    let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    parse_jsonc(&text)
 }
 
 /// Convert persisted geometry into `WindowBounds`, falling back to a centered

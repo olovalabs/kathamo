@@ -161,6 +161,338 @@ pub struct ThemeTokens {
     pub editor_bar_border: Hsla,
 }
 
+/// Per-appearance overrides. Colors use #RRGGBB or #RRGGBBAA.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeColors {
+    pub light: AppearanceColors,
+    pub dark: AppearanceColors,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceColors {
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub ui: std::collections::BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub terminal: std::collections::BTreeMap<String, String>,
+    pub style: std::collections::BTreeMap<String, String>,
+}
+
+impl ThemeColors {
+    /// A complete editable copy of Kathamo's built-in Warp colors.
+    pub fn complete_defaults(scheme: PaletteScheme) -> Self {
+        fn hex(color: Hsla) -> String {
+            let rgb = terminal::hsla_to_rgb(color);
+            format!(
+                "#{:02x}{:02x}{:02x}{:02x}",
+                rgb.r,
+                rgb.g,
+                rgb.b,
+                (color.a.clamp(0.0, 1.0) * 255.0).round() as u8
+            )
+        }
+        fn appearance(dark: bool, scheme: PaletteScheme) -> AppearanceColors {
+            let mode = if dark {
+                gpui_component::ThemeMode::Dark
+            } else {
+                gpui_component::ThemeMode::Light
+            };
+            let tokens = ThemeTokens::from_mode_with_scheme(mode, scheme);
+            let palette = load_palette(scheme, dark);
+            let mut style = std::collections::BTreeMap::new();
+            style.insert("window.bg".into(), hex(tokens.window_bg));
+            style.insert("text.primary".into(), hex(tokens.text_primary));
+            style.insert("text.secondary".into(), hex(tokens.text_secondary));
+            style.insert("text.muted".into(), hex(tokens.text_muted));
+            style.insert("border".into(), hex(tokens.border));
+            style.insert("border.subtle".into(), hex(tokens.border_subtle));
+            style.insert("titlebar.bg".into(), hex(tokens.titlebar_bg));
+            style.insert("titlebar.border".into(), hex(tokens.titlebar_border));
+            style.insert("titlebar.fg".into(), hex(tokens.titlebar_fg));
+            style.insert("titlebar.btn.hover".into(), hex(tokens.titlebar_btn_hover));
+            style.insert("sidebar.bg".into(), hex(tokens.sidebar_bg));
+            style.insert("sidebar.bg.start".into(), hex(tokens.sidebar_bg_start));
+            style.insert("sidebar.bg.end".into(), hex(tokens.sidebar_bg_end));
+            style.insert("sidebar.border".into(), hex(tokens.sidebar_border));
+            style.insert("sidebar.fg".into(), hex(tokens.sidebar_fg));
+            style.insert("sidebar.muted".into(), hex(tokens.sidebar_muted));
+            style.insert("sidebar.item.hover".into(), hex(tokens.sidebar_item_hover));
+            style.insert(
+                "sidebar.item.active".into(),
+                hex(tokens.sidebar_item_active),
+            );
+            style.insert(
+                "sidebar.item.active.fg".into(),
+                hex(tokens.sidebar_item_active_fg),
+            );
+            style.insert(
+                "sidebar.section.header".into(),
+                hex(tokens.sidebar_section_header),
+            );
+            style.insert(
+                "sidebar.icon.btn.hover".into(),
+                hex(tokens.sidebar_icon_btn_hover),
+            );
+            style.insert("sidebar.icon".into(), hex(tokens.sidebar_icon));
+            style.insert("sidebar.icon.hover".into(), hex(tokens.sidebar_icon_hover));
+            style.insert("sidebar.footer.bg".into(), hex(tokens.sidebar_footer_bg));
+            style.insert(
+                "sidebar.footer.border".into(),
+                hex(tokens.sidebar_footer_border),
+            );
+            style.insert("pane.bg".into(), hex(tokens.pane_bg));
+            style.insert("pane.border".into(), hex(tokens.pane_border));
+            style.insert(
+                "pane.border.focused".into(),
+                hex(tokens.pane_border_focused),
+            );
+            style.insert("pane.header.bg".into(), hex(tokens.pane_header_bg));
+            style.insert("pane.header.fg".into(), hex(tokens.pane_header_fg));
+            style.insert(
+                "pane.header.btn.hover".into(),
+                hex(tokens.pane_header_btn_hover),
+            );
+            style.insert("pane.header.icon".into(), hex(tokens.pane_header_icon));
+            style.insert(
+                "pane.header.icon.hover".into(),
+                hex(tokens.pane_header_icon_hover),
+            );
+            style.insert("primary.btn.bg".into(), hex(tokens.primary_btn_bg));
+            style.insert("primary.btn.hover".into(), hex(tokens.primary_btn_hover));
+            style.insert("primary.btn.fg".into(), hex(tokens.primary_btn_fg));
+            style.insert("secondary.btn.bg".into(), hex(tokens.secondary_btn_bg));
+            style.insert(
+                "secondary.btn.hover".into(),
+                hex(tokens.secondary_btn_hover),
+            );
+            style.insert("secondary.btn.fg".into(), hex(tokens.secondary_btn_fg));
+            style.insert("card.bg".into(), hex(tokens.card_bg));
+            style.insert("card.border".into(), hex(tokens.card_border));
+            style.insert("card.hover".into(), hex(tokens.card_hover));
+            style.insert("pill.active.bg".into(), hex(tokens.pill_active_bg));
+            style.insert("pill.active.fg".into(), hex(tokens.pill_active_fg));
+            style.insert("pill.inactive.bg".into(), hex(tokens.pill_inactive_bg));
+            style.insert("pill.inactive.fg".into(), hex(tokens.pill_inactive_fg));
+            style.insert("ring".into(), hex(tokens.ring));
+            style.insert("block.bg".into(), hex(tokens.block_bg));
+            style.insert("block.bg.hover".into(), hex(tokens.block_bg_hover));
+            style.insert("block.border".into(), hex(tokens.block_border));
+            style.insert(
+                "block.border.selected".into(),
+                hex(tokens.block_border_selected),
+            );
+            style.insert("block.success".into(), hex(tokens.block_success));
+            style.insert("block.failure".into(), hex(tokens.block_failure));
+            style.insert("block.warning".into(), hex(tokens.block_warning));
+            style.insert("block.separator".into(), hex(tokens.block_separator));
+            style.insert("block.status.bg".into(), hex(tokens.block_status_bg));
+            style.insert("editor.bar.bg".into(), hex(tokens.editor_bar_bg));
+            style.insert("editor.bar.border".into(), hex(tokens.editor_bar_border));
+            style.insert("terminal.background".into(), hex(palette.background()));
+            style.insert("terminal.foreground".into(), hex(palette.foreground()));
+            style.insert("terminal.cursor".into(), hex(palette.cursor()));
+            style.insert("terminal.ansi.black".into(), hex(palette.ansi_colors()[0]));
+            style.insert("terminal.ansi.red".into(), hex(palette.ansi_colors()[1]));
+            style.insert("terminal.ansi.green".into(), hex(palette.ansi_colors()[2]));
+            style.insert("terminal.ansi.yellow".into(), hex(palette.ansi_colors()[3]));
+            style.insert("terminal.ansi.blue".into(), hex(palette.ansi_colors()[4]));
+            style.insert(
+                "terminal.ansi.magenta".into(),
+                hex(palette.ansi_colors()[5]),
+            );
+            style.insert("terminal.ansi.cyan".into(), hex(palette.ansi_colors()[6]));
+            style.insert("terminal.ansi.white".into(), hex(palette.ansi_colors()[7]));
+            style.insert(
+                "terminal.ansi.bright_black".into(),
+                hex(palette.ansi_colors()[8]),
+            );
+            style.insert(
+                "terminal.ansi.bright_red".into(),
+                hex(palette.ansi_colors()[9]),
+            );
+            style.insert(
+                "terminal.ansi.bright_green".into(),
+                hex(palette.ansi_colors()[10]),
+            );
+            style.insert(
+                "terminal.ansi.bright_yellow".into(),
+                hex(palette.ansi_colors()[11]),
+            );
+            style.insert(
+                "terminal.ansi.bright_blue".into(),
+                hex(palette.ansi_colors()[12]),
+            );
+            style.insert(
+                "terminal.ansi.bright_magenta".into(),
+                hex(palette.ansi_colors()[13]),
+            );
+            style.insert(
+                "terminal.ansi.bright_cyan".into(),
+                hex(palette.ansi_colors()[14]),
+            );
+            style.insert(
+                "terminal.ansi.bright_white".into(),
+                hex(palette.ansi_colors()[15]),
+            );
+            AppearanceColors {
+                style,
+                ..Default::default()
+            }
+        }
+        Self {
+            light: appearance(false, scheme),
+            dark: appearance(true, scheme),
+        }
+    }
+
+    /// Update untouched generated defaults while keeping custom colors.
+    pub fn change_scheme(&mut self, old: PaletteScheme, new: PaletteScheme) {
+        let before = Self::complete_defaults(old);
+        let after = Self::complete_defaults(new);
+        for (current, previous, next) in [
+            (&mut self.light, before.light, after.light),
+            (&mut self.dark, before.dark, after.dark),
+        ] {
+            for (key, value) in &mut current.style {
+                if previous.style.get(key) == Some(value) {
+                    if let Some(replacement) = next.style.get(key) {
+                        *value = replacement.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn appearance(&self, dark: bool) -> &AppearanceColors {
+        if dark { &self.dark } else { &self.light }
+    }
+
+    pub fn tokens(&self, mode: gpui_component::ThemeMode, scheme: PaletteScheme) -> ThemeTokens {
+        let mut tokens = ThemeTokens::from_mode_with_scheme(mode, scheme);
+        for (name, value) in self.appearance(mode.is_dark()).ui.iter().chain(
+            self.appearance(mode.is_dark())
+                .style
+                .iter()
+                .filter(|(key, _)| !key.starts_with("terminal.")),
+        ) {
+            let Some(color) = parse_hex(value) else {
+                eprintln!("invalid theme color {name}: {value}");
+                continue;
+            };
+            let normalized = name.replace('.', "_");
+            match normalized.as_str() {
+                "window_bg" => tokens.window_bg = rgba(color).into(),
+                "text_primary" => tokens.text_primary = rgba(color).into(),
+                "text_secondary" => tokens.text_secondary = rgba(color).into(),
+                "text_muted" => tokens.text_muted = rgba(color).into(),
+                "border" => tokens.border = rgba(color).into(),
+                "border_subtle" => tokens.border_subtle = rgba(color).into(),
+                "titlebar_bg" => tokens.titlebar_bg = rgba(color).into(),
+                "titlebar_border" => tokens.titlebar_border = rgba(color).into(),
+                "titlebar_fg" => tokens.titlebar_fg = rgba(color).into(),
+                "titlebar_btn_hover" => tokens.titlebar_btn_hover = rgba(color).into(),
+                "sidebar_bg" => tokens.sidebar_bg = rgba(color).into(),
+                "sidebar_bg_start" => tokens.sidebar_bg_start = rgba(color).into(),
+                "sidebar_bg_end" => tokens.sidebar_bg_end = rgba(color).into(),
+                "sidebar_border" => tokens.sidebar_border = rgba(color).into(),
+                "sidebar_fg" => tokens.sidebar_fg = rgba(color).into(),
+                "sidebar_muted" => tokens.sidebar_muted = rgba(color).into(),
+                "sidebar_item_hover" => tokens.sidebar_item_hover = rgba(color).into(),
+                "sidebar_item_active" => tokens.sidebar_item_active = rgba(color).into(),
+                "sidebar_item_active_fg" => tokens.sidebar_item_active_fg = rgba(color).into(),
+                "sidebar_section_header" => tokens.sidebar_section_header = rgba(color).into(),
+                "sidebar_icon_btn_hover" => tokens.sidebar_icon_btn_hover = rgba(color).into(),
+                "sidebar_icon" => tokens.sidebar_icon = rgba(color).into(),
+                "sidebar_icon_hover" => tokens.sidebar_icon_hover = rgba(color).into(),
+                "sidebar_footer_bg" => tokens.sidebar_footer_bg = rgba(color).into(),
+                "sidebar_footer_border" => tokens.sidebar_footer_border = rgba(color).into(),
+                "pane_bg" => tokens.pane_bg = rgba(color).into(),
+                "pane_border" => tokens.pane_border = rgba(color).into(),
+                "pane_border_focused" => tokens.pane_border_focused = rgba(color).into(),
+                "pane_header_bg" => tokens.pane_header_bg = rgba(color).into(),
+                "pane_header_fg" => tokens.pane_header_fg = rgba(color).into(),
+                "pane_header_btn_hover" => tokens.pane_header_btn_hover = rgba(color).into(),
+                "pane_header_icon" => tokens.pane_header_icon = rgba(color).into(),
+                "pane_header_icon_hover" => tokens.pane_header_icon_hover = rgba(color).into(),
+                "primary_btn_bg" => tokens.primary_btn_bg = rgba(color).into(),
+                "primary_btn_hover" => tokens.primary_btn_hover = rgba(color).into(),
+                "primary_btn_fg" => tokens.primary_btn_fg = rgba(color).into(),
+                "secondary_btn_bg" => tokens.secondary_btn_bg = rgba(color).into(),
+                "secondary_btn_hover" => tokens.secondary_btn_hover = rgba(color).into(),
+                "secondary_btn_fg" => tokens.secondary_btn_fg = rgba(color).into(),
+                "card_bg" => tokens.card_bg = rgba(color).into(),
+                "card_border" => tokens.card_border = rgba(color).into(),
+                "card_hover" => tokens.card_hover = rgba(color).into(),
+                "pill_active_bg" => tokens.pill_active_bg = rgba(color).into(),
+                "pill_active_fg" => tokens.pill_active_fg = rgba(color).into(),
+                "pill_inactive_bg" => tokens.pill_inactive_bg = rgba(color).into(),
+                "pill_inactive_fg" => tokens.pill_inactive_fg = rgba(color).into(),
+                "ring" => tokens.ring = rgba(color).into(),
+                "block_bg" => tokens.block_bg = rgba(color).into(),
+                "block_bg_hover" => tokens.block_bg_hover = rgba(color).into(),
+                "block_border" => tokens.block_border = rgba(color).into(),
+                "block_border_selected" => tokens.block_border_selected = rgba(color).into(),
+                "block_success" => tokens.block_success = rgba(color).into(),
+                "block_failure" => tokens.block_failure = rgba(color).into(),
+                "block_warning" => tokens.block_warning = rgba(color).into(),
+                "block_separator" => tokens.block_separator = rgba(color).into(),
+                "block_status_bg" => tokens.block_status_bg = rgba(color).into(),
+                "editor_bar_bg" => tokens.editor_bar_bg = rgba(color).into(),
+                "editor_bar_border" => tokens.editor_bar_border = rgba(color).into(),
+                _ => eprintln!("unknown UI theme token: {name}"),
+            }
+        }
+        tokens
+    }
+
+    pub fn palette(&self, scheme: PaletteScheme, dark: bool) -> ColorPalette {
+        let mut builder = terminal::ColorPaletteBuilder::from_palette(load_palette(scheme, dark));
+        for (name, value) in self
+            .appearance(dark)
+            .terminal
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .chain(self.appearance(dark).style.iter().filter_map(|(k, v)| {
+                k.strip_prefix("terminal.")
+                    .map(|name| (name.strip_prefix("ansi.").unwrap_or(name), v))
+            }))
+        {
+            let Some(color) = parse_hex(value).filter(|c| c & 0xff == 0xff) else {
+                eprintln!("invalid terminal theme color {name}: {value} (must be opaque)");
+                continue;
+            };
+            let (r, g, b) = hex_to_rgb(color);
+            builder = match name {
+                "background" => builder.background(r, g, b),
+                "foreground" => builder.foreground(r, g, b),
+                "cursor" => builder.cursor(r, g, b),
+                "black" => builder.black(r, g, b),
+                "red" => builder.red(r, g, b),
+                "green" => builder.green(r, g, b),
+                "yellow" => builder.yellow(r, g, b),
+                "blue" => builder.blue(r, g, b),
+                "magenta" => builder.magenta(r, g, b),
+                "cyan" => builder.cyan(r, g, b),
+                "white" => builder.white(r, g, b),
+                "bright_black" => builder.bright_black(r, g, b),
+                "bright_red" => builder.bright_red(r, g, b),
+                "bright_green" => builder.bright_green(r, g, b),
+                "bright_yellow" => builder.bright_yellow(r, g, b),
+                "bright_blue" => builder.bright_blue(r, g, b),
+                "bright_magenta" => builder.bright_magenta(r, g, b),
+                "bright_cyan" => builder.bright_cyan(r, g, b),
+                "bright_white" => builder.bright_white(r, g, b),
+                _ => {
+                    eprintln!("unknown terminal theme token: {name}");
+                    builder
+                }
+            };
+        }
+        builder.build()
+    }
+}
+
 impl ThemeTokens {
     /// Build tokens for a mode and palette scheme. The Warp scheme reproduces
     /// Warp's default terminal chrome: near-black surfaces, white text, a cyan
@@ -681,6 +1013,85 @@ pub fn load_warp_palette(dark: bool) -> ColorPalette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_defaults_match_built_in_and_keep_customizations_on_scheme_change() {
+        let mut colors = ThemeColors::complete_defaults(PaletteScheme::Warp);
+        assert_eq!(colors.dark.style.len(), 77);
+        let actual = colors.tokens(gpui_component::ThemeMode::Dark, PaletteScheme::Warp);
+        let original = ThemeTokens::from_mode_with_scheme(
+            gpui_component::ThemeMode::Dark,
+            PaletteScheme::Warp,
+        );
+        assert_eq!(actual.window_bg, original.window_bg);
+        assert_eq!(
+            colors.palette(PaletteScheme::Warp, true).ansi_colors(),
+            load_warp_palette(true).ansi_colors()
+        );
+        colors
+            .dark
+            .style
+            .insert("window.bg".into(), "#123456".into());
+        colors.change_scheme(PaletteScheme::Warp, PaletteScheme::Github);
+        assert_eq!(colors.dark.style["window.bg"], "#123456");
+        assert_eq!(
+            colors.dark.style["sidebar.bg"],
+            ThemeColors::complete_defaults(PaletteScheme::Github)
+                .dark
+                .style["sidebar.bg"]
+        );
+    }
+
+    #[test]
+    fn overrides_apply_per_mode_and_preserve_palette_defaults() {
+        let colors: ThemeColors = serde_json::from_str(
+            r##"{
+            "dark": {"ui": {"window_bg": "#12345680"},
+                     "terminal": {"red": "#abcdef"}}
+        }"##,
+        )
+        .unwrap();
+        let dark = colors.tokens(gpui_component::ThemeMode::Dark, PaletteScheme::Warp);
+        assert_eq!(dark.window_bg, rgba(0x12345680).into());
+        let light = colors.tokens(gpui_component::ThemeMode::Light, PaletteScheme::Warp);
+        assert_eq!(
+            light.window_bg,
+            ThemeTokens::from_mode_with_scheme(
+                gpui_component::ThemeMode::Light,
+                PaletteScheme::Warp
+            )
+            .window_bg
+        );
+        let palette = colors.palette(PaletteScheme::Warp, true);
+        let red = terminal::hsla_to_rgb(palette.ansi_colors()[1]);
+        assert_eq!((red.r, red.g, red.b), (0xab, 0xcd, 0xef));
+        assert_eq!(palette.background(), load_warp_palette(true).background());
+        assert_eq!(palette.extended_colors()[1], palette.ansi_colors()[1]);
+    }
+
+    #[test]
+    fn invalid_colors_leave_defaults_intact() {
+        let colors: ThemeColors = serde_json::from_str(
+            r##"{
+            "dark": {"ui": {"window_bg": "bad"}, "terminal": {"red": "#12345680"}}
+        }"##,
+        )
+        .unwrap();
+        assert_eq!(
+            colors
+                .tokens(gpui_component::ThemeMode::Dark, PaletteScheme::Warp)
+                .window_bg,
+            ThemeTokens::from_mode_with_scheme(
+                gpui_component::ThemeMode::Dark,
+                PaletteScheme::Warp
+            )
+            .window_bg
+        );
+        assert_eq!(
+            colors.palette(PaletteScheme::Warp, true).ansi_colors()[1],
+            load_warp_palette(true).ansi_colors()[1]
+        );
+    }
 
     #[test]
     fn test_theme_preference_default_is_system() {

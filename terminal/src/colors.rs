@@ -336,6 +336,11 @@ impl Default for ColorPaletteBuilder {
 }
 
 impl ColorPaletteBuilder {
+    /// Start from an existing palette, preserving unspecified colors.
+    pub fn from_palette(palette: ColorPalette) -> Self {
+        Self { palette }
+    }
+
     pub fn new() -> Self {
         Self {
             palette: ColorPalette::default(),

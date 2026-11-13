@@ -11475,17 +11475,15 @@ impl AppState {
             return None;
         }
 
-        let bg: Hsla = if pane.chat.active && tokens.is_dark {
-            rgba(0x050505ff).into()
-        } else if pane.chat.active {
-            tokens.pane_header_bg
+        let bg: Hsla = if pane.chat.active {
+            tokens.card_bg
         } else if tokens.is_dark {
             rgba(0x16171eff).into()
         } else {
             rgba(0xffffffff).into()
         };
         let border: Hsla = if pane.chat.active {
-            tokens.pane_border
+            tokens.card_border
         } else if tokens.is_dark {
             rgba(0x2d2e3dff).into()
         } else {
@@ -11524,11 +11522,11 @@ impl AppState {
                     .id(("completion-item", pane_id * 1000 + index))
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .gap(px(10.0))
-                    .px(px(8.0))
-                    .py(px(4.0))
-                    .rounded(px(4.0))
+                    .when(!pane.chat.active, |this| this.justify_between())
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded(if pane.chat.active { px(14.0) } else { px(4.0) })
                     .cursor(CursorStyle::PointingHand)
                     .when(selected, |this| this.bg(row_selected_bg))
                     .hover(|this| this.bg(row_hover_bg))
@@ -11538,6 +11536,25 @@ impl AppState {
                             .items_center()
                             .gap(px(7.0))
                             .min_w_0()
+                            .when(pane.chat.active, |this| {
+                                let icon = match item.display.as_str() {
+                                    "/help" => "icons/info.svg",
+                                    "/diff" => "icons/git-branch.svg",
+                                    "/new" => "icons/plus.svg",
+                                    "/copy" => "icons/copy.svg",
+                                    "/version" => "icons/terminal.svg",
+                                    "/auth" => "icons/settings.svg",
+                                    "/model" => "icons/command.svg",
+                                    "/fast" => "icons/sparkle.svg",
+                                    _ => "icons/settings.svg",
+                                };
+                                this.child(
+                                    svg()
+                                        .path(icon)
+                                        .size(px(14.0))
+                                        .text_color(tokens.text_secondary),
+                                )
+                            })
                             .when(!pane.chat.active, |this| {
                                 this.child(
                                     div()
@@ -11549,7 +11566,7 @@ impl AppState {
                             })
                             .child(
                                 div()
-                                    .font_family(MONO_FONT)
+                                    .when(!pane.chat.active, |this| this.font_family(MONO_FONT))
                                     .text_size(px(12.5))
                                     .text_color(tokens.text_primary)
                                     .truncate()
@@ -11558,8 +11575,10 @@ impl AppState {
                     )
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .min_w_0()
+                            .text_size(if pane.chat.active { px(12.0) } else { px(10.0) })
                             .text_color(tokens.text_muted)
+                            .truncate()
                             .child(item.detail.clone()),
                     )
                     .on_mouse_down(
@@ -11577,12 +11596,21 @@ impl AppState {
             div()
                 .id(("completion-menu", pane_id))
                 .debug_selector(|| "completion-menu".to_string())
-                .w(px(440.0))
+                .occlude()
+                .w(if pane.chat.active {
+                    px(736.0)
+                } else {
+                    px(440.0)
+                })
                 .max_w(relative(1.0))
-                .max_h(px(240.0))
+                .max_h(if pane.chat.active {
+                    px(320.0)
+                } else {
+                    px(240.0)
+                })
                 .overflow_y_scrollbar()
                 .p(px(5.0))
-                .rounded(px(8.0))
+                .rounded(if pane.chat.active { px(20.0) } else { px(8.0) })
                 .border_1()
                 .border_color(border)
                 .bg(bg)

@@ -6013,6 +6013,7 @@ impl AppState {
                                     .line_number(true)
                                     .soft_wrap(false)
                                     .default_value(content.text)
+                                    .line_changes(content.changes)
                                     .read_only(true)
                             });
                             input.update(cx, |input, cx| input.focus(window, cx));
@@ -6030,81 +6031,118 @@ impl AppState {
         .detach();
     }
 
-    fn render_changed_file(
+    fn render_preview_tab(
         &self,
         pane_id: usize,
-        file: &ReadOnlyFile,
+        path: &str,
+        return_to_changes: bool,
+        deleted: bool,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Div {
         let tokens = self.tokens(cx);
-        let file_only = self
-            .pane_ref(pane_id)
-            .and_then(|pane| pane.diff_preview.as_ref())
-            .is_some_and(|view| view.file_only);
-        let mut header = div()
+        let editor_bg = cx.theme().editor_background();
+        let path_tip: SharedString = if deleted {
+            format!("{path} (last committed version)").into()
+        } else {
+            path.to_owned().into()
+        };
+        div()
+            .h(px(36.0))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(tokens.border_subtle)
+            .bg(tokens.pane_header_bg)
             .flex()
-            .items_center()
-            .gap(px(10.0))
-            .px(px(12.0))
-            .py(px(9.0))
             .child(
                 div()
-                    .id(("back-to-changes", pane_id))
-                    .cursor_pointer()
-                    .rounded(px(4.0))
-                    .px(px(6.0))
-                    .hover(|s| s.bg(tokens.card_hover))
-                    .text_color(tokens.text_secondary)
-                    .child(if file_only {
-                        "‹ Close"
-                    } else {
-                        "‹ Changes"
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if file_only {
-                                this.close_pane(pane_id, window, cx);
-                            } else if let Some(view) = this
-                                .pane_mut(pane_id)
-                                .and_then(|pane| pane.diff_preview.as_mut())
-                            {
-                                view.file_request += 1;
-                                view.file_view = None;
-                                cx.notify();
-                            }
-                        }),
+                    .id(("preview-tab", pane_id))
+                    .h_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .pl(px(12.0))
+                    .pr(px(6.0))
+                    .border_r_1()
+                    .border_color(tokens.border_subtle)
+                    .bg(editor_bg)
+                    .child(
+                        svg()
+                            .path(file_icons::icon_for_path(path))
+                            .size(px(15.0))
+                            .flex_shrink_0()
+                            .text_color(tokens.text_secondary),
+                    )
+                    .child(
+                        div()
+                            .id(("preview-filename", pane_id))
+                            .min_w_0()
+                            .max_w(px(250.0))
+                            .truncate()
+                            .text_size(px(13.0))
+                            .text_color(if deleted {
+                                tokens.text_muted
+                            } else {
+                                tokens.text_primary
+                            })
+                            .when(deleted, |label| label.line_through())
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(path_tip.clone())
+                                    .build(window, cx)
+                            })
+                            .child(file_name(path).to_owned()),
+                    )
+                    .child(
+                        div()
+                            .id(("close-preview-tab", pane_id))
+                            .debug_selector(|| "close-preview-tab".to_string())
+                            .size(px(22.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(tokens.pane_header_btn_hover))
+                            .tooltip(move |window, cx| {
+                                let label = if return_to_changes {
+                                    "Back to changes"
+                                } else {
+                                    "Close file"
+                                };
+                                gpui_component::tooltip::Tooltip::new(label).build(window, cx)
+                            })
+                            .child(
+                                svg()
+                                    .path("icons/x.svg")
+                                    .size(px(12.0))
+                                    .text_color(tokens.text_secondary),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if return_to_changes {
+                                        if let Some(view) = this
+                                            .pane_mut(pane_id)
+                                            .and_then(|pane| pane.diff_preview.as_mut())
+                                        {
+                                            view.file_request += 1;
+                                            view.file_view = None;
+                                            this.focus_pane(pane_id, window, cx);
+                                        }
+                                    } else {
+                                        this.close_pane(pane_id, window, cx);
+                                    }
+                                }),
+                            ),
                     ),
             )
-            .child(
-                svg()
-                    .path(file_icons::icon_for_path(&file.path))
-                    .size(px(16.0))
-                    .text_color(tokens.text_secondary),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(px(12.0))
-                    .text_color(tokens.text_primary)
-                    .child(file.path.clone()),
-            )
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(tokens.text_secondary)
-                    .child("Read only"),
-            );
-        if matches!(&file.state, ReadOnlyFileState::Ready { deleted: true, .. }) {
-            header = header.child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(tokens.text_secondary)
-                    .child("Deleted · HEAD version"),
-            );
-        }
+    }
+
+    fn render_changed_file(&self, file: &ReadOnlyFile, cx: &mut Context<Self>) -> AnyElement {
+        let tokens = self.tokens(cx);
+        let editor_bg = cx.theme().editor_background();
         let body = match &file.state {
             ReadOnlyFileState::Loading => div()
                 .p(px(16.0))
@@ -6124,6 +6162,11 @@ impl AppState {
                     Input::new(input)
                         .appearance(false)
                         .bordered(false)
+                        .font_family(MONO_FONT)
+                        .text_size(px(13.0))
+                        .line_height(px(21.0))
+                        .px(px(0.0))
+                        .py(px(4.0))
                         .size_full(),
                 )
                 .into_any_element(),
@@ -6132,7 +6175,7 @@ impl AppState {
             .size_full()
             .flex()
             .flex_col()
-            .child(header)
+            .bg(editor_bg)
             .child(body)
             .into_any_element()
     }
@@ -6144,7 +6187,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(file) = &view.file_view {
-            return self.render_changed_file(pane_id, file, cx);
+            return self.render_changed_file(file, cx);
         }
         let tokens = self.tokens(cx);
         let mut content = div()
@@ -13537,6 +13580,18 @@ impl AppState {
         let pane_id = pane.id;
         let is_focused = self.focused_pane_id == Some(pane_id);
         let tokens = self.tokens(cx);
+        let preview_tab = if let Some((view, file)) = pane
+            .diff_preview
+            .as_ref()
+            .and_then(|view| view.file_view.as_ref().map(|file| (view, file)))
+        {
+            let deleted = matches!(file.state, ReadOnlyFileState::Ready { deleted: true, .. });
+            Some(self.render_preview_tab(pane_id, &file.path, !view.file_only, deleted, cx))
+        } else {
+            pane.markdown_preview.as_ref().map(|(path, _)| {
+                self.render_preview_tab(pane_id, &path.to_string_lossy(), false, false, cx)
+            })
+        };
 
         div()
             .id(("terminal-pane", pane_id))
@@ -13565,7 +13620,7 @@ impl AppState {
                     this.focus_pane(pane_id, window, cx);
                 }),
             )
-            .child(
+            .child(preview_tab.unwrap_or_else(|| {
                 div()
                     .h(px(28.0))
                     .w_full()
@@ -13722,8 +13777,8 @@ impl AppState {
                                         }),
                                     ),
                             ),
-                    ),
-            )
+                    )
+            }))
             .child(
                 div()
                     .flex_1()
@@ -13757,6 +13812,7 @@ impl AppState {
                         div()
                             .id(("markdown-preview", pane_id))
                             .size_full()
+                            .bg(cx.theme().editor_background())
                             .overflow_y_scrollbar()
                             .px(px(28.0))
                             .py(px(20.0))
@@ -18698,8 +18754,14 @@ mod pane_tests {
             assert_eq!(preview.markdown_preview.as_ref().unwrap().0, second);
             assert!(preview.diff_preview.is_none());
         });
+        let close = cx
+            .debug_bounds("close-preview-tab")
+            .expect("Markdown tab close");
+        cx.simulate_click(close.center(), Modifiers::default());
+        app_state.read_with(&cx, |state, _| {
+            assert_eq!(state.active_project().unwrap().sessions[0].panes.len(), 1);
+        });
         cx.update_window_entity(&app_state, |state, window, cx| {
-            state.close_pane(preview_id, window, cx);
             assert!(state.open_local_link(1, first.to_str().unwrap(), window, cx));
         });
         app_state.read_with(&cx, |state, _| {
@@ -18784,6 +18846,13 @@ mod pane_tests {
                 _ => panic!("file did not finish loading"),
             }
         });
+        let close = cx
+            .debug_bounds("close-preview-tab")
+            .expect("file tab close");
+        cx.simulate_click(close.center(), Modifiers::default());
+        cx.draw_frame().expect("changes draws after closing file");
+        assert!(cx.debug_bounds("project-diff-file-0").is_some());
+        assert!(cx.debug_bounds("close-preview-tab").is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

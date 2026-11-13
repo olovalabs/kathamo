@@ -19,6 +19,7 @@ use super::{InputState, LastLayout, mode::InputMode};
 const BOTTOM_MARGIN_ROWS: usize = 3;
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
+const LINE_NUMBER_LEFT_PADDING: Pixels = px(9.);
 
 pub(super) struct TextElement {
     pub(crate) state: Entity<InputState>,
@@ -483,13 +484,7 @@ impl TextElement {
         style: &TextStyle,
         window: &mut Window,
     ) -> (Pixels, usize) {
-        let total_lines = text.lines_len();
-        let line_number_len = match total_lines {
-            0..=9999 => 5,
-            10000..=99999 => 6,
-            100000..=999999 => 7,
-            _ => 8,
-        };
+        let line_number_len = (text.lines_len().max(1).ilog10() as usize + 1).max(3);
 
         let line_number_width = if state.mode.line_number() {
             let empty_line_number = window.text_system().shape_line(
@@ -506,7 +501,7 @@ impl TextElement {
                 None,
             );
 
-            empty_line_number.width + px(6.) + LINE_NUMBER_RIGHT_MARGIN
+            empty_line_number.width + LINE_NUMBER_LEFT_PADDING + LINE_NUMBER_RIGHT_MARGIN
         } else {
             px(0.)
         };
@@ -877,6 +872,15 @@ impl Element for TextElement {
 
         let mut bounds = bounds;
 
+        let foreground = if state.mode.is_code_editor() {
+            cx.theme()
+                .highlight_theme
+                .style
+                .editor_foreground
+                .unwrap_or(cx.theme().foreground)
+        } else {
+            cx.theme().foreground
+        };
         let (display_text, text_color) = if is_empty {
             (
                 &Rope::from(placeholder.as_str()),
@@ -885,13 +889,14 @@ impl Element for TextElement {
         } else if state.masked {
             (
                 &Rope::from("*".repeat(text.chars().count())),
-                cx.theme().foreground,
+                foreground,
             )
         } else {
-            (&text, cx.theme().foreground)
+            (&text, foreground)
         };
 
-        let text_style = window.text_style();
+        let mut text_style = window.text_style();
+        text_style.color = text_color;
 
         let (line_number_width, line_number_len) =
             Self::layout_line_numbers(&state, &text, text_size, &text_style, window);
@@ -1061,10 +1066,12 @@ impl Element for TextElement {
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
             let mut line_numbers = vec![];
+            let theme = cx.theme();
+            let highlight = &theme.highlight_theme.style;
             let other_line_runs = vec![TextRun {
                 len: line_number_len,
                 font: style.font(),
-                color: cx.theme().muted_foreground,
+                color: highlight.editor_line_number.unwrap_or(theme.muted_foreground),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -1072,7 +1079,7 @@ impl Element for TextElement {
             let current_line_runs = vec![TextRun {
                 len: line_number_len,
                 font: style.font(),
-                color: cx.theme().foreground,
+                color: highlight.editor_active_line_number.unwrap_or(foreground),
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -1188,6 +1195,7 @@ impl Element for TextElement {
             }
         }
 
+        let line_changes = state.line_changes.clone();
         let active_line_color = cx.theme().highlight_theme.style.editor_active_line;
 
         let mut offset_y = px(0.);
@@ -1312,8 +1320,28 @@ impl Element for TextElement {
                     }
                 }
 
+                if let Some(change) = line_changes.get(row) {
+                    // One Dark and One Light use the same Git gutter colors.
+                    let marker = p + point(px(1.), px(0.));
+                    if change.added || change.modified {
+                        let color = if change.modified {
+                            gpui::rgb(0xd3b020)
+                        } else {
+                            gpui::rgb(0x27a657)
+                        };
+                        window.paint_quad(fill(Bounds::new(marker, size(px(3.), height)), color));
+                    }
+                    if change.deleted {
+                        window.paint_quad(
+                            fill(Bounds::new(marker, size(px(6.), px(4.))), gpui::rgb(0xe06c76))
+                                .corner_radii(Corners::all(px(2.))),
+                        );
+                    }
+                }
+
                 for line in lines {
-                    _ = line.paint(p, line_height, gpui::TextAlign::Left, None, window, cx);
+                    let number_origin = p + point(LINE_NUMBER_LEFT_PADDING, px(0.));
+                    _ = line.paint(number_origin, line_height, gpui::TextAlign::Left, None, window, cx);
                     offset_y += line_height;
                 }
 

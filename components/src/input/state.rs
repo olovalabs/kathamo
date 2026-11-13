@@ -254,10 +254,19 @@ impl LastLayout {
     }
 }
 
+/// Git change indicators for a zero-based editor line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LineChange {
+    pub added: bool,
+    pub modified: bool,
+    pub deleted: bool,
+}
+
 pub struct InputState {
     pub(super) focus_handle: FocusHandle,
     pub(super) mode: InputMode,
     pub(super) text: Rope,
+    pub(super) line_changes: Rc<Vec<LineChange>>,
     pub(super) text_wrapper: TextWrapper,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -331,6 +340,12 @@ pub struct InputState {
 impl EventEmitter<InputEvent> for InputState {}
 
 impl InputState {
+    /// Set per-line Git change indicators on the editor gutter.
+    pub fn line_changes(mut self, changes: Vec<LineChange>) -> Self {
+        self.line_changes = Rc::new(changes);
+        self
+    }
+
     /// Create a Input state with default [`InputMode::SingleLine`] mode.
     ///
     /// See also: [`Self::multi_line`], [`Self::auto_grow`] to set other mode.
@@ -363,6 +378,7 @@ impl InputState {
         Self {
             focus_handle: focus_handle.clone(),
             text: "".into(),
+            line_changes: Rc::new(Vec::new()),
             text_wrapper: TextWrapper::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
             history,

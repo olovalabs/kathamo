@@ -156,7 +156,7 @@ impl Theme {
     }
 
     #[inline]
-    pub(crate) fn editor_background(&self) -> Hsla {
+    pub fn editor_background(&self) -> Hsla {
         self.highlight_theme
             .style
             .editor_background

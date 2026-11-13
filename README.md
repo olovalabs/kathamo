@@ -95,9 +95,9 @@ names are its own and it does not yet support importing Zed theme files. These
 tokens cover Kathamo's existing UI tokens and terminal palette; some component
 library styles and colors defined directly in views are not yet configurable.
 
-The data folder holds `workspace.json` (projects, tabs, split layout, cwd), `sessions/` (per-pane terminal output), `conversations/` (agent transcripts), and `backups/`. Manage or clear it from **Settings → Data & Sessions**, or override the location with `KATHAMO_DATA_DIR=/absolute/path`. Set `KATHAMO_DISABLE_RESTORE=1` for a clean launch without reading saved state.
+The data folder holds `workspace.json` (projects, tabs, split layout, cwd), `sessions/` (per-pane terminal output), `conversations/` (agent transcripts), `rpi/sessions/` (RPI histories grouped by project), and `backups/`. Manage or clear it from **Settings → Data & Sessions**, or override the location with `KATHAMO_DATA_DIR=/absolute/path`. Set `KATHAMO_DISABLE_RESTORE=1` for a clean launch without reading saved state.
 
-Deleting a sidebar session removes its saved workspace entry, pane scrollback, and Kathamo conversation transcripts. Embedded rpi and other command-line agents can keep separate session histories outside the Kathamo data folder; deleting the sidebar session does not currently remove those files.
+Deleting a sidebar session removes its saved workspace entry, pane scrollback, Kathamo conversation transcripts, and its embedded RPI session files. Other command-line agent histories and standalone RPI sessions are not removed. Existing project-local RPI sessions are left in place; an embedded session is copied to the data folder when resumed. Standalone RPI uses the same default location, with `--session-dir`, the `sessionDir` setting, and `RPI_CODING_AGENT_SESSION_DIR` available as overrides.
 
 Processes are not resurrected: a restored pane starts a fresh shell in the saved working directory with the previous output shown above the new prompt.
 

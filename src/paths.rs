@@ -31,7 +31,7 @@ pub fn data_dir() -> PathBuf {
         return custom;
     }
     let Some(base) = base_dirs() else {
-        return PathBuf::from(".kathamo");
+        return std::env::temp_dir().join("kathamo");
     };
     if cfg!(target_os = "macos") {
         base.home_dir().join("Library/Application Support/Kathamo")
@@ -97,6 +97,10 @@ pub fn workspace_path() -> PathBuf {
 
 pub fn sessions_dir() -> PathBuf {
     data_dir().join("sessions")
+}
+
+pub fn rpi_sessions_dir() -> PathBuf {
+    data_dir().join("rpi").join("sessions")
 }
 
 pub fn conversations_dir() -> PathBuf {

@@ -595,6 +595,8 @@ pub fn prune_stale_scrollbacks(live_uids: &HashSet<String>) {
 pub struct PendingDeletion {
     pub session_uid: String,
     pub pane_uids: Vec<String>,
+    #[serde(default)]
+    pub rpi_session_ids: Vec<String>,
 }
 
 fn safe_uid(uid: &str) -> bool {
@@ -628,6 +630,7 @@ pub fn record_deletion(deletion: &PendingDeletion) -> io::Result<PathBuf> {
 }
 
 pub fn finish_deletion(path: &Path, deletion: &PendingDeletion) -> io::Result<()> {
+    crate::rpi_storage::delete_sessions(&deletion.rpi_session_ids)?;
     for uid in &deletion.pane_uids {
         if !safe_uid(uid) {
             return Err(io::Error::new(

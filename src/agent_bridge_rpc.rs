@@ -112,6 +112,8 @@ impl RpcAgentBridge {
         let mut command = Command::new(binary);
         command
             .args(["--mode", "rpc"])
+            .arg("--session-dir")
+            .arg(crate::paths::rpi_sessions_dir())
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

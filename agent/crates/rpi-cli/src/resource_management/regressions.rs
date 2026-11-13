@@ -276,7 +276,8 @@ mod linked_scope_roots {
                 checked_path(&resolved).unwrap();
                 let lease = Lease::acquire(&resolved, false, true).unwrap().unwrap();
                 ensure_complete(&resolved).unwrap();
-                assert!(expected.join(LEASE).is_file());
+                assert!(lease_path(&expected).is_file());
+                assert!(!expected.exists());
                 assert!(!expected.join(RECEIPTS).exists());
                 assert!(!expected.join(JOURNAL).exists());
                 drop(lease);
@@ -337,7 +338,7 @@ mod linked_scope_roots {
                 ));
             }
             fs::create_dir(&root).unwrap();
-            for filename in [LEASE, RECEIPTS, JOURNAL] {
+            for filename in [RECEIPTS, JOURNAL] {
                 #[cfg(unix)]
                 let metadata_target = target.join("sentinel");
                 #[cfg(windows)]
@@ -345,7 +346,6 @@ mod linked_scope_roots {
                 let _metadata_link = OwnedLink::new(&metadata_target, &root.join(filename));
                 let resolved = selected_root(&alias, style).unwrap();
                 let error = match filename {
-                    LEASE => String::from(Lease::acquire(&resolved, false, true).unwrap_err()),
                     RECEIPTS => receipts(&resolved).err().unwrap(),
                     JOURNAL => {
                         link_error(recover(&resolved).unwrap_err());
@@ -428,7 +428,7 @@ mod linked_scope_roots {
                 fs::canonicalize(d.path()).unwrap().join("agent")
             );
         }
-        assert!(!d.path().join("agent").join(LEASE).exists());
+        assert!(!lease_path(&d.path().join("agent")).exists());
         assert!(!d.path().join("absent").exists());
     }
 

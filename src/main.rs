@@ -48,6 +48,7 @@ mod kathamo_compat;
 mod logos;
 mod paths;
 mod project_diff;
+mod rpi_storage;
 use terminal::pty_session;
 mod settings;
 mod shell_history;
@@ -5362,6 +5363,27 @@ impl AppState {
                 .iter()
                 .filter(|pane| !live_pane_uids.contains(pane.uid.as_str()))
                 .map(|pane| pane.uid.clone())
+                .collect(),
+            rpi_session_ids: session
+                .panes
+                .iter()
+                .filter(|pane| !live_pane_uids.contains(pane.uid.as_str()))
+                .filter_map(|pane| pane.chat.rpi_session_id.clone())
+                .filter(|id| {
+                    !self
+                        .projects
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(p, project)| {
+                            project
+                                .sessions
+                                .iter()
+                                .enumerate()
+                                .filter(move |(s, _)| p != project_idx || *s != session_idx)
+                                .flat_map(|(_, session)| session.panes.iter())
+                        })
+                        .any(|pane| pane.chat.rpi_session_id.as_ref() == Some(id))
+                })
                 .collect(),
         };
         let deletion_path = match workspace_state::record_deletion(&deletion) {
@@ -14566,7 +14588,7 @@ impl AppState {
                         div()
                             .text_size(px(12.5))
                             .text_color(tokens.text_secondary)
-                            .child("Everything Kathamo remembers is stored in this folder."),
+                            .child("Kathamo data and RPI sessions are stored in this folder."),
                     ),
             )
             .child(
@@ -14651,7 +14673,7 @@ impl AppState {
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(tokens.text_secondary)
-                                    .child("Deletes saved layouts, scrollback and transcripts. Settings are kept."),
+                                    .child("Deletes saved layouts, scrollback and Kathamo-owned RPI sessions. Settings are kept."),
                             ),
                     )
                     .child(
@@ -14703,15 +14725,88 @@ impl AppState {
             return;
         }
         self.clear_data_confirm = false;
+        let mut records: HashMap<String, workspace_state::PendingDeletion> = HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(paths::workspace_path()) {
+            let saved = workspace_state::load_from_text(&text);
+            for session in saved
+                .projects
+                .into_iter()
+                .flat_map(|project| project.sessions)
+            {
+                let record = records.entry(session.uid.clone()).or_insert_with(|| {
+                    workspace_state::PendingDeletion {
+                        session_uid: session.uid,
+                        pane_uids: Vec::new(),
+                        rpi_session_ids: Vec::new(),
+                    }
+                });
+                for pane in session.panes {
+                    record.pane_uids.push(pane.uid);
+                    record.rpi_session_ids.extend(pane.chat.rpi_session_id);
+                    record.rpi_session_ids.extend(
+                        pane.chat
+                            .models
+                            .into_iter()
+                            .filter_map(|model| model.rpi_session_id),
+                    );
+                }
+            }
+        }
+        for session in self.projects.iter().flat_map(|project| &project.sessions) {
+            let record = records.entry(session.uid.clone()).or_insert_with(|| {
+                workspace_state::PendingDeletion {
+                    session_uid: session.uid.clone(),
+                    pane_uids: Vec::new(),
+                    rpi_session_ids: Vec::new(),
+                }
+            });
+            for pane in &session.panes {
+                record.pane_uids.push(pane.uid.clone());
+                record
+                    .rpi_session_ids
+                    .extend(pane.chat.rpi_session_id.clone());
+            }
+        }
+        let mut deletions = Vec::new();
+        for deletion in records.into_values() {
+            match workspace_state::record_deletion(&deletion) {
+                Ok(path) => deletions.push((path, deletion)),
+                Err(error) => {
+                    for (path, _) in &deletions {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    eprintln!("failed to record saved data deletion: {error}");
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        for pane in self
+            .projects
+            .iter_mut()
+            .flat_map(|project| &mut project.sessions)
+            .flat_map(|session| &mut session.panes)
+        {
+            pane.chat.bridge = None;
+            pane.chat.bridge_resume = None;
+            pane.chat.rpi_session_id = None;
+        }
         if let Err(error) = std::fs::remove_file(paths::workspace_path()) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!("failed to remove saved workspace: {error}");
+                cx.notify();
+                return;
             }
         }
         let _ = std::fs::remove_dir_all(paths::sessions_dir());
         let _ = std::fs::create_dir_all(paths::sessions_dir());
         if let Err(error) = conversations::clear_all() {
             eprintln!("failed to clear conversations: {error}");
+        }
+        for (path, deletion) in deletions {
+            if let Err(error) = workspace_state::finish_deletion(&path, &deletion) {
+                eprintln!("failed to clear RPI session; cleanup will retry: {error}");
+            }
         }
         self.dirty = false;
         cx.notify();

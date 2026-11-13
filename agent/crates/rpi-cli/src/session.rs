@@ -394,13 +394,30 @@ pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelecti
     }
 }
 
-/// The default session directory is `<cwd>/.rpi/sessions`, unless
-/// `RPI_CODING_AGENT_SESSION_DIR` is set (in which case its value is used).
-pub fn default_session_dir(cwd: &Path) -> PathBuf {
+/// The default session directory is in Kathamo's application data folder.
+pub fn default_session_dir(_cwd: &Path) -> PathBuf {
     std::env::var("RPI_CODING_AGENT_SESSION_DIR")
         .ok()
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.join(".rpi").join("sessions"))
+        .unwrap_or_else(|| kathamo_session_dir())
+}
+
+pub(crate) fn kathamo_session_dir() -> PathBuf {
+    let data = std::env::var_os("KATHAMO_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                dirs::home_dir().map(|p| p.join("Library/Application Support/Kathamo"))
+            } else if cfg!(target_os = "windows") {
+                dirs::data_local_dir().map(|p| p.join("Kathamo"))
+            } else {
+                dirs::data_local_dir().map(|p| p.join("kathamo"))
+            }
+            .unwrap_or_else(|| std::env::temp_dir().join("kathamo"))
+        });
+    data.join("rpi").join("sessions")
 }
 
 /// Extensions are loaded exactly once before model resolution. Their action
@@ -5504,21 +5521,23 @@ mod tests {
         let cwd = Path::new("/proj");
         match select_session(&args, cwd) {
             SessionSelection::New { dir, .. } => {
-                assert_eq!(dir, Path::new("/proj/.rpi/sessions"));
+                assert_eq!(dir, kathamo_session_dir());
             }
             other => panic!("expected New, got {other:?}"),
         }
     }
 
     #[test]
-    fn default_session_dir_only_uses_rpi() {
+    fn default_session_dir_is_independent_of_project() {
         let _env = crate::config::test_support::SessionDirEnv::new(None);
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
-        assert_eq!(default_session_dir(cwd), cwd.join(".rpi/sessions"));
-        std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
-        assert_eq!(default_session_dir(cwd), cwd.join(".rpi/sessions"));
+        assert_eq!(default_session_dir(cwd), kathamo_session_dir());
+        assert_eq!(
+            default_session_dir(Path::new("/another/project")),
+            kathamo_session_dir()
+        );
     }
 
     #[test]

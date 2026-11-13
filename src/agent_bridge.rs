@@ -159,6 +159,10 @@ impl AgentBridge {
         model: Option<&str>,
     ) -> Result<Self, String> {
         let trace_id = crate::stream_timing::new_trace();
+        if let Some(id) = session {
+            crate::rpi_storage::copy_legacy_session(cwd, id)
+                .map_err(|error| format!("Could not copy the existing RPI session: {error}"))?;
+        }
         if rpc_backend_requested() && !uses_gemini(model) {
             agent_bridge_rpc::RpcAgentBridge::spawn_resumed(cwd, session, model, trace_id).map(
                 |backend| Self {
@@ -272,6 +276,7 @@ impl EmbeddedBridge {
         let delta_trace = trace_id;
         let resumed = session.is_some();
         let mut options = SessionOptions::new(cwd)
+            .with_session_dir(crate::paths::rpi_sessions_dir())
             .with_selector(model)
             .with_session(session)
             .with_append_system_prompt(crate::agent_ui::CATALOG_PROMPT)

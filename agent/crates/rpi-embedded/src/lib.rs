@@ -755,6 +755,8 @@ impl rpi_agent::AgentEmitter for HostEmitter {
 #[derive(Clone)]
 pub struct SessionOptions {
     pub cwd: PathBuf,
+    /// Optional host-owned root for durable session files.
+    pub session_dir: Option<PathBuf>,
     /// Provider id from the host's model picker.
     pub provider: Option<String>,
     /// Model id from the host's model picker. May itself contain `/`.
@@ -785,6 +787,7 @@ impl SessionOptions {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
+            session_dir: None,
             provider: None,
             model: None,
             session_id: None,
@@ -812,6 +815,11 @@ impl SessionOptions {
 
     pub fn with_session(mut self, session_id: Option<&str>) -> Self {
         self.session_id = session_id.map(str::to_owned);
+        self
+    }
+
+    pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.session_dir = Some(dir.into());
         self
     }
 
@@ -1145,6 +1153,7 @@ async fn run_session(
 ) {
     let SessionOptions {
         cwd,
+        session_dir,
         provider,
         model,
         session_id: resume,
@@ -1211,6 +1220,7 @@ async fn run_session(
     args.provider = provider.clone();
     args.model = model.clone();
     args.session = resume.clone();
+    args.session_dir = session_dir;
     if let Some(prompt) = append_system_prompt {
         args.append_system_prompt.push(prompt);
     }
@@ -2498,6 +2508,7 @@ mod tests {
     fn a_missing_model_reports_a_fatal_error_and_closes() {
         let mut session = EmbeddedSession::spawn(SessionOptions {
             cwd: std::env::temp_dir(),
+            session_dir: None,
             provider: Some("definitely-not-a-provider".into()),
             model: Some("missing-model".into()),
             session_id: None,

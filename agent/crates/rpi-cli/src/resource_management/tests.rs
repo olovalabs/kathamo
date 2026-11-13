@@ -30,7 +30,7 @@ fn leases_distinguish_contention_from_errors_and_keep_observation_guard() {
     let (_dir, root, _) = fixture();
     let (guard, busy) = observation_lease(&root).unwrap();
     assert!(guard.is_none() && !busy);
-    assert!(!root.join(LEASE).exists());
+    assert!(!lease_path(&root).exists());
     let a = Lease::acquire(&root, false, true).unwrap().unwrap();
     let b = Lease::acquire(&root, false, true).unwrap().unwrap();
     assert!(matches!(
@@ -57,12 +57,31 @@ fn leases_distinguish_contention_from_errors_and_keep_observation_guard() {
         lock_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
         LeaseError::Other(_)
     ));
-    fs::remove_file(root.join(LEASE)).unwrap();
-    fs::create_dir(root.join(LEASE)).unwrap();
+    fs::remove_file(lease_path(&root)).unwrap();
+    fs::create_dir(lease_path(&root)).unwrap();
     assert!(matches!(
         Lease::acquire(&root, true, false),
         Err(LeaseError::Other(_))
     ));
+    fs::remove_dir(lease_path(&root)).unwrap();
+}
+
+#[test]
+fn host_lease_does_not_create_project_resource_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join(".rpi");
+    let host = shared_lease(&root).unwrap();
+    assert!(!root.exists());
+    assert!(lease_path(&root).is_file());
+    assert!(matches!(
+        Lease::acquire(&root, true, true),
+        Err(LeaseError::Contended)
+    ));
+    drop(host);
+    let mutation = mutation_lease(&root).unwrap();
+    assert!(root.is_dir());
+    drop(mutation);
+    fs::remove_file(lease_path(&root)).unwrap();
 }
 
 #[test]
@@ -233,7 +252,7 @@ fn catalog_cannot_observe_a_paused_half_publication_and_never_creates_locks() {
         ..Default::default()
     };
     assert_eq!(catalog(&root, &o).unwrap()["resources"], json!([]));
-    assert!(!root.join(LEASE).exists());
+    assert!(!lease_path(&root).exists());
     mutate(
         &root,
         &options("install", Kind::Skill, "demo", Some(source)),

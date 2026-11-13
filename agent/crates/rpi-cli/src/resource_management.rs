@@ -12,7 +12,6 @@ use std::{
 
 const RECEIPTS: &str = "resource-receipts.json";
 const JOURNAL: &str = "resource-transaction.json";
-const LEASE: &str = ".resource-lease";
 const MAX_META: usize = 256 * 1024;
 const MAX_FILES: usize = 2048;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
@@ -319,6 +318,22 @@ fn lock_error(error: std::io::Error) -> LeaseError {
         LeaseError::Other(error.to_string())
     }
 }
+
+/// All processes addressing the same resource scope must lock the same inode.
+/// Keep that inode in application data rather than creating a project folder.
+fn lease_path(root: &Path) -> PathBuf {
+    let hash = Sha256::digest(root.as_os_str().to_string_lossy().as_bytes());
+    let name = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    crate::session::kathamo_session_dir()
+        .parent()
+        .expect("session directory has a parent")
+        .join("resource-leases")
+        .join(name)
+}
+
 impl Lease {
     fn acquire(
         root: &Path,
@@ -326,11 +341,15 @@ impl Lease {
         create: bool,
     ) -> std::result::Result<Option<Self>, LeaseError> {
         checked_path(root)?;
-        if create {
-            fs::create_dir_all(root).map_err(err)?;
-        }
-        let path = root.join(LEASE);
+        let path = lease_path(root);
         checked_path(&path)?;
+        if create {
+            fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| "resource lease has no parent".to_string())?,
+            )
+            .map_err(err)?;
+        }
         let file = match OpenOptions::new()
             .read(true)
             .write(true)
@@ -357,6 +376,7 @@ impl Drop for Lease {
 }
 pub(crate) fn mutation_lease(root: &Path) -> Result<Lease> {
     let lease = Lease::acquire(root, true, true)?.ok_or("missing resource lease")?;
+    fs::create_dir_all(root).map_err(err)?;
     ensure_complete(root)?;
     Ok(lease)
 }
@@ -1357,7 +1377,7 @@ fn catalog(root: &Path, o: &Options) -> Result<Value> {
     // When no persistent lock existed initially, first publication could have
     // started during traversal. Its lock inode is never unlinked: reject and
     // retry rather than returning any potentially mixed observation.
-    if _observation_lease.is_none() && root.join(LEASE).try_exists().map_err(err)? {
+    if _observation_lease.is_none() && lease_path(root).try_exists().map_err(err)? {
         return Err("resource ownership initialized during observation; retry catalog".into());
     }
     Ok(

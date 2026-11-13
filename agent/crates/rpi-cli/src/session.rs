@@ -289,9 +289,12 @@ fn extension_tool_prompt_metadata(
         .unwrap_or_default()
 }
 
+pub use rpi_tools::tools::task_list;
+
 /// One-line prompt descriptions of the tools rpi itself registers.
 fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
     Some(match name {
+        task_list::NAME => "Keep a live checklist for substantial multi-step work",
         "read" => "Read file contents",
         "bash" => "Execute Bash commands (Bash/POSIX syntax, also on Windows)",
         "edit" => "Find/replace edits to existing files",
@@ -2995,6 +2998,13 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     // Denylist (`--exclude-tools`): drop named tools.
     if let Some(deny) = &args.exclude_tools {
         all.retain(|(name, _)| !deny.iter().any(|d| d == name));
+    }
+
+    if args.host_task_list && !args.no_builtin_tools && tool_name_allowed(task_list::NAME, args) {
+        all.push((
+            task_list::NAME,
+            HarnessTool::new(task_list::TaskListTool::create()),
+        ));
     }
 
     all.into_iter().map(|(_, t)| t).collect()

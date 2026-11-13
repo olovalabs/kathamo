@@ -13,6 +13,7 @@ pub mod image;
 pub mod ls;
 pub mod powershell;
 pub mod read;
+pub mod task_list;
 pub mod tool_context;
 pub mod write;
 

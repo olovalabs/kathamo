@@ -198,6 +198,8 @@ pub struct Args {
     /// `--no-extensions`/`-ne`: skip Rust cdylib extension loading.
     /// Honored by `session.rs`: when set, no extension directory is scanned.
     pub no_extensions: bool,
+    /// Enable the host UI checklist tool in embedded sessions.
+    pub host_task_list: bool,
     /// `--no-themes`: disable custom theme discovery and loading.
     /// Built-in presets remain available unless a custom `--theme` is given.
     pub no_themes: bool,

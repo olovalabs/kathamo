@@ -9,7 +9,7 @@
 use crate::agent_auth::{AgentModel, ModelBackend};
 use crate::agent_bridge::AgentEvent;
 use crate::paths;
-use crate::{ChatMessage, ChatRole, ToolState, push_chat_event};
+use crate::{ChatMessage, ChatRole, ToolState, push_chat_event, task_list_update};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -430,13 +430,24 @@ fn sanitize(value: &str) -> String {
     out
 }
 
-/// Read a conversation file and rebuild the visible transcript. Missing files
-/// yield an empty transcript; corrupt lines are skipped.
-pub fn load(path: &Path) -> Vec<std::sync::Arc<ChatMessage>> {
+#[derive(Default)]
+pub(crate) struct RestoredConversation {
+    pub messages: Vec<Arc<ChatMessage>>,
+    pub checklist: Option<rpi_embedded::task_list::TaskList>,
+}
+
+#[cfg(test)]
+fn load(path: &Path) -> Vec<Arc<ChatMessage>> {
+    restore(path).messages
+}
+
+/// Replay the transcript and the latest checklist for the current turn.
+pub(crate) fn restore(path: &Path) -> RestoredConversation {
+    let mut restored = RestoredConversation::default();
     let Some(text) = read_bounded(path) else {
-        return Vec::new();
+        return restored;
     };
-    let mut messages = Vec::new();
+    let messages = &mut restored.messages;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -447,19 +458,26 @@ pub fn load(path: &Path) -> Vec<std::sync::Arc<ChatMessage>> {
         };
         match entry {
             Entry::User { text } => {
-                messages.push(std::sync::Arc::new(ChatMessage::new(ChatRole::User, text)))
+                restored.checklist = None;
+                messages.push(Arc::new(ChatMessage::new(ChatRole::User, text)));
             }
             Entry::Local { role, text } => {
                 messages.push(std::sync::Arc::new(ChatMessage::new(role, text)))
             }
             Entry::Event { event } => match event {
                 AgentEvent::Done | AgentEvent::Closed => {}
-                event => push_chat_event(&mut messages, event),
+                event => {
+                    if let Some(list) = task_list_update(&event) {
+                        restored.checklist = Some(list);
+                    } else {
+                        push_chat_event(messages, event);
+                    }
+                }
             },
         }
     }
-    normalize_replay(&mut messages);
-    messages
+    normalize_replay(messages);
+    restored
 }
 
 /// Restore cumulative usage from the same bounded history as the transcript.

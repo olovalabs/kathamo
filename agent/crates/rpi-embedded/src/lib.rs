@@ -40,6 +40,7 @@ use rpi_runtime::{RuntimeConfig, RuntimeSettings, ValueSource};
 mod antigravity;
 pub const ANTIGRAVITY: &str = rpi_ai::providers::antigravity::ID;
 pub use rpi_cli::native_auth::{AuthMethod, AuthMethods};
+pub use rpi_cli::session::task_list;
 
 static EXTENSION_OAUTH_METHODS: std::sync::LazyLock<
     std::sync::RwLock<std::collections::BTreeMap<PathBuf, Arc<std::collections::BTreeSet<String>>>>,
@@ -1217,6 +1218,7 @@ async fn run_session(
     // when it needs an OAuth provider.
     args.no_extensions = true;
     args.offline = true;
+    args.host_task_list = true;
     args.provider = provider.clone();
     args.model = model.clone();
     args.session = resume.clone();

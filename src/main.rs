@@ -1693,7 +1693,45 @@ fn finish_chat_tools(messages: &mut [Arc<ChatMessage>]) {
     }
 }
 
+const TASK_LIST_COMPLETION_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn is_task_list_event(event: &agent_bridge::AgentEvent) -> bool {
+    use agent_bridge::AgentEvent;
+    matches!(
+        event,
+        AgentEvent::ToolStart { name, .. }
+            | AgentEvent::ToolUpdate { name, .. }
+            | AgentEvent::ToolEnd { name, .. }
+            if name == rpi_embedded::task_list::NAME
+    )
+}
+
+fn task_list_update(event: &agent_bridge::AgentEvent) -> Option<rpi_embedded::task_list::TaskList> {
+    match event {
+        agent_bridge::AgentEvent::ToolEnd { name, output, failed: false, .. }
+            if name == rpi_embedded::task_list::NAME => serde_json::from_str(output).ok(),
+        _ => None,
+    }
+}
+
+fn active_task_index(list: &rpi_embedded::task_list::TaskList) -> Option<usize> {
+    list.tasks
+        .iter()
+        .position(|task| task.status == rpi_embedded::task_list::TaskStatus::InProgress)
+}
+
+fn task_list_completed(list: &rpi_embedded::task_list::TaskList) -> bool {
+    !list.tasks.is_empty()
+        && list
+            .tasks
+            .iter()
+            .all(|task| task.status == rpi_embedded::task_list::TaskStatus::Completed)
+}
+
 fn push_chat_event(messages: &mut Vec<Arc<ChatMessage>>, event: agent_bridge::AgentEvent) {
+    if is_task_list_event(&event) {
+        return;
+    }
     let (role, text) = match event {
         agent_bridge::AgentEvent::ToolStart { id, name, input } => {
             if let Some(id) = id.as_deref() {
@@ -2156,6 +2194,14 @@ fn reasoning_effort_label(level: &str) -> &str {
     }
 }
 
+#[derive(Default)]
+struct AgentChecklist {
+    list: Option<rpi_embedded::task_list::TaskList>,
+    dismissal: Option<gpui::Task<()>>,
+    scroll: gpui::ScrollHandle,
+    browsing: bool,
+}
+
 struct PaneChat {
     worker_view: Option<WorkerView>,
     active: bool,
@@ -2168,6 +2214,7 @@ struct PaneChat {
     cwd: Option<PathBuf>,
     messages: Vec<Arc<ChatMessage>>,
     running: bool,
+    checklist: AgentChecklist,
     /// Native agent lifecycle, independent of the pane's hidden shell.
     status: SessionStatus,
     /// Completed turns in this conversation.
@@ -2221,6 +2268,7 @@ impl Default for PaneChat {
             cwd: None,
             messages: Vec::new(),
             running: false,
+            checklist: AgentChecklist::default(),
             status: SessionStatus::Idle,
             completed_turns: 0,
             usage: None,
@@ -3150,7 +3198,7 @@ struct RenamingProject {
 struct RestoreData {
     workspace: workspace_state::SavedWorkspace,
     scrollbacks: HashMap<String, String>,
-    transcripts: HashMap<String, Vec<Arc<ChatMessage>>>,
+    transcripts: HashMap<String, conversations::RestoredConversation>,
     usage: HashMap<String, rpi_embedded::AgentUsage>,
 }
 
@@ -3588,8 +3636,9 @@ impl AppState {
                     if self.settings.restore.agent_history {
                         let key = &pane.chat.conversation_key;
                         pane.chat.conversation = Some(conversations::Log::open(&pane.uid, key));
-                        if let Some(messages) = transcripts.get(&transcript_key(&pane.uid, key)) {
-                            pane.chat.messages = messages.clone();
+                        if let Some(restored) = transcripts.get(&transcript_key(&pane.uid, key)) {
+                            pane.chat.messages = restored.messages.clone();
+                            pane.chat.checklist.list = restored.checklist.clone();
                         }
                         if let Some(total) = usage.get(&transcript_key(&pane.uid, key)) {
                             pane.chat.set_usage(*total);
@@ -8018,23 +8067,37 @@ impl AppState {
                         let drain_start = std::time::Instant::now();
                         let drained = bridge.poll();
                         crate::stream_timing::record_since("ui.drain", drain_start);
-                        if !drained.is_empty() {
+                        if drained.iter().any(|event| !is_task_list_event(event)) {
                             pane.chat.active_dirty.set(true);
                             if drained.iter().any(|event| {
-                                matches!(
-                                    event,
-                                    agent_bridge::AgentEvent::ToolStart { .. }
-                                        | agent_bridge::AgentEvent::ToolUpdate { .. }
-                                        | agent_bridge::AgentEvent::ToolEnd { .. }
-                                        | agent_bridge::AgentEvent::Subagents { .. }
-                                        | agent_bridge::AgentEvent::Done
-                                        | agent_bridge::AgentEvent::Closed
-                                )
+                                !is_task_list_event(event)
+                                    && matches!(
+                                        event,
+                                        agent_bridge::AgentEvent::ToolStart { .. }
+                                            | agent_bridge::AgentEvent::ToolUpdate { .. }
+                                            | agent_bridge::AgentEvent::ToolEnd { .. }
+                                            | agent_bridge::AgentEvent::Subagents { .. }
+                                            | agent_bridge::AgentEvent::Done
+                                            | agent_bridge::AgentEvent::Closed
+                                    )
                             }) {
                                 pane.chat.activity_dirty.set(true);
                             }
                         }
                         for event in drained {
+                            if is_task_list_event(&event) {
+                                if let Some(list) = task_list_update(&event)
+                                    && Self::apply_task_list(pane, list, cx)
+                                {
+                                    changed = true;
+                                    if save_history
+                                        && let Some(log) = pane.chat.conversation.as_mut()
+                                    {
+                                        log.append_event(&event);
+                                    }
+                                }
+                                continue;
+                            }
                             let apply_start = std::time::Instant::now();
                             changed = true;
                             session_changed |= pane.chat.record_first_response_provider(&event);
@@ -8506,6 +8569,7 @@ impl AppState {
                 pane.chat
                     .messages
                     .push(Arc::new(ChatMessage::new(ChatRole::User, prompt)));
+                pane.chat.checklist = AgentChecklist::default();
                 pane.chat.running = true;
                 pane.chat.status = SessionStatus::Working;
                 pane.attachments.clear();
@@ -10453,6 +10517,165 @@ impl AppState {
         .into_any_element()
     }
 
+    fn apply_task_list(
+        pane: &mut TerminalPane,
+        list: rpi_embedded::task_list::TaskList,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let checklist = &mut pane.chat.checklist;
+        if checklist.list.as_ref() == Some(&list) {
+            return false;
+        }
+        let was_completed = checklist.list.as_ref().is_some_and(task_list_completed);
+        let completed = task_list_completed(&list);
+        let active = active_task_index(&list);
+        if !checklist.browsing
+            && let Some(index) = active
+            && checklist.list.as_ref().and_then(active_task_index) != active
+        {
+            checklist.scroll.scroll_to_item(index);
+        }
+        checklist.list = Some(list);
+
+        if !completed {
+            checklist.dismissal = None;
+        } else if !was_completed {
+            let pane_id = pane.id;
+            let timer = cx.background_executor().timer(TASK_LIST_COMPLETION_DELAY);
+            checklist.dismissal = Some(cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(pane) = this.pane_mut(pane_id) {
+                        pane.chat.checklist.dismissal = None;
+                        cx.notify();
+                    }
+                });
+            }));
+        }
+        true
+    }
+
+    fn render_agent_task_list(
+        &self,
+        pane: &TerminalPane,
+        tokens: &ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        use gpui_component::{Icon, IconName, spinner::Spinner};
+        use rpi_embedded::task_list::TaskStatus;
+
+        if !pane.chat.active || pane.chat.worker_view.is_some() {
+            return None;
+        }
+        let checklist = &pane.chat.checklist;
+        let list = checklist.list.as_ref()?;
+        let pane_id = pane.id;
+        if task_list_completed(list) && checklist.dismissal.is_none() {
+            return None;
+        }
+        Some(
+            div()
+                .id(("agent-task-list", pane.id))
+                .debug_selector(|| "agent-task-list".to_string())
+                .w_full()
+                .flex_none()
+                .max_h(px(152.0))
+                .overflow_y_scroll()
+                .track_scroll(&checklist.scroll)
+                .hover_listener_mode(gpui::HoverListenerMode::InputModalityIndependent)
+                .on_hover(cx.listener(move |this, hovered, _, cx| {
+                    let Some(pane) = this.pane_mut(pane_id) else {
+                        return;
+                    };
+                    let checklist = &mut pane.chat.checklist;
+                    let was_browsing = std::mem::replace(&mut checklist.browsing, *hovered);
+                    if was_browsing
+                        && !hovered
+                        && pane.chat.running
+                        && let Some(index) = checklist.list.as_ref().and_then(active_task_index)
+                    {
+                        checklist.scroll.scroll_to_item(index);
+                        cx.notify();
+                    }
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .px(px(11.0))
+                .py(px(8.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(tokens.border_subtle)
+                .bg(tokens.pane_bg)
+                .text_size(px(13.0))
+                .children(list.tasks.iter().enumerate().map(|(index, task)| {
+                    let status = match task.status {
+                        TaskStatus::InProgress if !pane.chat.running => TaskStatus::Pending,
+                        status => status,
+                    };
+                    let marker = match status {
+                        TaskStatus::Completed => div()
+                            .size(px(14.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(tokens.text_secondary)
+                            .child(
+                                Icon::new(IconName::Check)
+                                    .with_size(px(11.0))
+                                    .text_color(tokens.pane_bg),
+                            )
+                            .into_any_element(),
+                        TaskStatus::InProgress => Spinner::new()
+                            .icon(Icon::new(IconName::LoaderCircle))
+                            .with_size(px(14.0))
+                            .color(tokens.text_secondary)
+                            .into_any_element(),
+                        TaskStatus::Pending => div()
+                            .size(px(13.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_dashed()
+                            .border_color(tokens.text_muted)
+                            .into_any_element(),
+                    };
+                    div()
+                        .id(("agent-task", index))
+                        .flex()
+                        .flex_none()
+                        .items_start()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id("task-status")
+                                .debug_selector(move || match status {
+                                    TaskStatus::Pending => "agent-task-pending".to_string(),
+                                    TaskStatus::InProgress => "agent-task-running".to_string(),
+                                    TaskStatus::Completed => "agent-task-completed".to_string(),
+                                })
+                                .flex_none()
+                                .size(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(marker),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(if task.status == TaskStatus::Completed {
+                                    tokens.text_secondary
+                                } else {
+                                    tokens.text_primary
+                                })
+                                .child(task.text.clone()),
+                        )
+                })),
+        )
+    }
+
     fn render_kathamo_input_bar(
         &self,
         pane: &TerminalPane,
@@ -10731,6 +10954,10 @@ impl AppState {
                 }),
             )
             .children(plus_menu)
+            .children(
+                self.render_agent_task_list(pane, &tokens, cx)
+                    .map(|list| div().pb(px(8.0)).child(list)),
+            )
             .child(
                 div().relative().w_full().h(px(0.0)).children(completion_menu.map(|menu| {
                     deferred(
@@ -17121,14 +17348,14 @@ fn main() -> Result<()> {
                                                     let conversation_path = paths::conversations_dir()
                                                         .join(&pane.uid)
                                                         .join(format!("{key}.jsonl"));
-                                                    let messages = conversations::load(&conversation_path);
+                                                    let restored = conversations::restore(&conversation_path);
                                                     if let Some(total) = conversations::load_usage(&conversation_path) {
                                                         usage.insert(transcript_key(&pane.uid, &key), total);
                                                     }
-                                                    if !messages.is_empty() {
+                                                    if !restored.messages.is_empty() || restored.checklist.is_some() {
                                                         transcripts.insert(
                                                             transcript_key(&pane.uid, &key),
-                                                            messages,
+                                                            restored,
                                                         );
                                                     }
                                                 }
@@ -17855,6 +18082,176 @@ mod resize_tests {
     }
 
     #[test]
+    fn agent_checklist_hides_automatically_only_after_all_steps_are_complete() {
+        use agent_bridge::AgentEvent;
+
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let report = |first: &str, second: &str| AgentEvent::ToolEnd {
+            id: Some("checklist".into()),
+            name: rpi_embedded::task_list::NAME.into(),
+            output: serde_json::json!({"tasks": [
+                {"text": "Inspect the inputs", "status": first},
+                {"text": "Prepare the report", "status": second}
+            ]})
+            .to_string(),
+            failed: false,
+        };
+
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            let chat = &mut pane.chat;
+            chat.active = true;
+            chat.running = true;
+            chat.messages
+                .push(Arc::new(ChatMessage::new(ChatRole::User, "Prepare a report".into())));
+            AppState::apply_task_list(
+                pane,
+                task_list_update(&report("in_progress", "pending")).unwrap(),
+                cx,
+            );
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        let list = cx.debug_bounds("agent-task-list").unwrap();
+        let input = cx.debug_bounds("agent-composer-input").unwrap();
+        assert!(list.bottom() <= input.top());
+        assert!(cx.debug_bounds("agent-task-running").is_some());
+        assert!(cx.debug_bounds("agent-task-pending").is_some());
+
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            AppState::apply_task_list(
+                pane,
+                task_list_update(&report("completed", "in_progress")).unwrap(),
+                cx,
+            );
+            let chat = &mut pane.chat;
+            chat.observe_status(&AgentEvent::Done);
+            assert_eq!(chat.messages.len(), 1, "updates do not create tool cards");
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-task-list").is_some());
+        assert!(cx.debug_bounds("agent-task-completed").is_some());
+        assert!(cx.debug_bounds("agent-task-running").is_none());
+
+        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY);
+        cx.run_until_parked();
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-task-list").is_some());
+
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            AppState::apply_task_list(
+                pane,
+                task_list_update(&report("completed", "completed")).unwrap(),
+                cx,
+            );
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-task-completed").is_some());
+
+        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY / 2);
+        cx.run_until_parked();
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            let complete = task_list_update(&report("completed", "completed")).unwrap();
+            assert!(!AppState::apply_task_list(pane, complete, cx));
+        });
+        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY / 2);
+        cx.run_until_parked();
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-task-list").is_none());
+
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            for (first, second) in [
+                ("completed", "pending"),
+                ("completed", "completed"),
+                ("completed", "in_progress"),
+            ] {
+                AppState::apply_task_list(
+                    pane,
+                    task_list_update(&report(first, second)).unwrap(),
+                    cx,
+                );
+            }
+            cx.notify();
+        });
+        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY);
+        cx.run_until_parked();
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-task-list").is_some());
+    }
+
+    #[test]
+    fn agent_checklist_scrolls_to_active_step_unless_user_is_browsing() {
+        use rpi_embedded::task_list::{Task, TaskList, TaskStatus};
+
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let report = |active| TaskList {
+            tasks: (0..12)
+                .map(|index| Task {
+                    text: format!("Step {}", index + 1),
+                    status: if index == active {
+                        TaskStatus::InProgress
+                    } else {
+                        TaskStatus::Pending
+                    },
+                })
+                .collect(),
+        };
+        let scroll = cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            pane.chat.active = true;
+            pane.chat.running = true;
+            AppState::apply_task_list(pane, report(0), cx);
+            cx.notify();
+            pane.chat.checklist.scroll.clone()
+        });
+        cx.draw_frame().unwrap();
+        assert_eq!(scroll.offset().y, px(0.0));
+
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            AppState::apply_task_list(pane, report(10), cx);
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        assert!(scroll.offset().y < px(0.0));
+        let position = cx.debug_bounds("agent-task-list").unwrap().center();
+        cx.simulate_mouse_move(position, None, Modifiers::none());
+        cx.draw_frame().unwrap();
+        cx.simulate_event(gpui::ScrollEvent {
+            position,
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(20.0))),
+            ..Default::default()
+        });
+        cx.draw_frame().unwrap();
+        let offset = scroll.offset();
+        assert!(offset.y < px(0.0));
+
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            assert!(pane.chat.checklist.browsing);
+            AppState::apply_task_list(pane, report(0), cx);
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        assert_eq!(scroll.offset(), offset);
+
+        cx.simulate_mouse_move(point(px(1.0), px(1.0)), None, Modifiers::none());
+        cx.draw_frame().unwrap();
+        assert!(scroll.offset().y > offset.y);
+        let list = cx.debug_bounds("agent-task-list").unwrap();
+        let active = cx.debug_bounds("agent-task-running").unwrap();
+        assert!(active.top() >= list.top() && active.bottom() <= list.bottom());
+    }
+
+    #[test]
     fn completion_menu_sits_directly_above_composer() {
         let mut app = TestAppContext::new();
         let (mut cx, state) = open_app(&mut app);
@@ -18384,10 +18781,13 @@ Done."#
         });
         let transcripts = HashMap::from([(
             transcript_key("p-1", &legacy_key),
-            vec![Arc::new(ChatMessage::new(
-                ChatRole::User,
-                "Legacy history".into(),
-            ))],
+            conversations::RestoredConversation {
+                messages: vec![Arc::new(ChatMessage::new(
+                    ChatRole::User,
+                    "Legacy history".into(),
+                ))],
+                ..Default::default()
+            },
         )]);
         let mut cx = TestAppContext::new();
         let (mut cx, state) = open_app(&mut cx);

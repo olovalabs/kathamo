@@ -400,7 +400,10 @@ fn gemini_tool_approval() -> rpi_embedded::BeforeToolCall {
     let dialogs = Arc::new(smol::lock::Mutex::new(()));
     Arc::new(move |call, cancelled| {
         let name = call.tool_call.name.clone();
-        if matches!(name.as_str(), "read" | "find" | "grep" | "ls") {
+        if matches!(
+            name.as_str(),
+            "read" | "find" | "grep" | "ls" | rpi_embedded::task_list::NAME
+        ) {
             return Box::pin(async { None });
         }
         let arguments = call.args.to_string();

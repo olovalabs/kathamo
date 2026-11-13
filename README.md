@@ -28,6 +28,10 @@ Kathamo combines native terminal rendering powered by [GPUI Fast](https://github
   - Agent conversations are saved to disk; rpi sessions resume on the next prompt.
   - Quick-action buttons to create new terminal sessions per project or open existing directories.
 
+- **Project changes**
+  - Select **Changes** in a pane header or run `/diff` in agent chat to open a Git diff beside your work.
+  - Review per-file patches and line counts against `HEAD` (or an empty tree before the first commit), grouped into collapsible tracked and untracked sections. Ignored untracked files are excluded; changed dotfiles and lockfiles remain visible. Use **Refresh** to reload the snapshot.
+
 - **🔌 First-Class Agent Integrations & CLI**
   - Automated one-command setup for popular agent CLIs:
     ```bash
@@ -348,4 +352,7 @@ Dual-licensed under either:
 - **MIT License** ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
 - **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
 
-at your option.
+at your option for Kathamo's original code. The distributed application also
+embeds Zed's default file icons and uses its filename associations, which are
+provided under GPL-3.0-or-later. See [the Zed icon notice](assets/zed_file_icons/NOTICE.md)
+and [GPL-3.0 license](assets/zed_file_icons/LICENSE-GPL) for those components.

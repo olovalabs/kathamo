@@ -334,7 +334,7 @@ impl Element for Inline {
                 let links = self.links.clone();
                 let text_layout = text_layout.clone();
 
-                move |event: &MouseUpEvent, phase, _, cx| {
+                move |event: &MouseUpEvent, phase, window, cx| {
                     if !bounds.contains(&event.position) || !phase.bubble() {
                         return;
                     }
@@ -343,6 +343,10 @@ impl Element for Inline {
                         Self::link_for_position(&text_layout, &links, event.position)
                     {
                         cx.stop_propagation();
+                        let handler = cx.try_global::<super::TextLinkHandler>().map(|h| h.0.clone());
+                        if event.modifiers.control && handler.is_some_and(|handler| handler(&link.url, window, cx)) {
+                            return;
+                        }
                         cx.open_url(&link.url);
                     }
                 }

@@ -40,11 +40,13 @@ mod cli;
 mod completion;
 mod conversations;
 mod diagnostics;
+mod file_icons;
 mod integrations;
 #[cfg(unix)]
 mod kathamo_compat;
 mod logos;
 mod paths;
+mod project_diff;
 use terminal::pty_session;
 mod settings;
 mod shell_history;
@@ -2541,6 +2543,35 @@ impl PaneChat {
     }
 }
 
+struct DiffPreview {
+    directory: PathBuf,
+    result: Option<Result<project_diff::ProjectDiff, String>>,
+    expanded: HashSet<String>,
+    tracked_collapsed: bool,
+    untracked_collapsed: bool,
+    request: u64,
+}
+
+fn diff_counts(
+    counts: (Option<usize>, Option<usize>),
+    added: gpui::Rgba,
+    removed: gpui::Rgba,
+    muted: Hsla,
+) -> Div {
+    let row = div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .flex_shrink_0()
+        .text_size(px(11.0));
+    match counts {
+        (Some(additions), Some(deletions)) => row
+            .child(div().text_color(added).child(format!("+{additions}")))
+            .child(div().text_color(removed).child(format!("-{deletions}"))),
+        _ => row.child(div().text_color(muted).child("binary")),
+    }
+}
+
 /// One terminal inside a session's screen. A session (a sidebar tab) owns a
 /// split tree of panes; each pane is a full, independent terminal whose PTY
 /// keeps running while another session's screen is shown.
@@ -2561,6 +2592,8 @@ pub struct TerminalPane {
     pub native_acknowledged: bool,
     pub osc_report_active: bool,
     pub terminal: Entity<TerminalView>,
+    markdown_preview: Option<(PathBuf, SharedString)>,
+    diff_preview: Option<DiffPreview>,
     pub status: SessionStatus,
     pub detection: status::DetectionResult,
     pub title: String,
@@ -2626,6 +2659,7 @@ pub struct TerminalPane {
 /// Commands handled by the agent composer itself.
 const AGENT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show available commands"),
+    ("/diff", "Show project changes"),
     ("/new", "Start a new chat"),
     ("/copy", "Copy the last assistant reply"),
     ("/version", "Show the application version"),
@@ -2696,6 +2730,8 @@ impl TerminalPane {
             native_acknowledged: false,
             osc_report_active: false,
             terminal,
+            markdown_preview: None,
+            diff_preview: None,
             status: SessionStatus::Idle,
             detection: status::DetectionResult::new(
                 SessionStatus::Idle,
@@ -2868,6 +2904,38 @@ impl PaneNode {
             PaneNode::Split { left, right, .. } => {
                 left.split(target_id, new_id, split_id, axis)
                     || right.split(target_id, new_id, split_id, axis)
+            }
+        }
+    }
+
+    fn preview_goes_left(&self, source: usize) -> Option<bool> {
+        match self {
+            PaneNode::Leaf(_) => None,
+            PaneNode::Split {
+                axis, left, right, ..
+            } => {
+                let (branch, on_right) = if left.contains(source) {
+                    (left, false)
+                } else if right.contains(source) {
+                    (right, true)
+                } else {
+                    return None;
+                };
+                branch
+                    .preview_goes_left(source)
+                    .or_else(|| (*axis == gpui::Axis::Horizontal).then_some(on_right))
+            }
+        }
+    }
+
+    fn swap_split_children(&mut self, source: usize, preview: usize) {
+        if let PaneNode::Split { left, right, .. } = self {
+            if matches!((&**left, &**right), (PaneNode::Leaf(a), PaneNode::Leaf(b)) if *a == source && *b == preview)
+            {
+                std::mem::swap(left, right);
+            } else {
+                left.swap_split_children(source, preview);
+                right.swap_split_children(source, preview);
             }
         }
     }
@@ -3925,10 +3993,19 @@ impl AppState {
         };
 
         let target = window_title_target.clone();
+        let link_target = window_title_target.clone();
         let seed = scrollback.map(str::to_string);
         let terminal = cx.new(|cx| {
             let mut view = TerminalView::new_with_scrollback(writer, reader, config, seed, cx)
                 .with_resize_callback(resize_callback)
+                .with_link_callback(move |window, cx, link| {
+                    let (path, _, _) = link.path_with_position();
+                    let mut handled = false;
+                    let _ = link_target.update(cx, |state, cx| {
+                        handled = state.open_markdown_preview(pane_id, &path, window, cx);
+                    });
+                    handled
+                })
                 .with_title_callback(move |window, cx, title| {
                     window.set_window_title(title);
                     let title_str = title.to_string();
@@ -4006,7 +4083,7 @@ impl AppState {
         let Some(pane) = session.panes.get_mut(pane_idx) else {
             return;
         };
-        if pane.title == trimmed {
+        if pane.markdown_preview.is_some() || pane.diff_preview.is_some() || pane.title == trimmed {
             return;
         }
         pane.title = trimmed.to_string();
@@ -5569,6 +5646,420 @@ impl AppState {
             self.schedule_workspace_save(cx);
             cx.notify();
         }
+    }
+
+    /// Open a local Markdown link beside its source, leaving the source running.
+    fn open_markdown_preview(
+        &mut self,
+        source: usize,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let path = if let Ok(url) = url::Url::parse(target) {
+            if url.scheme() != "file" {
+                return false;
+            }
+            match url.to_file_path() {
+                Ok(path) => path,
+                Err(_) => return false,
+            }
+        } else {
+            PathBuf::from(target)
+        };
+        if !path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "md" | "markdown" | "mdown"
+                )
+            })
+        {
+            return false;
+        }
+        let Some(&(project, session, _)) = self.pane_index.get(&source) else {
+            return false;
+        };
+        let Some(pane) = self.pane_ref(source) else {
+            return false;
+        };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            pane.markdown_preview
+                .as_ref()
+                .and_then(|(path, _)| path.parent().map(|p| p.to_path_buf()))
+                .or_else(|| self.pane_cwd_path(pane))
+                .unwrap_or_else(|| self.projects[project].path.clone())
+                .join(path)
+        };
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return false;
+        };
+        let mut html = String::new();
+        let options = pulldown_cmark::Options::ENABLE_TABLES
+            | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
+            | pulldown_cmark::Options::ENABLE_TASKLISTS
+            | pulldown_cmark::Options::ENABLE_FOOTNOTES;
+        pulldown_cmark::html::push_html(
+            &mut html,
+            pulldown_cmark::Parser::new_ext(&content, options),
+        );
+        let source_on_right = self.projects[project].sessions[session]
+            .pane_tree
+            .as_ref()
+            .and_then(|tree| tree.preview_goes_left(source))
+            .unwrap_or(false);
+        let new_id = self.next_id + 1;
+        self.split_pane(source, gpui::Axis::Horizontal, window, cx);
+        if let Some(pane) = self.pane_mut(new_id) {
+            pane.markdown_preview = Some((path.clone(), html.into()));
+            pane.display_title = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+                .into();
+        } else {
+            return false;
+        }
+        if source_on_right {
+            if let Some(tree) = self.projects[project].sessions[session].pane_tree.as_mut() {
+                tree.swap_split_children(source, new_id);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    fn open_project_diff(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(&(project, session, _)) = self.pane_index.get(&source) else {
+            return;
+        };
+        let directory = self.projects[project].path.clone();
+        let source_on_right = self.projects[project].sessions[session]
+            .pane_tree
+            .as_ref()
+            .and_then(|tree| tree.preview_goes_left(source))
+            .unwrap_or(false);
+        let new_id = self.next_id + 1;
+        self.split_pane(source, gpui::Axis::Horizontal, window, cx);
+        let Some(pane) = self.pane_mut(new_id) else {
+            return;
+        };
+        pane.display_title = "Project changes".into();
+        pane.diff_preview = Some(DiffPreview {
+            directory,
+            result: None,
+            expanded: HashSet::new(),
+            tracked_collapsed: false,
+            untracked_collapsed: false,
+            request: 0,
+        });
+        if source_on_right {
+            if let Some(tree) = self.projects[project].sessions[session].pane_tree.as_mut() {
+                tree.swap_split_children(source, new_id);
+            }
+        }
+        self.refresh_project_diff(new_id, cx);
+    }
+
+    fn refresh_project_diff(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .pane_mut(pane_id)
+            .and_then(|pane| pane.diff_preview.as_mut())
+        else {
+            return;
+        };
+        view.request += 1;
+        let request = view.request;
+        let directory = view.directory.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { project_diff::load(directory) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(view) = this
+                    .pane_mut(pane_id)
+                    .and_then(|pane| pane.diff_preview.as_mut())
+                    .filter(|view| view.request == request)
+                {
+                    view.result = Some(result);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn render_project_diff(
+        &self,
+        pane_id: usize,
+        view: &DiffPreview,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tokens = self.tokens(cx);
+        let mut content = div()
+            .id(("project-diff-content", pane_id))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scrollbar()
+            .flex()
+            .flex_col()
+            .p(px(16.0))
+            .gap(px(8.0));
+        let mut summary = "Loading project changes…".to_string();
+        let mut totals = None;
+        let added_color = if tokens.is_dark {
+            rgba(0x3fb950ff)
+        } else {
+            rgba(0x1a7f37ff)
+        };
+        let removed_color = if tokens.is_dark {
+            rgba(0xf85149ff)
+        } else {
+            rgba(0xcf222eff)
+        };
+        match &view.result {
+            Some(Err(error)) => {
+                summary = "Could not load changes".to_owned();
+                content =
+                    content.child(div().text_color(tokens.text_secondary).child(error.clone()));
+            }
+            Some(Ok(diff)) => {
+                let additions: usize = diff.files.iter().filter_map(|f| f.additions).sum();
+                let deletions: usize = diff.files.iter().filter_map(|f| f.deletions).sum();
+                summary = format!("{} files changed", diff.files.len());
+                totals = Some((additions, deletions));
+                if diff.files.is_empty() {
+                    content = content.child(
+                        div()
+                            .text_color(tokens.text_secondary)
+                            .child("No project changes."),
+                    );
+                }
+                for (group, title, collapsed) in [
+                    (
+                        project_diff::FileGroup::Tracked,
+                        "Tracked",
+                        view.tracked_collapsed,
+                    ),
+                    (
+                        project_diff::FileGroup::Untracked,
+                        "Untracked",
+                        view.untracked_collapsed,
+                    ),
+                ] {
+                    let file_count = diff.files.iter().filter(|file| file.group == group).count();
+                    if file_count == 0 {
+                        continue;
+                    }
+                    content = content.child(
+                        div()
+                            .id((title, pane_id))
+                            .debug_selector(move || format!("project-diff-section-{title}"))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .px(px(6.0))
+                            .py(px(6.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(tokens.card_hover))
+                            .text_color(tokens.text_secondary)
+                            .text_size(px(12.0))
+                            .child(if collapsed { "▸" } else { "▾" })
+                            .child(format!("{title} ({file_count})"))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(view) = this
+                                        .pane_mut(pane_id)
+                                        .and_then(|pane| pane.diff_preview.as_mut())
+                                    {
+                                        match group {
+                                            project_diff::FileGroup::Tracked => {
+                                                view.tracked_collapsed = !view.tracked_collapsed
+                                            }
+                                            project_diff::FileGroup::Untracked => {
+                                                view.untracked_collapsed = !view.untracked_collapsed
+                                            }
+                                        }
+                                        cx.notify();
+                                    }
+                                }),
+                            ),
+                    );
+                    if collapsed {
+                        continue;
+                    }
+                    for (index, file) in diff
+                        .files
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, file)| file.group == group)
+                    {
+                        let path = file.path.clone();
+                        let expanded = view.expanded.contains(&path);
+                        let counts = (file.additions, file.deletions);
+                        let mut card = div()
+                            .flex()
+                            .flex_col()
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(tokens.border_subtle)
+                            .child(
+                                div()
+                                    .id(("project-diff-file", pane_id * 100000 + index))
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.0))
+                                    .px(px(10.0))
+                                    .py(px(7.0))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(tokens.card_hover))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(6.0))
+                                            .min_w_0()
+                                            .text_color(tokens.text_primary)
+                                            .text_size(px(12.0))
+                                            .child(if expanded { "▾" } else { "▸" })
+                                            .child(
+                                                svg()
+                                                    .path(file_icons::icon_for_path(&path))
+                                                    .size(px(16.0))
+                                                    .text_color(tokens.text_secondary),
+                                            )
+                                            .child(div().min_w_0().child(path.clone())),
+                                    )
+                                    .child(diff_counts(
+                                        counts,
+                                        added_color,
+                                        removed_color,
+                                        tokens.text_secondary,
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(view) = this
+                                                .pane_mut(pane_id)
+                                                .and_then(|pane| pane.diff_preview.as_mut())
+                                            {
+                                                if !view.expanded.remove(&path) {
+                                                    view.expanded.insert(path.clone());
+                                                }
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ),
+                            );
+                        if expanded {
+                            let mut patch = div()
+                                .flex()
+                                .flex_col()
+                                .w_full()
+                                .font_family(MONO_FONT)
+                                .text_size(px(11.0))
+                                .py(px(6.0));
+                            for (line_index, line) in file.patch.lines().take(1500).enumerate() {
+                                let (color, background) =
+                                    if line.starts_with('+') && !line.starts_with("+++") {
+                                        (rgba(0x86efacff), rgba(0x163a2a99))
+                                    } else if line.starts_with('-') && !line.starts_with("---") {
+                                        (rgba(0xfca5a5ff), rgba(0x48212499))
+                                    } else if line.starts_with("@@") {
+                                        (rgba(0x93c5fdff), rgba(0x00000000))
+                                    } else {
+                                        (tokens.text_secondary.into(), rgba(0x00000000))
+                                    };
+                                patch = patch.child(
+                                    div()
+                                        .id((
+                                            "diff-line",
+                                            pane_id * 10000000 + index * 1500 + line_index,
+                                        ))
+                                        .w_full()
+                                        .px(px(10.0))
+                                        .bg(background)
+                                        .text_color(color)
+                                        .child(line.to_owned()),
+                                );
+                            }
+                            if file.patch.lines().count() > 1500 {
+                                patch = patch.child(
+                                    div()
+                                        .px(px(10.0))
+                                        .text_color(tokens.text_secondary)
+                                        .child("Diff truncated after 1,500 lines."),
+                                );
+                            }
+                            card = card.child(patch);
+                        }
+                        content = content.child(card);
+                    }
+                }
+            }
+            None => {}
+        }
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(16.0))
+                    .py(px(10.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .text_size(px(12.0))
+                            .child(div().text_color(tokens.text_primary).child(summary))
+                            .when_some(totals, |row, (additions, deletions)| {
+                                row.child(diff_counts(
+                                    (Some(additions), Some(deletions)),
+                                    added_color,
+                                    removed_color,
+                                    tokens.text_secondary,
+                                ))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id(("refresh-project-diff", pane_id))
+                            .px(px(8.0))
+                            .py(px(4.0))
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(tokens.card_hover))
+                            .text_color(tokens.text_secondary)
+                            .text_size(px(11.0))
+                            .child("Refresh")
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.refresh_project_diff(pane_id, cx);
+                                }),
+                            ),
+                    ),
+            )
+            .child(content)
+            .into_any_element()
     }
 
     fn toggle_maximize_pane(&mut self, pane_id: usize, cx: &mut Context<Self>) {
@@ -7232,6 +7723,11 @@ impl AppState {
         };
         let command = input.read(cx).value().trim().to_owned();
         match command.as_str() {
+            "/diff" => {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+                self.open_project_diff(pane_id, window, cx);
+                return;
+            }
             "/new" => {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
                 let project_idx = self.projects.iter().position(|project| {
@@ -12532,24 +13028,51 @@ impl AppState {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
-                            .when(!pane.should_show_bottom_input(cx), |row| {
-                                row.child(
-                                    div()
-                                        .id(("header-agent", pane_id))
-                                        .px(px(7.0))
-                                        .text_size(px(11.0))
-                                        .text_color(tokens.pane_header_fg)
-                                        .cursor(CursorStyle::PointingHand)
-                                        .child("Agent")
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.set_chat_mode(pane_id, true, window, cx);
-                                            }),
-                                        ),
-                                )
-                            })
+                            .when(
+                                pane.diff_preview.is_none()
+                                    && pane.markdown_preview.is_none()
+                                    && !pane.should_show_bottom_input(cx),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .id(("header-agent", pane_id))
+                                            .px(px(7.0))
+                                            .text_size(px(11.0))
+                                            .text_color(tokens.pane_header_fg)
+                                            .cursor(CursorStyle::PointingHand)
+                                            .child("Agent")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.set_chat_mode(pane_id, true, window, cx);
+                                                }),
+                                            ),
+                                    )
+                                },
+                            )
+                            .when(
+                                pane.diff_preview.is_none() && pane.markdown_preview.is_none(),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .id(("open-project-diff", pane_id))
+                                            .px(px(6.0))
+                                            .text_size(px(11.0))
+                                            .text_color(tokens.pane_header_fg)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(tokens.pane_header_btn_hover))
+                                            .child("Changes")
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_project_diff(pane_id, window, cx);
+                                                }),
+                                            ),
+                                    )
+                                },
+                            )
                             .child(
                                 div()
                                     .id(("split-v-btn", pane_id))
@@ -12684,14 +13207,34 @@ impl AppState {
                             this.open_terminal_context_menu(pane_id, event.position, window, cx);
                         }),
                     )
-                    .child(if pane.chat.active {
+                    .child(if let Some(view) = &pane.diff_preview {
+                        self.render_project_diff(pane_id, view, cx)
+                    } else if let Some((_, html)) = &pane.markdown_preview {
+                        div()
+                            .id(("markdown-preview", pane_id))
+                            .size_full()
+                            .overflow_y_scrollbar()
+                            .px(px(28.0))
+                            .py(px(20.0))
+                            .text_color(tokens.text_primary)
+                            .child(TextView::html(
+                                format!("markdown-preview-body-{pane_id}"),
+                                html.clone(),
+                                window,
+                                cx,
+                            ))
+                            .into_any_element()
+                    } else if pane.chat.active {
                         self.render_agent_chat(pane, window, cx).into_any_element()
                     } else {
                         pane.terminal.clone().into_any_element()
                     }),
             )
             .when(
-                pane.should_show_bottom_input(cx) && pane.chat.worker_view.is_none(),
+                pane.markdown_preview.is_none()
+                    && pane.diff_preview.is_none()
+                    && pane.should_show_bottom_input(cx)
+                    && pane.chat.worker_view.is_none(),
                 |this| this.child(self.render_kathamo_input_bar(pane, is_focused, cx)),
             )
     }
@@ -15936,6 +16479,16 @@ fn main() -> Result<()> {
                         .detach();
                     }
 
+                    let link_host = app_state.downgrade();
+                    cx.set_global(gpui_component::text::TextLinkHandler(std::rc::Rc::new(move |link, window, cx| {
+                        let mut handled = false;
+                        let _ = link_host.update(cx, |state, cx| {
+                            if let Some(pane_id) = state.focused_pane_id {
+                                handled = state.open_markdown_preview(pane_id, link, window, cx);
+                            }
+                        });
+                        handled
+                    })));
                     cx.new(|cx| Root::new(app_state, window, cx))
                 },
             )
@@ -17257,6 +17810,28 @@ mod pane_tests {
     }
 
     #[test]
+    fn preview_can_be_placed_to_the_left_of_a_right_hand_source() {
+        let mut tree = PaneNode::Leaf(1);
+        tree.split(1, 2, 10, gpui::Axis::Horizontal);
+        tree.split(2, 3, 11, gpui::Axis::Horizontal);
+        tree.swap_split_children(2, 3);
+        assert_eq!(
+            tree,
+            PaneNode::Split {
+                id: 10,
+                axis: gpui::Axis::Horizontal,
+                left: Box::new(PaneNode::Leaf(1)),
+                right: Box::new(PaneNode::Split {
+                    id: 11,
+                    axis: gpui::Axis::Horizontal,
+                    left: Box::new(PaneNode::Leaf(3)),
+                    right: Box::new(PaneNode::Leaf(2)),
+                }),
+            }
+        );
+    }
+
+    #[test]
     fn pane_node_remove_collapses_tree() {
         let mut tree = PaneNode::Leaf(1);
         tree.split(1, 2, 10, gpui::Axis::Horizontal);
@@ -17322,6 +17897,59 @@ mod pane_tests {
             state.active_project().unwrap().sessions[0].panes.len()
         });
         assert_eq!(pane_count_after, 1);
+    }
+
+    #[test]
+    fn project_diff_opens_beside_source_and_renders_expanded_patch() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_diff(1, window, cx);
+            let id = state.focused_pane_id.unwrap();
+            let view = state.pane_mut(id).unwrap().diff_preview.as_mut().unwrap();
+            view.request += 1; // Keep the asynchronous Git result from replacing this fixture.
+            view.expanded.insert("example.rs".to_owned());
+            view.result = Some(Ok(project_diff::ProjectDiff {
+                files: vec![
+                    project_diff::DiffFile {
+                        group: project_diff::FileGroup::Tracked,
+                        path: "example.rs".into(),
+                        additions: Some(1),
+                        deletions: Some(1),
+                        patch: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                    },
+                    project_diff::DiffFile {
+                        group: project_diff::FileGroup::Untracked,
+                        path: ".new-config".into(),
+                        additions: Some(1),
+                        deletions: Some(0),
+                        patch: "+new\n".into(),
+                    },
+                ],
+            }));
+        });
+        cx.draw_frame().expect("diff preview draws");
+        let section = cx
+            .debug_bounds("project-diff-section-Untracked")
+            .expect("untracked section");
+        cx.simulate_click(section.center(), Modifiers::default());
+        cx.draw_frame()
+            .expect("diff preview draws after collapsing");
+        app_state.read_with(&cx, |state, _| {
+            let view = state
+                .pane_ref(state.focused_pane_id.unwrap())
+                .unwrap()
+                .diff_preview
+                .as_ref()
+                .unwrap();
+            assert!(view.untracked_collapsed);
+            assert!(!view.tracked_collapsed);
+        });
+        app_state.read_with(&cx, |state, _| {
+            let session = &state.active_project().unwrap().sessions[0];
+            assert_eq!(session.panes.len(), 2);
+            assert!(session.panes.iter().any(|pane| pane.diff_preview.is_some()));
+        });
     }
 
     #[test]

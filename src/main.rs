@@ -5,7 +5,7 @@ use gpui::{
     CursorStyle, Div, Edges, Entity, ExternalPaths, FollowMode, Hsla, InteractiveElement as _,
     IntoElement, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, ParentElement, Pixels, Point, Rems, Render, SharedString,
-    StatefulInteractiveElement as _, StyleRefinement, Styled, StyledImage as _, Window,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, StyledImage as _, StyledText, Window,
     WindowControlArea, WindowDecorations, WindowOptions, actions, canvas, deferred, div, img, list,
     px, relative, rems, rgba, size, svg,
 };
@@ -19,10 +19,12 @@ use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::text::{TextView, TextViewStyle};
 use gpui_component::{ActiveTheme as _, Root, Sizable as _, TitleBar};
+use gpui_kit::base::{Scrollbar as KitScrollbar, VirtualListScrollHandle, v_virtual_list};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -1833,6 +1835,8 @@ enum AgentDialogPage {
 struct AuthModal {
     page: AgentDialogPage,
     managing_models: bool,
+    model_scroll: VirtualListScrollHandle,
+    provider_scroll: VirtualListScrollHandle,
     focus: gpui::FocusHandle,
     cwd: PathBuf,
     providers: Vec<agent_auth::Provider>,
@@ -2556,6 +2560,13 @@ struct DiffPreview {
     file_request: u64,
     file_view: Option<ReadOnlyFile>,
     file_only: bool,
+}
+
+struct InlinePatchState {
+    // Keep the inputs alive while their addresses identify this cached rendering.
+    _patch: SharedString,
+    _theme: Arc<HighlightTheme>,
+    diff: Option<project_diff::InlineDiff>,
 }
 
 struct ReadOnlyFile {
@@ -6180,10 +6191,142 @@ impl AppState {
             .into_any_element()
     }
 
+    fn render_inline_patch(
+        &self,
+        pane_id: usize,
+        file: &project_diff::DiffFile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use project_diff::DiffLineKind;
+
+        let tokens = self.tokens(cx);
+        let theme = cx.theme().highlight_theme.clone();
+        let foreground = theme.style.editor_foreground.unwrap_or(tokens.text_primary);
+        let editor_bg = cx.theme().editor_background();
+        let added = if tokens.is_dark {
+            rgba(0x4caf792e)
+        } else {
+            rgba(0x248c5630)
+        };
+        let removed = if tokens.is_dark {
+            rgba(0xe06c7633)
+        } else {
+            rgba(0xc94a5730)
+        };
+        let key = format!(
+            "inline-patch-{pane_id}-{}-{:p}-{:p}",
+            file.path,
+            file.patch.as_ptr(),
+            Arc::as_ptr(&theme)
+        );
+        let state = window.use_keyed_state(key, cx, |_, cx| {
+            let path = file.path.clone();
+            let patch = file.patch.clone();
+            let theme_for_worker = theme.clone();
+            let patch_for_worker = patch.clone();
+            cx.spawn(async move |state, cx| {
+                let diff = cx
+                    .background_executor()
+                    .spawn(async move {
+                        project_diff::InlineDiff::from_patch(
+                            &path,
+                            &patch_for_worker,
+                            &theme_for_worker,
+                        )
+                    })
+                    .await;
+                let _ = state.update(cx, |state: &mut InlinePatchState, cx| {
+                    state.diff = Some(diff);
+                    cx.notify();
+                });
+            })
+            .detach();
+            InlinePatchState {
+                _patch: patch,
+                _theme: theme,
+                diff: None,
+            }
+        });
+        let diff = state.read(cx).diff.as_ref();
+        let mut code = div().flex().flex_col().flex_shrink_0().min_w(relative(1.0));
+        if let Some(diff) = diff {
+            for (index, hunk) in diff.hunks.iter().enumerate() {
+                if index > 0 {
+                    code = code.child(div().h(px(8.0)).bg(tokens.pane_header_bg));
+                }
+                for line in hunk {
+                    code = code.child(
+                        div()
+                            .debug_selector({
+                                let kind = line.kind;
+                                move || match kind {
+                                    DiffLineKind::Context => "inline-diff-context".into(),
+                                    DiffLineKind::Added => "inline-diff-added".into(),
+                                    DiffLineKind::Removed => "inline-diff-removed".into(),
+                                }
+                            })
+                            .h(px(20.0))
+                            .px(px(18.0))
+                            .when(line.kind == DiffLineKind::Added, |row| row.bg(added))
+                            .when(line.kind == DiffLineKind::Removed, |row| row.bg(removed))
+                            .child(
+                                StyledText::new(line.text.clone())
+                                    .with_highlights(line.highlights.iter().cloned()),
+                            ),
+                    );
+                }
+            }
+        }
+        div()
+            .id((
+                SharedString::from(format!("inline-diff-{}", file.path)),
+                pane_id,
+            ))
+            .debug_selector(|| "inline-diff".to_owned())
+            .w_full()
+            .border_t_1()
+            .border_color(tokens.border_subtle)
+            .bg(editor_bg)
+            .child(
+                div()
+                    .id("inline-code")
+                    .w_full()
+                    .overflow_x_scroll()
+                    .font_family(MONO_FONT)
+                    .text_size(px(13.0))
+                    .line_height(px(20.0))
+                    .text_color(foreground)
+                    .whitespace_nowrap()
+                    .child(code),
+            )
+            .when(
+                diff.is_none() || diff.is_some_and(|diff| diff.truncated || diff.hunks.is_empty()),
+                |patch| {
+                    patch.child(
+                        div()
+                            .px(px(12.0))
+                            .py(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(tokens.text_muted)
+                            .child(match diff {
+                                None => "Loading diff…",
+                                Some(diff) if diff.truncated => "Diff preview truncated.",
+                                _ if file.additions.is_none() && file.deletions.is_none() => {
+                                    "Binary file"
+                                }
+                                _ => "No text changes",
+                            }),
+                    )
+                },
+            )
+    }
+
     fn render_project_diff(
         &self,
         pane_id: usize,
         view: &DiffPreview,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(file) = &view.file_view {
@@ -6381,46 +6524,7 @@ impl AppState {
                                     ),
                             );
                         if expanded {
-                            let mut patch = div()
-                                .flex()
-                                .flex_col()
-                                .w_full()
-                                .font_family(MONO_FONT)
-                                .text_size(px(11.0))
-                                .py(px(6.0));
-                            for (line_index, line) in file.patch.lines().take(1500).enumerate() {
-                                let (color, background) =
-                                    if line.starts_with('+') && !line.starts_with("+++") {
-                                        (rgba(0x86efacff), rgba(0x163a2a99))
-                                    } else if line.starts_with('-') && !line.starts_with("---") {
-                                        (rgba(0xfca5a5ff), rgba(0x48212499))
-                                    } else if line.starts_with("@@") {
-                                        (rgba(0x93c5fdff), rgba(0x00000000))
-                                    } else {
-                                        (tokens.text_secondary.into(), rgba(0x00000000))
-                                    };
-                                patch = patch.child(
-                                    div()
-                                        .id((
-                                            "diff-line",
-                                            pane_id * 10000000 + index * 1500 + line_index,
-                                        ))
-                                        .w_full()
-                                        .px(px(10.0))
-                                        .bg(background)
-                                        .text_color(color)
-                                        .child(line.to_owned()),
-                                );
-                            }
-                            if file.patch.lines().count() > 1500 {
-                                patch = patch.child(
-                                    div()
-                                        .px(px(10.0))
-                                        .text_color(tokens.text_secondary)
-                                        .child("Diff truncated after 1,500 lines."),
-                                );
-                            }
-                            card = card.child(patch);
+                            card = card.child(self.render_inline_patch(pane_id, file, window, cx));
                         }
                         content = content.child(card);
                     }
@@ -7454,6 +7558,8 @@ impl AppState {
         let mut auth = AuthModal {
             page,
             managing_models: false,
+            model_scroll: VirtualListScrollHandle::new(),
+            provider_scroll: VirtualListScrollHandle::new(),
             focus,
             cwd,
             providers: Vec::new(),
@@ -11328,6 +11434,7 @@ impl AppState {
                     &b.id,
                 ))
         });
+        // Store lightweight row data; construct GPUI elements only for the visible range.
         let mut rows = Vec::new();
         let mut last_group: Option<String> = None;
         for (index, model) in models.into_iter().enumerate() {
@@ -11339,135 +11446,183 @@ impl AppState {
             };
             if last_group.as_ref() != Some(&group) {
                 last_group = Some(group.clone());
-                rows.push(
-                    div()
-                        .px(px(20.0))
-                        .pt(px(12.0))
-                        .pb(px(6.0))
-                        .text_size(px(12.0))
-                        .text_color(muted)
-                        .child(group)
-                        .into_any_element(),
-                );
+                rows.push((Some(group), None));
             }
-            let choice = model.clone();
-            let is_free = model.id.ends_with(":free") || model.id.ends_with("-free");
-            let managing = auth.managing_models;
-            let visible = self.settings.enabled_agent_models.contains(model);
-            rows.push(
-                div()
-                    .id(("agent-model", index))
-                    .debug_selector(move || format!("agent-model-{index}"))
-                    .mx(px(8.0))
-                    .h(px(38.0))
-                    .flex_shrink_0()
-                    .px(px(12.0))
-                    .rounded(px(6.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(8.0))
-                    .text_size(px(14.0))
-                    .text_color(foreground)
-                    .when(is_selected && !managing, |row| row.bg(inset))
-                    .cursor(CursorStyle::PointingHand)
-                    .hover(move |row| row.bg(inset))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .items_center()
-                            .gap(px(10.0))
-                            .min_w_0()
-                            .child(
-                                svg()
-                                    .path(provider_icon_path(&model.provider))
-                                    .size(px(16.0))
-                                    .flex_shrink_0()
-                                    .text_color(foreground),
-                            )
-                            .child(
-                                div().truncate().child(
-                                    model
-                                        .id
-                                        .trim_end_matches(":free")
-                                        .trim_end_matches("-free")
-                                        .to_string(),
-                                ),
-                            )
-                            .when(is_selected && !managing, |row| {
-                                row.child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .text_size(px(12.0))
-                                        .text_color(muted)
-                                        .child(provider_display_name(&model.provider)),
-                                )
-                            }),
-                    )
-                    .when(is_free, |row| {
-                        row.child(
-                            div()
-                                .px(px(6.0))
-                                .rounded(px(4.0))
-                                .bg(card)
-                                .text_size(px(11.0))
-                                .text_color(muted)
-                                .child("Free"),
-                        )
-                    })
-                    .when(managing, |row| {
-                        row.child(
-                            div()
-                                .debug_selector(move || format!("agent-model-toggle-{index}"))
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .text_size(px(11.0))
-                                .text_color(muted)
-                                .child(if visible { "On" } else { "Off" })
-                                .child(
-                                    div()
-                                        .w(px(30.0))
-                                        .h(px(18.0))
-                                        .p(px(2.0))
-                                        .rounded_full()
-                                        .flex()
-                                        .items_center()
-                                        .when(visible, |track| track.justify_end())
-                                        .bg(if visible {
-                                            tokens.pill_active_bg
-                                        } else {
-                                            tokens.pill_inactive_bg
-                                        })
-                                        .child(div().size(px(14.0)).rounded_full().bg(foreground)),
-                                ),
-                        )
-                    })
-                    .when(is_selected && !managing, |row| {
-                        row.child(
-                            svg()
-                                .path("icons/status-check.svg")
-                                .size(px(12.0))
-                                .text_color(foreground),
-                        )
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if managing {
-                                this.toggle_model_visibility(&choice, cx);
-                            } else {
-                                this.select_agent_model(pane_id, Some(choice.clone()), window, cx);
-                            }
-                        }),
-                    )
-                    .into_any_element(),
-            );
+            rows.push((
+                None,
+                Some((
+                    index,
+                    model.clone(),
+                    is_selected,
+                    self.settings.enabled_agent_models.contains(model),
+                )),
+            ));
         }
         let loading = auth.discovery.is_some() || auth.model_discovery.is_some();
         let empty = rows.is_empty();
+        let model_height: f32 = rows
+            .iter()
+            .map(|(group, _)| if group.is_some() { 36.0 } else { 38.0 })
+            .sum();
+        let item_sizes = Rc::new(
+            rows.iter()
+                .map(|(group, _)| size(px(0.0), px(if group.is_some() { 36.0 } else { 38.0 })))
+                .collect(),
+        );
+        let managing = auth.managing_models;
+        let model_list = v_virtual_list(
+            cx.entity(),
+            ("agent-model-list", pane_id),
+            item_sizes,
+            move |_, range, _, cx| {
+                range
+                    .map(|row_index| {
+                        let (group, model) = &rows[row_index];
+                        if let Some(group) = group {
+                            return div()
+                                .w_full()
+                                .h(px(36.0))
+                                .px(px(20.0))
+                                .pt(px(12.0))
+                                .pb(px(6.0))
+                                .text_size(px(12.0))
+                                .text_color(muted)
+                                .child(group.clone())
+                                .into_any_element();
+                        }
+                        let (index, model, is_selected, visible) = model.as_ref().unwrap();
+                        let index = *index;
+                        let is_selected = *is_selected;
+                        let visible = *visible;
+                        let choice = model.clone();
+                        let is_free = model.id.ends_with(":free") || model.id.ends_with("-free");
+                        div()
+                            .id(("agent-model", index))
+                            .w_full()
+                            .debug_selector(move || format!("agent-model-{index}"))
+                            .mx(px(8.0))
+                            .h(px(38.0))
+                            .flex_shrink_0()
+                            .px(px(12.0))
+                            .rounded(px(6.0))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .text_size(px(14.0))
+                            .text_color(foreground)
+                            .when(is_selected && !managing, |row| row.bg(inset))
+                            .cursor(CursorStyle::PointingHand)
+                            .hover(move |row| row.bg(inset))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .min_w_0()
+                                    .child(
+                                        svg()
+                                            .path(provider_icon_path(&model.provider))
+                                            .size(px(16.0))
+                                            .flex_shrink_0()
+                                            .text_color(foreground),
+                                    )
+                                    .child(
+                                        div().truncate().child(
+                                            model
+                                                .id
+                                                .trim_end_matches(":free")
+                                                .trim_end_matches("-free")
+                                                .to_string(),
+                                        ),
+                                    )
+                                    .when(is_selected && !managing, |row| {
+                                        row.child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .text_size(px(12.0))
+                                                .text_color(muted)
+                                                .child(provider_display_name(&model.provider)),
+                                        )
+                                    }),
+                            )
+                            .when(is_free, |row| {
+                                row.child(
+                                    div()
+                                        .px(px(6.0))
+                                        .rounded(px(4.0))
+                                        .bg(card)
+                                        .text_size(px(11.0))
+                                        .text_color(muted)
+                                        .child("Free"),
+                                )
+                            })
+                            .when(managing, |row| {
+                                row.child(
+                                    div()
+                                        .debug_selector(move || {
+                                            format!("agent-model-toggle-{index}")
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .text_size(px(11.0))
+                                        .text_color(muted)
+                                        .child(if visible { "On" } else { "Off" })
+                                        .child(
+                                            div()
+                                                .w(px(30.0))
+                                                .h(px(18.0))
+                                                .p(px(2.0))
+                                                .rounded_full()
+                                                .flex()
+                                                .items_center()
+                                                .when(visible, |track| track.justify_end())
+                                                .bg(if visible {
+                                                    tokens.pill_active_bg
+                                                } else {
+                                                    tokens.pill_inactive_bg
+                                                })
+                                                .child(
+                                                    div()
+                                                        .size(px(14.0))
+                                                        .rounded_full()
+                                                        .bg(foreground),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .when(is_selected && !managing, |row| {
+                                row.child(
+                                    svg()
+                                        .path("icons/status-check.svg")
+                                        .size(px(12.0))
+                                        .text_color(foreground),
+                                )
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if managing {
+                                        this.toggle_model_visibility(&choice, cx);
+                                    } else {
+                                        this.select_agent_model(
+                                            pane_id,
+                                            Some(choice.clone()),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            },
+        )
+        .track_scroll(&auth.model_scroll);
         let featured = [
             ("openai", "OpenAI", ""),
             ("anthropic", "Anthropic", ""),
@@ -11645,11 +11800,20 @@ impl AppState {
                     .min_h_0()
                     .max_h(px(488.0))
                     .flex_1()
-                    .overflow_y_scrollbar()
                     .flex()
                     .flex_col()
                     .pb(px(12.0))
-                    .children(rows)
+                    .when(!empty, |view| {
+                        view.child(
+                            div()
+                                .relative()
+                                .w_full()
+                                .h(px(model_height.min(488.0)))
+                                .min_h_0()
+                                .child(model_list)
+                                .child(KitScrollbar::vertical(&auth.model_scroll)),
+                        )
+                    })
                     .when(empty, |view| {
                         view.child(div().px(px(20.0)).py(px(24.0)).text_color(muted).child(
                             if loading {
@@ -11822,82 +11986,107 @@ impl AppState {
             })
             .collect();
 
-        let mut card_rows = Vec::new();
-        for pair in card_items.chunks(2) {
-            let row_has_description = pair.iter().any(|item| !item.description.is_empty());
-            let row_height = if row_has_description { 58.0 } else { 40.0 };
-            let is_single = pair.len() == 1;
+        let has_matching_providers = !card_items.is_empty();
+        let provider_sizes: Vec<_> = card_items
+            .chunks(2)
+            .map(|pair| {
+                let height = if pair.iter().any(|item| !item.description.is_empty()) {
+                    58.0
+                } else {
+                    40.0
+                };
+                size(px(0.0), px(height + 8.0))
+            })
+            .collect();
+        let provider_height: f32 = provider_sizes
+            .iter()
+            .map(|size| f32::from(size.height))
+            .sum();
+        let provider_list =
+            v_virtual_list(
+                cx.entity(),
+                ("auth-provider-list", pane_id),
+                Rc::new(provider_sizes),
+                move |_, range, _, cx| {
+                    range
+                        .map(|row_index| {
+                            let pair = &card_items
+                                [row_index * 2..(row_index * 2 + 2).min(card_items.len())];
+                            let row_has_description =
+                                pair.iter().any(|item| !item.description.is_empty());
+                            let row_height = if row_has_description { 58.0 } else { 40.0 };
+                            let is_single = pair.len() == 1;
 
-            let mut row_children = Vec::new();
-            for item in pair {
-                let index = item.index;
-                let id = item.id.clone();
-                let name = item.name.clone();
-                let description = item.description.clone();
-                let described = !description.is_empty();
-                let ready = item.ready;
-                let selected = item.selected;
-                let icon = provider_icon_path(&id);
+                            let mut row_children = Vec::new();
+                            for item in pair {
+                                let index = item.index;
+                                let id = item.id.clone();
+                                let name = item.name.clone();
+                                let description = item.description.clone();
+                                let described = !description.is_empty();
+                                let ready = item.ready;
+                                let selected = item.selected;
+                                let icon = provider_icon_path(&id);
 
-                row_children.push(
-                    div()
-                        .id(("auth-provider", index))
-                        .debug_selector(move || format!("auth-provider-{index}"))
-                        .flex_1()
-                        .min_w_0()
-                        .h(px(row_height))
-                        .px(px(12.0))
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(if selected { tokens.ring } else { border })
-                        .bg(if selected { inset } else { card })
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .cursor(CursorStyle::PointingHand)
-                        .hover(move |view| {
-                            if !selected {
-                                view.bg(background)
-                            } else {
-                                view.bg(inset)
-                            }
-                        })
-                        .child(
-                            svg()
-                                .path(icon)
-                                .size(px(16.0))
-                                .flex_shrink_0()
-                                .text_color(foreground),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .justify_center()
-                                .gap(px(1.0))
-                                .child(
+                                row_children.push(
                                     div()
-                                        .truncate()
-                                        .text_size(px(13.0))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(foreground)
-                                        .child(name),
-                                )
-                                .when(described, |view| {
-                                    view.child(
-                                        div()
-                                            .truncate()
-                                            .text_size(px(12.0))
-                                            .text_color(muted)
-                                            .child(description),
-                                    )
-                                }),
-                        )
-                        .when(ready, |view| {
-                            let disconnect_id = id.clone();
-                            view.child(
+                                        .id(("auth-provider", index))
+                                        .debug_selector(move || format!("auth-provider-{index}"))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .h(px(row_height))
+                                        .px(px(12.0))
+                                        .rounded(px(6.0))
+                                        .border_1()
+                                        .border_color(if selected { tokens.ring } else { border })
+                                        .bg(if selected { inset } else { card })
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .cursor(CursorStyle::PointingHand)
+                                        .hover(move |view| {
+                                            if !selected {
+                                                view.bg(background)
+                                            } else {
+                                                view.bg(inset)
+                                            }
+                                        })
+                                        .child(
+                                            svg()
+                                                .path(icon)
+                                                .size(px(16.0))
+                                                .flex_shrink_0()
+                                                .text_color(foreground),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .flex_col()
+                                                .justify_center()
+                                                .gap(px(1.0))
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_size(px(13.0))
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .text_color(foreground)
+                                                        .child(name),
+                                                )
+                                                .when(described, |view| {
+                                                    view.child(
+                                                        div()
+                                                            .truncate()
+                                                            .text_size(px(12.0))
+                                                            .text_color(muted)
+                                                            .child(description),
+                                                    )
+                                                }),
+                                        )
+                                        .when(ready, |view| {
+                                            let disconnect_id = id.clone();
+                                            view.child(
                                 div()
                                     .flex()
                                     .items_center()
@@ -11957,37 +12146,51 @@ impl AppState {
                                             ),
                                     ),
                             )
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                if ready {
-                                    this.set_agent_dialog_page(
-                                        pane_id,
-                                        AgentDialogPage::Models,
-                                        window,
-                                        cx,
-                                    );
-                                } else {
-                                    this.select_provider_for_auth(pane_id, id.clone(), window, cx);
-                                }
-                            }),
-                        ),
-                );
-            }
-            if is_single {
-                row_children.push(
-                    div()
-                        .id(("auth-provider-spacer", pair[0].index))
-                        .flex_1()
-                        .min_w_0(),
-                );
-            }
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                if ready {
+                                                    this.set_agent_dialog_page(
+                                                        pane_id,
+                                                        AgentDialogPage::Models,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                } else {
+                                                    this.select_provider_for_auth(
+                                                        pane_id,
+                                                        id.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }
+                                            }),
+                                        ),
+                                );
+                            }
+                            if is_single {
+                                row_children.push(
+                                    div()
+                                        .id(("auth-provider-spacer", pair[0].index))
+                                        .flex_1()
+                                        .min_w_0(),
+                                );
+                            }
 
-            card_rows.push(div().flex().gap(px(8.0)).children(row_children));
-        }
-        let has_matching_providers = !card_items.is_empty();
+                            div()
+                                .w_full()
+                                .h(px(row_height + 8.0))
+                                .pb(px(8.0))
+                                .flex()
+                                .gap(px(8.0))
+                                .children(row_children)
+                        })
+                        .collect::<Vec<_>>()
+                },
+            )
+            .track_scroll(&auth.provider_scroll);
         div()
             .id(("agent-auth-content", pane_id))
             .flex().flex_col().flex_1().min_h_0().overflow_hidden()
@@ -12052,12 +12255,10 @@ impl AppState {
                                     .child(
                                         div()
                                             .id(("auth-providers", pane_id))
-                                            .max_h(if auth.selected.is_some() { px(180.0) } else { px(320.0) })
-                                            .overflow_y_scrollbar()
-                                            .flex()
-                                            .flex_col()
-                                            .gap(px(8.0))
-                                            .children(card_rows),
+                                            .relative()
+                                            .h(px(provider_height.min(if auth.selected.is_some() { 180.0 } else { 320.0 })))
+                                            .child(provider_list)
+                                            .child(KitScrollbar::vertical(&auth.provider_scroll)),
                                     )
                                     .when(
                                         !filter_query.is_empty()
@@ -13807,7 +14008,7 @@ impl AppState {
                         }),
                     )
                     .child(if let Some(view) = &pane.diff_preview {
-                        self.render_project_diff(pane_id, view, cx)
+                        self.render_project_diff(pane_id, view, window, cx)
                     } else if let Some((_, html)) = &pane.markdown_preview {
                         div()
                             .id(("markdown-preview", pane_id))
@@ -18681,7 +18882,7 @@ mod pane_tests {
                         path: "example.rs".into(),
                         additions: Some(1),
                         deletions: Some(1),
-                        patch: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                        patch: "@@ -1,2 +1,2 @@\n fn main() {}\n-old\n+new\n".into(),
                     },
                     project_diff::DiffFile {
                         group: project_diff::FileGroup::Untracked,
@@ -18694,6 +18895,19 @@ mod pane_tests {
             }));
         });
         cx.draw_frame().expect("diff preview draws");
+        cx.run_until_parked();
+        cx.draw_frame().expect("highlighted diff preview draws");
+        let patch = cx.debug_bounds("inline-diff").expect("inline patch");
+        let context = cx
+            .debug_bounds("inline-diff-context")
+            .expect("context line");
+        let removed = cx
+            .debug_bounds("inline-diff-removed")
+            .expect("removed line");
+        let added = cx.debug_bounds("inline-diff-added").expect("added line");
+        assert_eq!(removed.origin.y, context.origin.y + context.size.height);
+        assert_eq!(added.origin.y, removed.origin.y + removed.size.height);
+        assert!(added.size.width >= patch.size.width - px(1.0));
         let section = cx
             .debug_bounds("project-diff-section-Untracked")
             .expect("untracked section");

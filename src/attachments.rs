@@ -1,4 +1,4 @@
-//! Image attachments for the Kathamo bottom input bar.
+//! File attachments for the Kathamo bottom input bar.
 //!
 //! Attachments are kept as files on disk (dropped files keep their original
 //! path, clipboard images are written to a session temp directory) so the
@@ -12,44 +12,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{Image, ImageFormat};
 
-/// Never keep more than this many attachments on one input bar.
-pub const MAX_ATTACHMENTS: usize = 8;
-
-/// Reject files larger than this; agents choke on giant prompts.
-const MAX_IMAGE_BYTES: u64 = 40 * 1024 * 1024;
-
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// One image attached to a pane's input bar.
+/// One file attached to a pane's input bar.
 #[derive(Clone, Debug)]
-pub struct AttachedImage {
+pub struct AttachedFile {
     pub path: PathBuf,
     pub name: String,
+    pub is_image: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
 }
 
-impl AttachedImage {
+impl AttachedFile {
     pub fn dimensions(&self) -> Option<(u32, u32)> {
         Some((self.width?, self.height?))
     }
 }
 
-/// Build an attachment from a path on disk, validating that it really is an
-/// image (magic bytes win over the extension, so screenshots saved without an
-/// extension still work).
-pub fn from_path(path: &Path) -> Option<AttachedImage> {
+/// Build an attachment for any regular file on disk.
+pub fn from_path(path: &Path) -> Option<AttachedFile> {
     let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_IMAGE_BYTES {
+    if !metadata.is_file() {
         return None;
     }
 
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let dimensions = probe_dimensions(&path)?;
+    let image_dimensions = probe_dimensions(&path);
+    let is_image = image_dimensions.is_some();
+    let dimensions = image_dimensions.flatten();
 
-    Some(AttachedImage {
+    Some(AttachedFile {
         name: file_name(&path),
         path,
+        is_image,
         width: dimensions.map(|(width, _)| width),
         height: dimensions.map(|(_, height)| height),
     })
@@ -57,7 +53,7 @@ pub fn from_path(path: &Path) -> Option<AttachedImage> {
 
 /// Persist a clipboard image into the attachment directory and return it as
 /// an attachment.
-pub fn from_clipboard_image(image: &Image) -> Option<AttachedImage> {
+pub fn from_clipboard_image(image: &Image) -> Option<AttachedFile> {
     let extension = extension_for(image.format);
     let directory = attachment_directory();
     let stamp = SystemTime::now()
@@ -73,12 +69,9 @@ pub fn from_clipboard_image(image: &Image) -> Option<AttachedImage> {
     Some(attachment)
 }
 
-/// Add an attachment to the list unless it is already there or the list is
-/// full. Returns whether it was added.
-pub fn push_unique(attachments: &mut Vec<AttachedImage>, attachment: AttachedImage) -> bool {
-    if attachments.len() >= MAX_ATTACHMENTS {
-        return false;
-    }
+/// Add an attachment to the list unless it is
+/// already present. Returns whether it was added.
+pub fn push_unique(attachments: &mut Vec<AttachedFile>, attachment: AttachedFile) -> bool {
     if attachments
         .iter()
         .any(|existing| existing.path == attachment.path)
@@ -96,11 +89,11 @@ pub fn prompt_path(path: &Path) -> String {
     quote_path(path)
 }
 
-/// Interpret pasted text as one or more local image paths. File managers and
+/// Interpret pasted text as one or more local file paths. File managers and
 /// screenshot tools often put a plain path (or a `file://` URI) on the
 /// clipboard instead of pixel data; treating it as an attachment avoids
 /// pasting a path where an image was meant.
-pub fn from_clipboard_text(text: &str) -> Vec<AttachedImage> {
+pub fn from_clipboard_text(text: &str) -> Vec<AttachedFile> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -121,14 +114,14 @@ pub fn from_clipboard_text(text: &str) -> Vec<AttachedImage> {
         }
     }
 
-    let mut unique: Vec<AttachedImage> = Vec::new();
+    let mut unique: Vec<AttachedFile> = Vec::new();
     for attachment in attachments {
         push_unique(&mut unique, attachment);
     }
     unique
 }
 
-fn attachment_from_token(token: &str) -> Option<AttachedImage> {
+fn attachment_from_token(token: &str) -> Option<AttachedFile> {
     let token = token.trim();
     let token = token
         .strip_prefix("file://")
@@ -141,38 +134,6 @@ fn attachment_from_token(token: &str) -> Option<AttachedImage> {
     }
 
     from_path(Path::new(&percent_decode(&token)))
-}
-
-/// Cheap check used by drag-hover styling and the drop predicate: either a
-/// known image extension or a recognizable image header.
-pub fn looks_like_image(path: &Path) -> bool {
-    has_image_extension(path) || has_image_magic(path)
-}
-
-fn has_image_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tif" | "tiff" | "svg"
-            )
-        })
-}
-
-fn has_image_magic(path: &Path) -> bool {
-    let Some(header) = read_header(path) else {
-        return false;
-    };
-
-    header.starts_with(b"\x89PNG\r\n\x1a\n")
-        || header.starts_with(b"\xff\xd8\xff")
-        || header.starts_with(b"GIF8")
-        || (header.starts_with(b"RIFF") && header.get(8..12) == Some(b"WEBP"))
-        || header.starts_with(b"BM")
-        || header.starts_with(b"II*\0")
-        || header.starts_with(b"MM\0*")
-        || has_svg_tag(&header)
 }
 
 fn read_header(path: &Path) -> Option<Vec<u8>> {
@@ -238,10 +199,19 @@ fn is_svg(path: &Path) -> bool {
 
 fn quote_path(path: &Path) -> String {
     let path = path.display().to_string();
-    if path.chars().any(char::is_whitespace) {
-        format!("\"{path}\"")
-    } else {
+    if path
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c))
+    {
         path
+    } else {
+        format!(
+            "\"{}\"",
+            path.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('$', "\\$")
+                .replace('`', "\\`")
+        )
     }
 }
 
@@ -310,19 +280,18 @@ mod tests {
         let path = temp_path("screenshot");
         write_png(&path, 1, 1);
 
-        assert!(looks_like_image(&path));
         assert!(from_path(&path).is_some());
 
         std::fs::remove_file(path).ok();
     }
 
     #[test]
-    fn rejects_non_image_files() {
+    fn accepts_non_image_files() {
         let path = temp_path("notes.txt");
         std::fs::write(&path, b"not an image").unwrap();
 
-        assert!(!looks_like_image(&path));
-        assert!(from_path(&path).is_none());
+        let attachment = from_path(&path).expect("file should be accepted");
+        assert!(!attachment.is_image);
 
         std::fs::remove_file(path).ok();
     }
@@ -352,10 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn push_unique_dedupes_and_caps_the_list() {
-        let make = |index: usize| AttachedImage {
+    fn push_unique_dedupes_the_list() {
+        let make = |index: usize| AttachedFile {
             path: PathBuf::from(format!("/tmp/{index}.png")),
             name: String::new(),
+            is_image: false,
             width: None,
             height: None,
         };
@@ -363,10 +333,9 @@ mod tests {
         let mut attachments = Vec::new();
         assert!(push_unique(&mut attachments, make(0)));
         assert!(!push_unique(&mut attachments, make(0)));
-        for index in 1..MAX_ATTACHMENTS {
+        for index in 1..12 {
             assert!(push_unique(&mut attachments, make(index)));
         }
-        assert!(!push_unique(&mut attachments, make(MAX_ATTACHMENTS)));
-        assert_eq!(attachments.len(), MAX_ATTACHMENTS);
+        assert_eq!(attachments.len(), 12);
     }
 }

@@ -1708,8 +1708,12 @@ fn is_task_list_event(event: &agent_bridge::AgentEvent) -> bool {
 
 fn task_list_update(event: &agent_bridge::AgentEvent) -> Option<rpi_embedded::task_list::TaskList> {
     match event {
-        agent_bridge::AgentEvent::ToolEnd { name, output, failed: false, .. }
-            if name == rpi_embedded::task_list::NAME => serde_json::from_str(output).ok(),
+        agent_bridge::AgentEvent::ToolEnd {
+            name,
+            output,
+            failed: false,
+            ..
+        } if name == rpi_embedded::task_list::NAME => serde_json::from_str(output).ok(),
         _ => None,
     }
 }
@@ -2730,9 +2734,9 @@ pub struct TerminalPane {
     pub completion_menu: Option<CompletionMenuState>,
     pub bottom_input_visible: bool,
     pub plus_menu_open: bool,
-    /// Images staged in the input bar; dropped, pasted, or picked. They are
+    /// Files staged in the input bar; dropped, pasted, or picked. They are
     /// sent to the agent as file paths when the prompt is submitted.
-    pub attachments: Vec<attachments::AttachedImage>,
+    pub attachments: Vec<attachments::AttachedFile>,
     /// True while the shell reports a command owns the terminal.
     pub command_running: bool,
     /// Keeps the terminal's `ShellEvent` subscription alive for this pane.
@@ -9347,12 +9351,12 @@ impl AppState {
         self.focus_pane(pane_id, window, cx);
     }
 
-    /// Stage one image on a pane's input bar and reveal the bar so the user
+    /// Stage one file on a pane's input bar and focus it so the user
     /// can see what will be sent.
     fn attach_image(
         &mut self,
         pane_id: usize,
-        attachment: attachments::AttachedImage,
+        attachment: attachments::AttachedFile,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -9434,9 +9438,8 @@ impl AppState {
         attached
     }
 
-    /// Handle files dropped anywhere on the window. Only image files are
-    /// consumed; everything else falls through to the platform.
-    fn drop_external_images(
+    /// Stage files dropped anywhere in the window on the active pane.
+    fn drop_external_files(
         &mut self,
         paths: &ExternalPaths,
         window: &mut Window,
@@ -9450,6 +9453,16 @@ impl AppState {
             return false;
         };
 
+        self.drop_external_files_on_pane(pane_id, paths, window, cx)
+    }
+
+    fn drop_external_files_on_pane(
+        &mut self,
+        pane_id: usize,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let mut attached = false;
         for path in paths.paths() {
             if let Some(attachment) = attachments::from_path(path) {
@@ -9470,7 +9483,7 @@ impl AppState {
 
     fn open_image_viewer(
         &mut self,
-        attachment: &attachments::AttachedImage,
+        attachment: &attachments::AttachedFile,
         cx: &mut Context<Self>,
     ) {
         self.image_viewer = Some(ImageViewerState {
@@ -10281,6 +10294,9 @@ impl AppState {
             .enumerate()
             .map(|(index, attachment)| {
                 let image_path = attachment.path.clone();
+                let is_image = attachment.is_image;
+                let name = attachment.name.clone();
+                let icon = file_icons::icon_for_path(&image_path.to_string_lossy());
                 let attachment = attachment.clone();
 
                 div()
@@ -10300,10 +10316,30 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
-                            this.open_image_viewer(&attachment, cx);
+                            if attachment.is_image {
+                                this.open_image_viewer(&attachment, cx);
+                            }
                         }),
                     )
-                    .child(img(image_path).size_full().object_fit(ObjectFit::Cover))
+                    .when(is_image, |this| {
+                        this.child(img(image_path).size_full().object_fit(ObjectFit::Cover))
+                    })
+                    .when(!is_image, |this| {
+                        this.flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(2.0))
+                            .child(svg().path(icon).size(px(22.0)))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .px(px(2.0))
+                                    .text_size(px(9.0))
+                                    .overflow_hidden()
+                                    .child(name),
+                            )
+                    })
                     .child(
                         div()
                             .id(SharedString::from(format!(
@@ -10926,12 +10962,12 @@ impl AppState {
                     paths
                         .paths()
                         .iter()
-                        .any(|path| attachments::looks_like_image(path))
+                        .any(|path| path.is_file())
                 })
             })
             .on_drop::<ExternalPaths>(cx.listener(
                 move |this, paths: &ExternalPaths, window, cx| {
-                    this.drop_external_images(paths, window, cx);
+                    this.drop_external_files_on_pane(pane_id, paths, window, cx);
                 },
             ))
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
@@ -16844,15 +16880,12 @@ impl Render for AppState {
                 }
             }))
             .can_drop(|value, _, _| {
-                value.downcast_ref::<ExternalPaths>().is_some_and(|paths| {
-                    paths
-                        .paths()
-                        .iter()
-                        .any(|path| attachments::looks_like_image(path))
-                })
+                value
+                    .downcast_ref::<ExternalPaths>()
+                    .is_some_and(|paths| paths.paths().iter().any(|path| path.is_file()))
             })
             .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.drop_external_images(paths, window, cx);
+                this.drop_external_files(paths, window, cx);
             }))
             .when(self.sidebar_visible, |this| {
                 // Clamp on the way out too: a window that shrank since the
@@ -18103,8 +18136,10 @@ mod resize_tests {
             let chat = &mut pane.chat;
             chat.active = true;
             chat.running = true;
-            chat.messages
-                .push(Arc::new(ChatMessage::new(ChatRole::User, "Prepare a report".into())));
+            chat.messages.push(Arc::new(ChatMessage::new(
+                ChatRole::User,
+                "Prepare a report".into(),
+            )));
             AppState::apply_task_list(
                 pane,
                 task_list_update(&report("in_progress", "pending")).unwrap(),
@@ -18136,7 +18171,8 @@ mod resize_tests {
         assert!(cx.debug_bounds("agent-task-completed").is_some());
         assert!(cx.debug_bounds("agent-task-running").is_none());
 
-        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY);
+        cx.background_executor
+            .advance_clock(TASK_LIST_COMPLETION_DELAY);
         cx.run_until_parked();
         cx.draw_frame().unwrap();
         assert!(cx.debug_bounds("agent-task-list").is_some());
@@ -18153,14 +18189,16 @@ mod resize_tests {
         cx.draw_frame().unwrap();
         assert!(cx.debug_bounds("agent-task-completed").is_some());
 
-        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY / 2);
+        cx.background_executor
+            .advance_clock(TASK_LIST_COMPLETION_DELAY / 2);
         cx.run_until_parked();
         cx.update_window_entity(&state, |s, _, cx| {
             let pane = &mut s.projects[0].sessions[0].panes[0];
             let complete = task_list_update(&report("completed", "completed")).unwrap();
             assert!(!AppState::apply_task_list(pane, complete, cx));
         });
-        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY / 2);
+        cx.background_executor
+            .advance_clock(TASK_LIST_COMPLETION_DELAY / 2);
         cx.run_until_parked();
         cx.draw_frame().unwrap();
         assert!(cx.debug_bounds("agent-task-list").is_none());
@@ -18180,7 +18218,8 @@ mod resize_tests {
             }
             cx.notify();
         });
-        cx.background_executor.advance_clock(TASK_LIST_COMPLETION_DELAY);
+        cx.background_executor
+            .advance_clock(TASK_LIST_COMPLETION_DELAY);
         cx.run_until_parked();
         cx.draw_frame().unwrap();
         assert!(cx.debug_bounds("agent-task-list").is_some());

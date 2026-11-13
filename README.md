@@ -92,6 +92,8 @@ library styles and colors defined directly in views are not yet configurable.
 
 The data folder holds `workspace.json` (projects, tabs, split layout, cwd), `sessions/` (per-pane terminal output), `conversations/` (agent transcripts), and `backups/`. Manage or clear it from **Settings → Data & Sessions**, or override the location with `KATHAMO_DATA_DIR=/absolute/path`. Set `KATHAMO_DISABLE_RESTORE=1` for a clean launch without reading saved state.
 
+Deleting a sidebar session removes its saved workspace entry, pane scrollback, and Kathamo conversation transcripts. Embedded rpi and other command-line agents can keep separate session histories outside the Kathamo data folder; deleting the sidebar session does not currently remove those files.
+
 Processes are not resurrected: a restored pane starts a fresh shell in the saved working directory with the previous output shown above the new prompt.
 
 ---

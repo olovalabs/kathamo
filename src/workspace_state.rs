@@ -589,6 +589,130 @@ pub fn prune_stale_scrollbacks(live_uids: &HashSet<String>) {
     prune_stale_scrollbacks_in(&paths::sessions_dir(), live_uids);
 }
 
+/// A deletion intent remains on disk until the workspace and pane files have
+/// both been updated. It is replayed before restoring a workspace after a crash.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingDeletion {
+    pub session_uid: String,
+    pub pane_uids: Vec<String>,
+}
+
+fn safe_uid(uid: &str) -> bool {
+    !uid.is_empty()
+        && uid
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+fn deletions_dir() -> PathBuf {
+    paths::data_dir().join("pending-deletions")
+}
+
+pub fn record_deletion(deletion: &PendingDeletion) -> io::Result<PathBuf> {
+    if !safe_uid(&deletion.session_uid) || deletion.pane_uids.iter().any(|uid| !safe_uid(uid)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid session or pane identifier",
+        ));
+    }
+    let dir = deletions_dir();
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", deletion.session_uid));
+    let temp = path.with_extension("tmp");
+    fs::write(
+        &temp,
+        serde_json::to_vec(deletion).map_err(io::Error::other)?,
+    )?;
+    paths::atomic_replace(&temp, &path)?;
+    Ok(path)
+}
+
+pub fn finish_deletion(path: &Path, deletion: &PendingDeletion) -> io::Result<()> {
+    for uid in &deletion.pane_uids {
+        if !safe_uid(uid) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid pane identifier",
+            ));
+        }
+        crate::conversations::delete_pane(uid)?;
+        match fs::remove_file(scrollback_path_in(&paths::sessions_dir(), uid)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    fs::remove_file(path)
+}
+
+/// Replay pending deletions against the saved workspace before loading it.
+pub fn retry_pending_deletions(workspace_path: &Path) -> io::Result<()> {
+    let entries = match fs::read_dir(deletions_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let deletion: PendingDeletion =
+            serde_json::from_slice(&fs::read(&path)?).map_err(io::Error::other)?;
+        if !safe_uid(&deletion.session_uid) || deletion.pane_uids.iter().any(|uid| !safe_uid(uid)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid pending deletion",
+            ));
+        }
+        if workspace_path.exists() {
+            let text = fs::read_to_string(workspace_path)?;
+            let value: serde_json::Value = serde_json::from_str(&text).map_err(io::Error::other)?;
+            if value.get("version").and_then(|v| v.as_u64()).unwrap_or(1)
+                >= u64::from(CURRENT_VERSION)
+            {
+                let mut workspace: SavedWorkspace =
+                    serde_json::from_value(value).map_err(io::Error::other)?;
+                for project in &mut workspace.projects {
+                    project
+                        .sessions
+                        .retain(|session| session.uid != deletion.session_uid);
+                    project.active_session = project
+                        .active_session
+                        .min(project.sessions.len().saturating_sub(1));
+                }
+                save_atomic(workspace_path, &workspace)?;
+            }
+        }
+        finish_deletion(&path, &deletion)?;
+    }
+    Ok(())
+}
+
+pub fn hide_pending_deletions(workspace: &mut SavedWorkspace) -> io::Result<()> {
+    let entries = match fs::read_dir(deletions_dir()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let deletion: PendingDeletion =
+            serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
+        for project in &mut workspace.projects {
+            project
+                .sessions
+                .retain(|session| session.uid != deletion.session_uid);
+            project.active_session = project
+                .active_session
+                .min(project.sessions.len().saturating_sub(1));
+        }
+    }
+    Ok(())
+}
+
 fn prune_stale_scrollbacks_in(dir: &Path, live_uids: &HashSet<String>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;

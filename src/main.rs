@@ -5232,12 +5232,45 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(project) = self.projects.get_mut(project_idx) else {
+        let Some(project) = self.projects.get(project_idx) else {
             return;
         };
         if session_idx >= project.sessions.len() {
             return;
         }
+        let session = &project.sessions[session_idx];
+        let live_pane_uids: HashSet<&str> = self
+            .projects
+            .iter()
+            .enumerate()
+            .flat_map(|(p, project)| {
+                project
+                    .sessions
+                    .iter()
+                    .enumerate()
+                    .filter(move |(s, _)| p != project_idx || *s != session_idx)
+                    .flat_map(|(_, session)| session.panes.iter().map(|pane| pane.uid.as_str()))
+            })
+            .collect();
+        let deletion = workspace_state::PendingDeletion {
+            session_uid: session.uid.clone(),
+            pane_uids: session
+                .panes
+                .iter()
+                .filter(|pane| !live_pane_uids.contains(pane.uid.as_str()))
+                .map(|pane| pane.uid.clone())
+                .collect(),
+        };
+        let deletion_path = match workspace_state::record_deletion(&deletion) {
+            Ok(path) => path,
+            Err(error) => {
+                window.push_notification(Notification::new().title("Could not delete session")
+                    .message(format!("Could not record deletion: {error}. Check the data folder permissions and try again."))
+                    .with_type(NotificationType::Error), cx);
+                return;
+            }
+        };
+        let project = &mut self.projects[project_idx];
         let removed = project.sessions.remove(session_idx);
         for pane in &removed.panes {
             status::forget_pid(pane.pid);
@@ -5265,6 +5298,23 @@ impl AppState {
         // PTY masters close and the shells go away with them.
         drop(removed);
         self.rebuild_session_index();
+        // Invalidate older debounced snapshots before publishing the deletion.
+        self.save_generation.fetch_add(1, Ordering::SeqCst);
+        let saved = if self.persistence_enabled {
+            match self.persistence_path.as_ref() {
+                Some(path) => workspace_state::save_atomic(path, &self.saved_workspace(cx)),
+                None => Err(std::io::Error::other("workspace path unavailable")),
+            }
+        } else {
+            Ok(())
+        };
+        let result =
+            saved.and_then(|()| workspace_state::finish_deletion(&deletion_path, &deletion));
+        if let Err(error) = result {
+            window.push_notification(Notification::new().title("Session deletion incomplete")
+                .message(format!("{error}. Check the data folder permissions; cleanup will retry when Kathamo restarts."))
+                .with_type(NotificationType::Error), cx);
+        }
         cx.notify();
         self.schedule_workspace_save(cx);
     }
@@ -14524,6 +14574,10 @@ impl AppState {
                         this.close_session(project_idx, session_idx, window, cx);
                     }),
                 )
+                .tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new("Delete session and Kathamo history")
+                        .build(window, cx)
+                })
                 .invisible()
                 .group_hover("session-row", |s| s.visible())
                 .debug_selector(|| "session-close".to_string()),
@@ -15613,11 +15667,17 @@ fn main() -> Result<()> {
                                         usage: HashMap::new(),
                                     };
                                 };
-                                let workspace = if restore_enabled {
+                                if let Err(error) = workspace_state::retry_pending_deletions(&path) {
+                                    eprintln!("failed to retry session deletion: {error}");
+                                }
+                                let mut workspace = if restore_enabled {
                                     workspace_state::load(&path)
                                 } else {
                                     workspace_state::SavedWorkspace::default()
                                 };
+                                if let Err(error) = workspace_state::hide_pending_deletions(&mut workspace) {
+                                    eprintln!("failed to read pending session deletions: {error}");
+                                }
                                 let mut scrollbacks = HashMap::new();
                                 let mut transcripts = HashMap::new();
                                 let mut usage = HashMap::new();

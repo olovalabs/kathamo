@@ -62,6 +62,10 @@ enum WriteJob {
     Clear {
         ack: mpsc::Sender<io::Result<()>>,
     },
+    DeletePane {
+        dir: PathBuf,
+        ack: mpsc::Sender<io::Result<()>>,
+    },
     /// Release one file handle when its `Log` is dropped. The file is reopened
     /// lazily if another `Log` for the same conversation appends again.
     Close {
@@ -138,6 +142,14 @@ fn writer_loop(receiver: mpsc::Receiver<WriteJob>) {
                     }
                     fs::create_dir_all(dir)
                 })();
+                let _ = ack.send(result);
+            }
+            WriteJob::DeletePane { dir, ack } => {
+                files.retain(|path, _| !path.starts_with(&dir));
+                let result = match fs::remove_dir_all(&dir) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                };
                 let _ = ack.send(result);
             }
             WriteJob::Close { path } => {
@@ -521,9 +533,43 @@ pub fn clear_all() -> io::Result<()> {
         .map_err(|_| io::Error::other("conversation writer did not acknowledge clear"))?
 }
 
+/// Delete a pane's conversations after all previously queued writes.
+pub fn delete_pane(uid: &str) -> io::Result<()> {
+    delete_directory(paths::conversations_dir().join(uid))
+}
+
+fn delete_directory(dir: PathBuf) -> io::Result<()> {
+    let (ack, receiver) = mpsc::channel();
+    writer()
+        .sender
+        .send(WriteJob::DeletePane { dir, ack })
+        .map_err(|_| io::Error::other("conversation writer stopped"))?;
+    receiver
+        .recv()
+        .map_err(|_| io::Error::other("conversation writer did not acknowledge deletion"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delete_pane_waits_for_queued_writes_and_preserves_other_panes() {
+        let root = std::env::temp_dir().join(crate::paths::uid("conversation-delete-test"));
+        let deleted = root.join("deleted");
+        let retained = root.join("retained");
+        let mut first = Log::at_path(deleted.join("one.jsonl"), u64::MAX);
+        let mut second = Log::at_path(retained.join("two.jsonl"), u64::MAX);
+        first.append_user("private");
+        second.append_user("keep");
+        delete_directory(deleted.clone()).unwrap();
+        assert!(!deleted.exists());
+        assert!(retained.join("two.jsonl").exists());
+        delete_directory(deleted).unwrap();
+        drop(first);
+        drop(second);
+        let _ = fs::remove_dir_all(root);
+    }
 
     fn temp_log(name: &str, max_bytes: u64) -> Log {
         let path = std::env::temp_dir().join(format!(

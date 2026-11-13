@@ -124,6 +124,8 @@ pub struct AppSettings {
     pub palette_scheme: PaletteScheme,
     pub theme_colors: ThemeColors,
     pub default_agent_model: Option<AgentModel>,
+    /// Models explicitly enabled for the model picker. New models start hidden.
+    pub enabled_agent_models: Vec<AgentModel>,
     /// Explicit Kathamo execution opt-ins, scoped to canonical workspace paths.
     #[serde(alias = "trusted_omp_workspaces")]
     pub trusted_kathamo_workspaces: Vec<PathBuf>,
@@ -140,6 +142,7 @@ impl Default for AppSettings {
             palette_scheme: PaletteScheme::default(),
             theme_colors: ThemeColors::default(),
             default_agent_model: None,
+            enabled_agent_models: Vec::new(),
             trusted_kathamo_workspaces: Vec::new(),
             sidebar: SavedSidebar::default(),
             window: None,

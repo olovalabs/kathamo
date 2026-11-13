@@ -1832,6 +1832,7 @@ enum AgentDialogPage {
 
 struct AuthModal {
     page: AgentDialogPage,
+    managing_models: bool,
     focus: gpui::FocusHandle,
     cwd: PathBuf,
     providers: Vec<agent_auth::Provider>,
@@ -7409,6 +7410,7 @@ impl AppState {
         }
         let mut auth = AuthModal {
             page,
+            managing_models: false,
             focus,
             cwd,
             providers: Vec::new(),
@@ -7528,6 +7530,21 @@ impl AppState {
         self.schedule_workspace_save(cx);
         self.warm_agent_bridge(pane_id);
         self.close_agent_auth(pane_id, window, cx);
+    }
+
+    fn toggle_model_visibility(&mut self, model: &agent_auth::AgentModel, cx: &mut Context<Self>) {
+        if let Some(index) = self
+            .settings
+            .enabled_agent_models
+            .iter()
+            .position(|enabled| enabled == model)
+        {
+            self.settings.enabled_agent_models.remove(index);
+        } else {
+            self.settings.enabled_agent_models.push(model.clone());
+        }
+        self.schedule_workspace_save(cx);
+        cx.notify();
     }
 
     fn select_provider_for_auth(
@@ -10827,7 +10844,6 @@ impl AppState {
                                 .cursor_pointer().hover(|style| style.bg(tokens.pane_header_btn_hover))
                                 .text_size(px(11.0)).text_color(tokens.text_secondary)
                                 .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Project working-tree changes").build(window, cx))
-                                .child(svg().path("zed_file_icons/diff.svg").size(px(14.0)).text_color(tokens.text_muted))
                                 .child("Changes")
                                 .when_some(change_summary, |button, summary| button
                                     .child(div().debug_selector(|| "agent-changes-files".into()).text_color(tokens.text_secondary).child(format!("{}", summary.files)))
@@ -10897,20 +10913,28 @@ impl AppState {
                             "Tab complete · ↑↓ history · Ctrl+R search · Shift+Enter newline · Drop or paste images",
                         )
                     })
-                    .when(pane.chat.active && pane.chat.worker_view.is_none(), |hint| {
-                        let detail = pane.chat.usage_detail.clone();
-                        hint.child(
-                            div()
-                                .id(("agent-usage", pane_id))
-                                .debug_selector(|| "agent-usage".into())
-                                .min_w_0()
-                                .truncate()
-                                .child(pane.chat.usage_label.clone())
-                                .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
-                                }),
-                        )
-                    }),
+                    .when(
+                        pane.chat.active
+                            && pane.chat.worker_view.is_none()
+                            && pane.chat.usage.is_some_and(|usage| {
+                                usage.input != 0 || usage.output != 0 || usage.cache_read != 0 || usage.cache_write != 0
+                                    || usage.cost.is_some_and(|cost| cost > 0.0)
+                            }),
+                        |hint| {
+                            let detail = pane.chat.usage_detail.clone();
+                            hint.child(
+                                div()
+                                    .id(("agent-usage", pane_id))
+                                    .debug_selector(|| "agent-usage".into())
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(pane.chat.usage_label.clone())
+                                    .tooltip(move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, cx)
+                                    }),
+                            )
+                        },
+                    ),
             )
             .when(pane.chat.active && pane.chat.info_open, |this| {
                 this.child(self.render_agent_info(pane, cx))
@@ -11232,71 +11256,93 @@ impl AppState {
         let selected = self
             .pane_ref(pane_id)
             .and_then(|pane| pane.chat.selected_model.as_ref());
-        let provider_name = |id: &str| {
-            match id {
-                "opencode-zen" => "OpenCode",
-                "opencode-go" => "OpenCode Go",
-                "openai" => "OpenAI",
-                "anthropic" => "Anthropic",
-                "google" => "Google",
-                "github-copilot" => "GitHub Copilot",
-                _ => id,
-            }
-            .to_string()
-        };
-        let mut rows = Vec::new();
-        let mut last_provider = None;
-        for (index, model) in auth
+        let mut models: Vec<_> = auth
             .models
             .iter()
             .filter(|model| {
                 auth.providers
                     .iter()
                     .any(|provider| provider.id == model.provider && provider.ready)
+                    && (auth.managing_models || self.settings.enabled_agent_models.contains(model))
                     && (query.is_empty()
                         || model.id.to_lowercase().contains(&query)
-                        || model.provider.to_lowercase().contains(&query))
+                        || model.provider.to_lowercase().contains(&query)
+                        || provider_display_name(&model.provider)
+                            .to_lowercase()
+                            .contains(&query))
             })
-            .enumerate()
-        {
-            if last_provider != Some(model.provider.as_str()) {
-                last_provider = Some(model.provider.as_str());
+            .collect();
+        // Keep the active model easy to find, then group the rest by provider.
+        models.sort_by(|a, b| {
+            (
+                !auth.managing_models && selected != Some(*a),
+                &a.provider,
+                &a.id,
+            )
+                .cmp(&(
+                    !auth.managing_models && selected != Some(*b),
+                    &b.provider,
+                    &b.id,
+                ))
+        });
+        let mut rows = Vec::new();
+        let mut last_group: Option<String> = None;
+        for (index, model) in models.into_iter().enumerate() {
+            let is_selected = selected == Some(model);
+            let group = if is_selected && !auth.managing_models {
+                "Selected".to_string()
+            } else {
+                provider_display_name(&model.provider)
+            };
+            if last_group.as_ref() != Some(&group) {
+                last_group = Some(group.clone());
                 rows.push(
                     div()
                         .px(px(20.0))
-                        .pt(px(4.0))
-                        .pb(px(8.0))
-                        .text_size(px(14.0))
+                        .pt(px(12.0))
+                        .pb(px(6.0))
+                        .text_size(px(12.0))
                         .text_color(muted)
-                        .child(format!(
-                            "Models provided by {}",
-                            provider_name(&model.provider)
-                        ))
+                        .child(group)
                         .into_any_element(),
                 );
             }
             let choice = model.clone();
+            let is_free = model.id.ends_with(":free") || model.id.ends_with("-free");
+            let managing = auth.managing_models;
+            let visible = self.settings.enabled_agent_models.contains(model);
             rows.push(
                 div()
                     .id(("agent-model", index))
                     .debug_selector(move || format!("agent-model-{index}"))
-                    .h(px(36.0))
+                    .mx(px(8.0))
+                    .h(px(38.0))
                     .flex_shrink_0()
-                    .px(px(20.0))
+                    .px(px(12.0))
+                    .rounded(px(6.0))
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(px(8.0))
                     .text_size(px(14.0))
                     .text_color(foreground)
+                    .when(is_selected && !managing, |row| row.bg(inset))
                     .cursor(CursorStyle::PointingHand)
                     .hover(move |row| row.bg(inset))
                     .child(
                         div()
                             .flex()
+                            .flex_1()
                             .items_center()
-                            .gap(px(6.0))
+                            .gap(px(10.0))
                             .min_w_0()
+                            .child(
+                                svg()
+                                    .path(provider_icon_path(&model.provider))
+                                    .size(px(16.0))
+                                    .flex_shrink_0()
+                                    .text_color(foreground),
+                            )
                             .child(
                                 div().truncate().child(
                                     model
@@ -11306,25 +11352,56 @@ impl AppState {
                                         .to_string(),
                                 ),
                             )
-                            .when(
-                                model.id.ends_with(":free") || model.id.ends_with("-free"),
-                                |row| {
-                                    row.child(
-                                        div()
-                                            .px(px(4.0))
-                                            .h(px(16.0))
-                                            .rounded(px(2.0))
-                                            .border_1()
-                                            .border_color(border)
-                                            .bg(inset)
-                                            .text_size(px(11.0))
-                                            .text_color(muted)
-                                            .child("Free"),
-                                    )
-                                },
-                            ),
+                            .when(is_selected && !managing, |row| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(12.0))
+                                        .text_color(muted)
+                                        .child(provider_display_name(&model.provider)),
+                                )
+                            }),
                     )
-                    .when(selected == Some(model), |row| {
+                    .when(is_free, |row| {
+                        row.child(
+                            div()
+                                .px(px(6.0))
+                                .rounded(px(4.0))
+                                .bg(card)
+                                .text_size(px(11.0))
+                                .text_color(muted)
+                                .child("Free"),
+                        )
+                    })
+                    .when(managing, |row| {
+                        row.child(
+                            div()
+                                .debug_selector(move || format!("agent-model-toggle-{index}"))
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .text_size(px(11.0))
+                                .text_color(muted)
+                                .child(if visible { "On" } else { "Off" })
+                                .child(
+                                    div()
+                                        .w(px(30.0))
+                                        .h(px(18.0))
+                                        .p(px(2.0))
+                                        .rounded_full()
+                                        .flex()
+                                        .items_center()
+                                        .when(visible, |track| track.justify_end())
+                                        .bg(if visible {
+                                            tokens.pill_active_bg
+                                        } else {
+                                            tokens.pill_inactive_bg
+                                        })
+                                        .child(div().size(px(14.0)).rounded_full().bg(foreground)),
+                                ),
+                        )
+                    })
+                    .when(is_selected && !managing, |row| {
                         row.child(
                             svg()
                                 .path("icons/status-check.svg")
@@ -11336,7 +11413,11 @@ impl AppState {
                         MouseButton::Left,
                         cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.select_agent_model(pane_id, Some(choice.clone()), window, cx);
+                            if managing {
+                                this.toggle_model_visibility(&choice, cx);
+                            } else {
+                                this.select_agent_model(pane_id, Some(choice.clone()), window, cx);
+                            }
                         }),
                     )
                     .into_any_element(),
@@ -11431,6 +11512,68 @@ impl AppState {
             .min_h_0()
             .child(
                 div()
+                    .mx(px(20.0))
+                    .mb(px(12.0))
+                    .p(px(3.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .gap(px(3.0))
+                    .rounded(px(8.0))
+                    .bg(card)
+                    .children(
+                        [(false, "Visible models"), (true, "Manage models")]
+                            .into_iter()
+                            .map(|(manage, label)| {
+                                div()
+                                    .id(("model-view", usize::from(manage)))
+                                    .debug_selector(move || {
+                                        if manage {
+                                            "agent-model-manage".into()
+                                        } else {
+                                            "agent-model-visible".into()
+                                        }
+                                    })
+                                    .flex_1()
+                                    .py(px(7.0))
+                                    .rounded(px(6.0))
+                                    .text_center()
+                                    .text_size(px(12.0))
+                                    .text_color(if auth.managing_models == manage {
+                                        foreground
+                                    } else {
+                                        muted
+                                    })
+                                    .when(auth.managing_models == manage, |tab| tab.bg(inset))
+                                    .cursor(CursorStyle::PointingHand)
+                                    .child(label)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if let Some(auth) = this
+                                                .pane_mut(pane_id)
+                                                .and_then(|pane| pane.chat.auth.as_mut())
+                                            {
+                                                auth.managing_models = manage;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                            }),
+                    ),
+            )
+            .when(auth.managing_models, |view| {
+                view.child(
+                    div()
+                        .px(px(20.0))
+                        .pb(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(muted)
+                        .child("Choose which connected models appear in the picker."),
+                )
+            })
+            .child(
+                div()
                     .id(("model-filter", pane_id))
                     .debug_selector(|| "agent-model-filter".into())
                     .mx(px(20.0))
@@ -11470,6 +11613,11 @@ impl AppState {
                                 "Loading models…"
                             } else if !query.is_empty() {
                                 "No models match your search."
+                            } else if !auth.managing_models
+                                && !auth.models.is_empty()
+                                && auth.providers.iter().any(|provider| provider.ready)
+                            {
+                                "No visible models. Use Manage models to turn some on."
                             } else {
                                 "Connect a provider below to select a model."
                             },
@@ -13455,28 +13603,6 @@ impl AppState {
                                                 cx.listener(move |this, _, window, cx| {
                                                     cx.stop_propagation();
                                                     this.set_chat_mode(pane_id, true, window, cx);
-                                                }),
-                                            ),
-                                    )
-                                },
-                            )
-                            .when(
-                                pane.diff_preview.is_none() && pane.markdown_preview.is_none(),
-                                |row| {
-                                    row.child(
-                                        div()
-                                            .id(("open-project-diff", pane_id))
-                                            .px(px(6.0))
-                                            .text_size(px(11.0))
-                                            .text_color(tokens.pane_header_fg)
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(tokens.pane_header_btn_hover))
-                                            .child("Changes")
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.open_project_diff(pane_id, window, cx);
                                                 }),
                                             ),
                                     )
@@ -17227,6 +17353,28 @@ mod resize_tests {
         cx.update_window_entity(&state, |s, _, cx| {
             let chat = &mut s.projects[0].sessions[0].panes[0].chat;
             chat.active = true;
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        assert!(
+            cx.debug_bounds("agent-usage").is_none(),
+            "usage is hidden before a response"
+        );
+        let empty_bar_height = cx.debug_bounds("kathamo-input-bar").unwrap().size.height;
+        cx.update_window_entity(&state, |s, _, cx| {
+            let chat = &mut s.projects[0].sessions[0].panes[0].chat;
+            chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage::default()));
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        assert!(
+            cx.debug_bounds("agent-usage").is_none(),
+            "empty usage remains hidden"
+        );
+        cx.update_window_entity(&state, |s, _, cx| {
+            let chat = &mut s.projects[0].sessions[0].panes[0].chat;
+            // Start a fresh total so the test below can verify known cost accumulation.
+            chat.usage = None;
             chat.observe_status(&AgentEvent::Usage(rpi_embedded::AgentUsage {
                 input: 1200,
                 output: 80,
@@ -17258,6 +17406,10 @@ mod resize_tests {
         let footer = cx.debug_bounds("agent-usage").expect("agent usage visible");
         let editor = cx.debug_bounds("agent-composer-input").unwrap();
         let bar = cx.debug_bounds("kathamo-input-bar").unwrap();
+        assert_eq!(
+            empty_bar_height, bar.size.height,
+            "usage must not change input height"
+        );
         assert!(footer.top() >= editor.bottom());
         assert!(footer.bottom() <= bar.bottom());
         assert!(footer.right() <= bar.right());
@@ -20467,6 +20619,7 @@ First report
             backend: agent_auth::ModelBackend::Kathamo,
         };
         cx.update_window_entity(&state, |s, window, cx| {
+            s.settings.enabled_agent_models.push(model.clone());
             s.set_chat_mode(id, true, window, cx);
             let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
             input.update(cx, |input, cx| input.set_value("/model", window, cx));
@@ -20581,6 +20734,65 @@ First report
     }
 
     #[test]
+    fn model_visibility_can_be_managed_without_changing_the_selected_model() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        let model = agent_auth::AgentModel {
+            provider: "openai".into(),
+            id: "example-model".into(),
+            backend: agent_auth::ModelBackend::Rpi,
+        };
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(id, true, window, cx);
+            s.open_agent_auth(id, AgentDialogPage::Models, window, cx);
+            let pane = s.pane_mut(id).unwrap();
+            pane.chat.selected_model = Some(model.clone());
+            let auth = pane.chat.auth.as_mut().unwrap();
+            auth.discovery = None;
+            auth.model_discovery = None;
+            auth.providers = vec![agent_auth::Provider {
+                id: "openai".into(),
+                ready: true,
+                source: None,
+            }];
+            auth.models = vec![model.clone()];
+        });
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-model-0").is_none());
+        let manage = cx.debug_bounds("agent-model-manage").unwrap();
+        cx.simulate_click(manage.center(), gpui::Modifiers::default());
+        cx.draw_frame().unwrap();
+        let toggle = cx.debug_bounds("agent-model-toggle-0").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.draw_frame().unwrap();
+        state.read_with(&cx, |s, _| {
+            assert_eq!(s.settings.enabled_agent_models, vec![model.clone()]);
+            assert_eq!(
+                s.pane_ref(id).unwrap().chat.selected_model.as_ref(),
+                Some(&model)
+            );
+            let saved = serde_json::to_string(&s.saved_settings()).unwrap();
+            let restored: settings::AppSettings = serde_json::from_str(&saved).unwrap();
+            assert_eq!(restored.enabled_agent_models, vec![model.clone()]);
+        });
+        let visible = cx.debug_bounds("agent-model-visible").unwrap();
+        cx.simulate_click(visible.center(), gpui::Modifiers::default());
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-model-0").is_some());
+        let manage = cx.debug_bounds("agent-model-manage").unwrap();
+        cx.simulate_click(manage.center(), gpui::Modifiers::default());
+        cx.draw_frame().unwrap();
+        let toggle = cx.debug_bounds("agent-model-toggle-0").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+        cx.draw_frame().unwrap();
+        let visible = cx.debug_bounds("agent-model-visible").unwrap();
+        cx.simulate_click(visible.center(), gpui::Modifiers::default());
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-model-0").is_none());
+    }
+
+    #[test]
     fn model_tab_lists_only_connected_provider_models() {
         let mut app = TestAppContext::new();
         let (mut cx, state) = open_app(&mut app);
@@ -20596,6 +20808,7 @@ First report
             backend: agent_auth::ModelBackend::Rpi,
         };
         cx.update_window_entity(&state, |s, window, cx| {
+            s.settings.enabled_agent_models = vec![connected.clone(), disconnected.clone()];
             s.set_chat_mode(id, true, window, cx);
             let input = s.pane_ref(id).unwrap().input_state.clone().unwrap();
             input.update(cx, |input, cx| input.set_value("/model", window, cx));

@@ -200,6 +200,8 @@ pub struct Args {
     pub no_extensions: bool,
     /// Enable the host UI checklist tool in embedded sessions.
     pub host_task_list: bool,
+    /// Register tools that await responses from the host composer.
+    pub host_user_input: bool,
     /// `--no-themes`: disable custom theme discovery and loading.
     /// Built-in presets remain available unless a custom `--theme` is given.
     pub no_themes: bool,

@@ -31,6 +31,8 @@ use std::sync::atomic::Ordering;
 use terminal::{ColorPalette, ShellEvent, TerminalConfig, TerminalView};
 
 mod agent_auth;
+mod agent_composer;
+mod agent_interaction;
 mod agent_bridge;
 mod agent_rules;
 mod agent_ui;
@@ -2219,6 +2221,12 @@ struct PaneChat {
     messages: Vec<Arc<ChatMessage>>,
     running: bool,
     checklist: AgentChecklist,
+    requests: std::collections::VecDeque<agent_interaction::Request>,
+    follow_ups: std::collections::VecDeque<String>,
+    follow_ups_paused: bool,
+    recovery: Option<String>,
+    retry_prompt: Option<String>,
+    workspace_override: Option<PathBuf>,
     /// Native agent lifecycle, independent of the pane's hidden shell.
     status: SessionStatus,
     /// Completed turns in this conversation.
@@ -2273,6 +2281,12 @@ impl Default for PaneChat {
             messages: Vec::new(),
             running: false,
             checklist: AgentChecklist::default(),
+            requests: Default::default(),
+            follow_ups: Default::default(),
+            follow_ups_paused: false,
+            recovery: None,
+            retry_prompt: None,
+            workspace_override: None,
             status: SessionStatus::Idle,
             completed_turns: 0,
             usage: None,
@@ -7980,6 +7994,7 @@ impl AppState {
         let mut authenticated = false;
         let mut streaming = false;
         let mut titled_panes: Vec<usize> = Vec::new();
+        let mut ready_follow_ups = Vec::new();
         let save_history = self.settings.restore.agent_history;
         for project in &mut self.projects {
             for session in &mut project.sessions {
@@ -8064,6 +8079,20 @@ impl AppState {
                         }
                     }
                     if let Some(mut bridge) = pane.chat.bridge.take() {
+                        let previous = pane.chat.requests.len();
+                        pane.chat.requests.retain(agent_interaction::Request::alive);
+                        pane.chat.requests.extend(bridge.poll_requests());
+                        if !pane.chat.requests.is_empty() {
+                            if pane.chat.status != SessionStatus::Blocked || previous != pane.chat.requests.len() {
+                                pane.chat.status = SessionStatus::Blocked;
+                                changed = true;
+                            }
+                        } else if previous != 0 {
+                            if pane.chat.running && pane.chat.status == SessionStatus::Blocked {
+                                pane.chat.status = SessionStatus::Working;
+                            }
+                            changed = true;
+                        }
                         let mut closed = false;
                         let trace = bridge.trace_id();
                         let paint_turn = crate::stream_timing::turn_started_at(trace)
@@ -8117,6 +8146,16 @@ impl AppState {
                             let startup_error = pane.chat.messages.is_empty()
                                 && !pane.chat.running
                                 && matches!(event, agent_bridge::AgentEvent::Error(_));
+                            match &event {
+                                agent_bridge::AgentEvent::Error(error) => {
+                                    pane.chat.recovery = Some(error.clone());
+                                    pane.chat.follow_ups_paused = true;
+                                }
+                                agent_bridge::AgentEvent::Done | agent_bridge::AgentEvent::Closed => {
+                                    pane.chat.requests.clear();
+                                }
+                                _ => {}
+                            }
                             pane.chat.observe_status(&event);
                             if save_history && !startup_error {
                                 if let Some(log) = pane.chat.conversation.as_mut() {
@@ -8139,6 +8178,10 @@ impl AppState {
                                     finish_chat_streaming(&mut pane.chat.messages);
                                 }
                                 agent_bridge::AgentEvent::Closed => {
+                                    pane.chat.follow_ups_paused = true;
+                                    if pane.chat.status == SessionStatus::Error && pane.chat.recovery.is_none() {
+                                        pane.chat.recovery = Some("The agent session closed unexpectedly.".into());
+                                    }
                                     crate::stream_timing::turn_settled(trace);
                                     finish_chat_tools(&mut pane.chat.messages);
                                     finish_chat_streaming(&mut pane.chat.messages);
@@ -8187,6 +8230,9 @@ impl AppState {
                         pane.chat.mark_active_dirty();
                         changed = true;
                     }
+                    if !pane.chat.running && !pane.chat.follow_ups_paused && !pane.chat.follow_ups.is_empty() {
+                        ready_follow_ups.push(pane.id);
+                    }
                     streaming |= pane.chat.running;
                 }
             }
@@ -8230,6 +8276,9 @@ impl AppState {
                     }
                 }
             }
+        }
+        for pane_id in ready_follow_ups {
+            self.send_queued_follow_up(pane_id, cx);
         }
         for pane_id in titled_panes {
             self.sync_session_title(pane_id, cx);
@@ -8330,9 +8379,7 @@ impl AppState {
         if pane.chat.worker_view.is_some() {
             return;
         }
-        let cwd = self
-            .pane_cwd_path(pane)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let cwd = self.agent_working_directory(pane);
         let Some(pane) = self.pane_mut(pane_id) else {
             return;
         };
@@ -8493,18 +8540,44 @@ impl AppState {
             return;
         }
         if pane.chat.visible_running() {
+            if pane.chat.follow_ups.len() >= 16 {
+                return;
+            }
+            pane.chat.follow_ups.push_back(prompt);
+            pane.attachments.clear();
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+            cx.notify();
             return;
+        }
+        if Self::start_agent_turn(pane, prompt, cwd, save_history, cx) {
+            pane.attachments.clear();
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+    }
+
+    fn start_agent_turn(
+        pane: &mut TerminalPane,
+        prompt: String,
+        cwd: PathBuf,
+        save_history: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        pane.chat.retry_prompt = Some(prompt.clone());
+        if !cwd.is_dir() {
+            pane.chat.startup_error = Some(format!("Project folder unavailable: {}", cwd.display()));
+            cx.notify();
+            return false;
         }
         if pane.chat.selected_model.is_none() {
             pane.chat.startup_error = Some("Select a model to start chatting.".into());
             cx.notify();
-            return;
+            return false;
         }
         // A submitted turn (including a startup error) belongs at the live end.
         pane.chat.autoscroll = true;
         pane.chat.scroll_to_end();
         if pane.chat.conversation_title().is_none()
-            && let Some(title) = agent_title_from_prompt(trimmed)
+            && let Some(title) = agent_title_from_prompt(prompt.trim())
         {
             pane.chat.set_prompt_title(title);
         }
@@ -8516,12 +8589,13 @@ impl AppState {
             ));
         }
         if let Err(error) = pane.chat.ensure_agent(cwd) {
+            pane.chat.recovery = Some(error.clone());
             pane.chat.status = SessionStatus::Error;
             pane.chat
                 .messages
                 .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
             cx.notify();
-            return;
+            return false;
         }
         // Capabilities may have loaded after a bridge was warmed. Queue the
         // effective choice before every prompt so the displayed tier is used.
@@ -8539,12 +8613,13 @@ impl AppState {
                 .unwrap()
                 .set_thinking_level(&level)
             {
+                pane.chat.recovery = Some(error.clone());
                 pane.chat.status = SessionStatus::Error;
                 pane.chat
                     .messages
                     .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
                 cx.notify();
-                return;
+                return false;
             }
         }
         let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
@@ -8558,7 +8633,7 @@ impl AppState {
             None
         };
         let resume = pane.chat.bridge_resume.as_deref();
-        match pane
+        let sent = match pane
             .chat
             .bridge
             .as_mut()
@@ -8576,19 +8651,38 @@ impl AppState {
                 pane.chat.checklist = AgentChecklist::default();
                 pane.chat.running = true;
                 pane.chat.status = SessionStatus::Working;
-                pane.attachments.clear();
-                input.update(cx, |state, cx| state.set_value("", window, cx));
+                pane.chat.recovery = None;
+                pane.chat.follow_ups_paused = false;
+                true
             }
             Err(error) => {
+                pane.chat.recovery = Some(error.clone());
                 pane.chat.status = SessionStatus::Error;
                 pane.chat
                     .messages
                     .push(Arc::new(ChatMessage::new(ChatRole::Error, error)));
+                false
             }
-        }
+        };
         pane.chat.autoscroll = true;
         pane.chat.scroll_to_end();
         cx.notify();
+        sent
+    }
+
+    fn send_queued_follow_up(&mut self, pane_id: usize, cx: &mut Context<Self>) {
+        let Some(pane) = self.pane_ref(pane_id) else { return };
+        if pane.chat.running { return; }
+        let cwd = self.agent_working_directory(pane);
+        let save_history = self.settings.restore.agent_history;
+        let Some(pane) = self.pane_mut(pane_id) else { return };
+        if let Some(prompt) = pane.chat.follow_ups.front().cloned() {
+            if Self::start_agent_turn(pane, prompt, cwd, save_history, cx) {
+                pane.chat.follow_ups.pop_front();
+            } else {
+                pane.chat.follow_ups_paused = true;
+            }
+        }
     }
 
     fn execute_pane_input(&mut self, pane_id: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -8766,6 +8860,8 @@ impl AppState {
         };
         if pane.chat.active {
             if pane.chat.running {
+                pane.chat.follow_ups_paused = true;
+                pane.chat.requests.clear();
                 let trace = pane.chat.bridge.as_ref().map(|bridge| bridge.trace_id());
                 if let Some(bridge) = pane.chat.bridge.as_mut() {
                     if let Err(error) = bridge.cancel() {
@@ -9220,7 +9316,7 @@ impl AppState {
                     if let Some(project) = self.projects.get(p_idx) {
                         if let Some(session) = project.sessions.get(s_idx) {
                             if let Some(pane) = session.panes.get(pane_idx) {
-                                if pane.chat.auth.is_some() {
+                                if pane.chat.auth.is_some() || pane.chat.active && !pane.chat.requests.is_empty() {
                                     return;
                                 }
                                 let should_show = pane.should_show_bottom_input(cx);
@@ -10122,6 +10218,12 @@ impl AppState {
             )
     }
 
+    fn agent_working_directory(&self, pane: &TerminalPane) -> PathBuf {
+        pane.chat.workspace_override.clone()
+            .or_else(|| self.pane_cwd_path(pane))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
     fn pane_cwd_path(&self, pane: &TerminalPane) -> Option<std::path::PathBuf> {
         #[cfg(target_os = "linux")]
         if let Some(pid) = pane.pid {
@@ -10716,6 +10818,7 @@ impl AppState {
         &self,
         pane: &TerminalPane,
         _is_focused: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let pane_id = pane.id;
@@ -10976,7 +11079,9 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    if this.pane_ref(pane_id).is_some_and(|p| p.chat.auth.is_some()) {
+                    if this.pane_ref(pane_id).is_some_and(|p| {
+                        p.chat.auth.is_some() || p.chat.active && !p.chat.requests.is_empty()
+                    }) {
                         return;
                     }
                     this.focus_pane_input(pane_id, window, cx);
@@ -10990,6 +11095,9 @@ impl AppState {
                 }),
             )
             .children(plus_menu)
+            .children(pane.chat.active.then(|| self.render_agent_activity(pane, &tokens, cx)).flatten())
+            .children(pane.chat.active.then(|| self.render_agent_follow_ups(pane, &tokens, cx)).flatten())
+            .children(pane.chat.active.then(|| self.render_agent_recovery(pane, &tokens, cx)).flatten())
             .children(
                 self.render_agent_task_list(pane, &tokens, cx)
                     .map(|list| div().pb(px(8.0)).child(list)),
@@ -11004,6 +11112,7 @@ impl AppState {
                     )
                 })),
             )
+            .children(pane.chat.active.then(|| self.render_agent_request(pane, &tokens, window, cx)).flatten())
             // Row 1: Badges
             .child(
                 div()
@@ -14077,7 +14186,9 @@ impl AppState {
                 cx.listener(move |this, _, window, cx| {
                     if this
                         .pane_ref(pane_id)
-                        .is_some_and(|p| p.chat.auth.is_some())
+                        .is_some_and(|p| {
+                            p.chat.auth.is_some() || p.chat.active && !p.chat.requests.is_empty()
+                        })
                     {
                         return;
                     }
@@ -14299,7 +14410,7 @@ impl AppState {
                     && pane.diff_preview.is_none()
                     && pane.should_show_bottom_input(cx)
                     && pane.chat.worker_view.is_none(),
-                |this| this.child(self.render_kathamo_input_bar(pane, is_focused, cx)),
+                |this| this.child(self.render_kathamo_input_bar(pane, is_focused, window, cx)),
             )
     }
 
@@ -18112,6 +18223,112 @@ mod resize_tests {
                     .all(|pane| pane.chat.selected_model.as_ref() == Some(&model))
             );
         });
+    }
+
+    #[test]
+    fn agent_composer_question_collects_a_response_and_hides() {
+        use crate::agent_interaction::{self, Field, Kind, Response};
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let (request, reply) = agent_interaction::request(
+            "Choose an approach".into(),
+            None,
+            vec![Field {
+                label: "Which approach should I use?".into(),
+                kind: Kind::Text,
+                options: Vec::new(),
+                required: true,
+                custom: true,
+            }],
+            false,
+        );
+        cx.update_window_entity(&state, |s, _, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            pane.chat.active = true;
+            pane.chat.running = true;
+            pane.chat.status = SessionStatus::Blocked;
+            pane.chat.requests.push_back(request);
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        cx.run_until_parked();
+        cx.draw_frame().unwrap();
+        let request = cx.debug_bounds("agent-request-panel").unwrap();
+        let input = cx.debug_bounds("agent-composer-input").unwrap();
+        assert!(request.bottom() <= input.top());
+        let submit = cx.debug_bounds("agent-request-submit").unwrap().center();
+        cx.simulate_click(submit, Modifiers::none());
+        assert!(reply.try_recv().is_err(), "required answer is validated");
+        cx.draw_frame().unwrap();
+        let field = cx.debug_bounds("agent-request-input").unwrap();
+        cx.simulate_click(field.center(), Modifiers::none());
+        cx.simulate_input("simpler");
+        cx.draw_frame().unwrap();
+        let submit = cx.debug_bounds("agent-request-submit").unwrap().center();
+        cx.simulate_click(submit, Modifiers::none());
+        match reply.try_recv() {
+            Ok(Response::Submit(answer)) => assert_eq!(answer[0]["value"], "simpler"),
+            Ok(_) => panic!("unexpected response"),
+            Err(error) => panic!("no response: {error}; validation error visible: {}", cx.debug_bounds("agent-request-error").is_some()),
+        }
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-request-panel").is_none());
+    }
+
+    #[test]
+    fn agent_composer_custom_answer_submits_from_question_panel() {
+        use crate::agent_interaction::{self, Field, Kind, Response};
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let (request, reply) = agent_interaction::request(
+            "Choose an approach".into(),
+            None,
+            vec![Field {
+                label: "What should I inspect?".into(),
+                kind: Kind::Single,
+                options: vec!["Layout".into(), "Tests".into()],
+                required: true,
+                custom: true,
+            }],
+            false,
+        );
+        cx.update_window_entity(&state, |s, _, cx| {
+            let chat = &mut s.projects[0].sessions[0].panes[0].chat;
+            chat.active = true;
+            chat.running = true;
+            chat.requests.push_back(request);
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        let field = cx.debug_bounds("agent-request-input").unwrap().center();
+        cx.simulate_click(field, Modifiers::none());
+        cx.simulate_input("Docs");
+        cx.draw_frame().unwrap();
+        let submit = cx.debug_bounds("agent-request-submit").unwrap().center();
+        cx.simulate_click(submit, Modifiers::none());
+        assert!(matches!(reply.try_recv(), Ok(Response::Submit(answer))
+            if answer[0]["value"] == "Docs"));
+    }
+
+    #[test]
+    fn agent_composer_queues_follow_up_without_touching_transcript() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        cx.update_window_entity(&state, |s, window, cx| {
+            let pane = &mut s.projects[0].sessions[0].panes[0];
+            let id = pane.id;
+            pane.chat.active = true;
+            pane.chat.running = true;
+            let input = pane.input_state.clone().unwrap();
+            input.update(cx, |input, cx| input.set_value("Check the tests next", window, cx));
+            s.submit_agent_prompt(id, window, cx);
+            let pane = s.pane_ref(id).unwrap();
+            assert_eq!(pane.chat.follow_ups.front().map(String::as_str), Some("Check the tests next"));
+            assert!(pane.chat.messages.is_empty());
+            assert!(input.read(cx).value().is_empty());
+        });
+        cx.draw_frame().unwrap();
+        assert!(cx.debug_bounds("agent-follow-up-panel").is_some());
     }
 
     #[test]

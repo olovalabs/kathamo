@@ -289,7 +289,7 @@ fn extension_tool_prompt_metadata(
         .unwrap_or_default()
 }
 
-pub use rpi_tools::tools::task_list;
+pub use rpi_tools::tools::{task_list, user_input};
 
 /// One-line prompt descriptions of the tools rpi itself registers.
 fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
@@ -3005,6 +3005,14 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
             task_list::NAME,
             HarnessTool::new(task_list::TaskListTool::create()),
         ));
+    }
+
+    if args.host_user_input && !args.no_builtin_tools {
+        for name in [user_input::QUESTION, user_input::FORM] {
+            if tool_name_allowed(name, args) {
+                all.push((name, HarnessTool::new(user_input::UserInput::create(name))));
+            }
+        }
     }
 
     all.into_iter().map(|(_, t)| t).collect()

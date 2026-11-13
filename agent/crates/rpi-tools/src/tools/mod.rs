@@ -15,6 +15,7 @@ pub mod powershell;
 pub mod read;
 pub mod task_list;
 pub mod tool_context;
+pub mod user_input;
 pub mod write;
 
 pub use bash::{create_bash_tool, BashExecution, BashPrepare, BashToolOptions};

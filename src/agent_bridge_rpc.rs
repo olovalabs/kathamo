@@ -4,6 +4,7 @@
 //! the old process/stdio/JSONL path available for before/after measurements on
 //! a credentialed machine, without changing the UI or the event contract.
 
+use crate::agent_interaction::{self, Field, Kind, Request, Response};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -58,6 +59,7 @@ impl Write for DeferredStdin {
 pub(crate) struct RpcAgentBridge {
     writer: AgentWriter,
     events: Arc<EventQueue<AgentEvent>>,
+    requests: smol::channel::Receiver<Request>,
     stop: mpsc::Sender<()>,
     cleanup: Arc<Cleanup>,
     closed: bool,
@@ -79,6 +81,10 @@ impl RpcAgentBridge {
         Self::spawn_session_with(Path::new("rpi"), cwd, session, model, trace_id, None)
     }
 
+    pub(crate) fn poll_requests(&self) -> Vec<Request> {
+        std::iter::from_fn(|| self.requests.try_recv().ok()).filter(Request::alive).collect()
+    }
+
     pub(crate) fn session_id(&self) -> Option<String> {
         self.session_id.lock().ok().and_then(|id| id.clone())
     }
@@ -92,6 +98,7 @@ impl RpcAgentBridge {
         after_cleanup: Option<Arc<Cleanup>>,
     ) -> Result<Self, String> {
         let events = Arc::new(EventQueue::default());
+        let (request_tx, requests) = smol::channel::bounded(16);
         let error_events = Arc::clone(&events);
         let (stdin_tx, stdin_rx) = mpsc::channel();
         let writer = AgentWriter::spawn(
@@ -191,6 +198,7 @@ impl RpcAgentBridge {
             let reader_events = Arc::clone(&worker_events);
             let reply_writer = worker_writer.clone();
             let reader = thread::spawn(move || {
+                let mut active_dialogs = std::collections::HashMap::new();
                 let mut reader = BufReader::new(stdout);
                 let mut line = String::new();
                 let started = std::time::Instant::now();
@@ -227,8 +235,19 @@ impl RpcAgentBridge {
                             *worker_model.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!("{provider}/{model}"));
                         }
                     }
-                    if record["type"] == "extension_ui_request" {
-                        handle_extension_ui(&record, &reply_writer, &reader_events);
+                    if record["type"] == "ui_dialog_request" {
+                        if let Some((id, close)) = handle_native_dialog(&record, &reply_writer, &request_tx) {
+                            active_dialogs.insert(id, close);
+                        }
+                    } else if record["type"] == "ui_dialog_closed" {
+                        if let Some(id) = record["requestId"].as_str()
+                            && let Some(close) = active_dialogs.remove(id)
+                        {
+                            close.close();
+                            super::signal_wake();
+                        }
+                    } else if record["type"] == "extension_ui_request" {
+                        handle_extension_ui(&record, &reply_writer, &reader_events, &request_tx);
                     } else {
                         let project_start = std::time::Instant::now();
                         let decoded = decode_event(&record);
@@ -247,6 +266,9 @@ impl RpcAgentBridge {
                         }
                     }
                 };
+                for (_, pending) in active_dialogs {
+                    pending.close();
+                }
                 reply_writer.close();
                 let _ = reader_stop.send(());
                 failure
@@ -271,6 +293,7 @@ impl RpcAgentBridge {
         Ok(Self {
             writer,
             events,
+            requests,
             stop,
             closed: false,
             next_id: 0,
@@ -313,6 +336,10 @@ impl RpcAgentBridge {
         self.next_id = self.next_id.wrapping_add(1);
         self.writer
             .send_prompt(format!("kathamo-{}", self.next_id), prompt.to_owned())
+    }
+
+    pub(crate) fn steer(&self, text: &str) -> Result<(), String> {
+        self.writer.send_json(json!({"type":"queue_message","deliverAs":"steer","message":text}))
     }
 
     pub(crate) fn cancel(&mut self) -> Result<(), String> {
@@ -364,21 +391,119 @@ fn emit(events: &EventQueue<AgentEvent>, event: AgentEvent) -> bool {
     sent
 }
 
-fn handle_extension_ui(record: &Value, writer: &AgentWriter, events: &EventQueue<AgentEvent>) {
-    match record["method"].as_str().unwrap_or("") {
-        "select" | "confirm" | "input" | "editor" => {
-            let title = record["title"].as_str().unwrap_or("Extension interaction");
-            emit(
-                events,
-                AgentEvent::Error(format!(
-                    "{title}: interactive extension dialogs are not supported in this view; request cancelled"
-                )),
-            );
-            if let Err(error) = writer.send_json(json!({
-                "type":"extension_ui_response","id":record["id"],"cancelled":true,
-            })) {
-                emit(events, AgentEvent::Error(error));
+fn handle_native_dialog(
+    record: &Value,
+    writer: &AgentWriter,
+    requests: &smol::channel::Sender<Request>,
+) -> Option<(String, smol::channel::Sender<Response>)> {
+    let id = record["requestId"].as_str()?.to_owned();
+    let ui = &record["ui"];
+    let question = ui["questions"].as_array().and_then(|questions| questions.first()).unwrap_or(ui);
+    let prompt = question["question"].as_str()
+        .or_else(|| question["title"].as_str()).unwrap_or("Extension request");
+    let options: Vec<String> = question["options"].as_array().or_else(|| ui["options"].as_array())
+        .into_iter().flatten().filter_map(|option| option.as_str().or_else(|| option["title"].as_str()))
+        .map(str::to_owned).collect();
+    let choices = !options.is_empty();
+    let permission = ui["purpose"] == "permission";
+    let confirm = !choices && ui["kind"] == "confirm";
+    let custom = !permission && (!choices || question["allowFreeform"] == true
+        || question["allow_custom"] == true || ui["allowFreeform"] == true);
+    let fields = if confirm {
+        Vec::new()
+    } else {
+        vec![Field {
+            label: prompt.to_owned(),
+            kind: if !choices { Kind::Text }
+                else if !permission && (question["allowMultiple"] == true || question["multiple"] == true || ui["allowMultiple"] == true) { Kind::Multiple }
+                else { Kind::Single },
+            options: options.clone(),
+            required: true,
+            custom,
+        }]
+    };
+    let title = if confirm { prompt } else if permission { "Permission request" } else { "Extension question" };
+    let (mut request, reply) = agent_interaction::request(
+        title.into(), question["context"].as_str().or_else(|| ui["message"].as_str()).map(str::to_owned),
+        fields, confirm,
+    );
+    request.allow_session = false;
+    let close = request.reply.clone();
+    if requests.try_send(request).is_err() {
+        let _ = writer.send_json(json!({"type":"ui_dialog_response","requestId":id,"cancelled":true}));
+        return None;
+    }
+    super::signal_wake();
+    let writer = writer.clone();
+    let reply_id = id.clone();
+    std::thread::spawn(move || {
+        let message = match reply.recv_blocking() {
+            Ok(Response::Submit(values)) => {
+                let value = &values[0]["value"];
+                let chosen = value.as_array().is_some()
+                    || value.as_str().is_some_and(|text| options.iter().any(|option| option == text));
+                let answer = if chosen {
+                    let values = value.as_array().cloned().unwrap_or_else(|| vec![value.clone()]);
+                    json!({"kind":"selector","values":values})
+                } else {
+                    json!({"kind":"input","value":value,"text":value,"values":[value]})
+                };
+                json!({"type":"ui_dialog_response","requestId":reply_id,"answer":answer})
             }
+            Ok(Response::AllowOnce) => json!({"type":"ui_dialog_response","requestId":reply_id,"answer":true}),
+            Ok(Response::Deny) => json!({"type":"ui_dialog_response","requestId":reply_id,"cancelled":true}),
+            _ => return,
+        };
+        let _ = writer.send_json(message);
+    });
+    Some((id, close))
+}
+
+fn handle_extension_ui(
+    record: &Value,
+    writer: &AgentWriter,
+    events: &EventQueue<AgentEvent>,
+    requests: &smol::channel::Sender<Request>,
+) {
+    let method = record["method"].as_str().unwrap_or("");
+    match method {
+        "select" | "confirm" | "input" | "editor" => {
+            let fields = if method == "confirm" {
+                Vec::new()
+            } else {
+                vec![Field {
+                    label: if method == "select" { "Choose an option" } else { "Your response" }.into(),
+                    kind: if method == "select" { Kind::Single } else { Kind::Text },
+                    options: record["options"].as_array().into_iter().flatten()
+                        .filter_map(Value::as_str).map(str::to_owned).collect(),
+                    required: method == "select",
+                    custom: false,
+                }]
+            };
+            let (mut request, receiver) = agent_interaction::request(
+                record["title"].as_str().unwrap_or("Extension request").into(),
+                record["message"].as_str().map(str::to_owned),
+                fields, method == "confirm",
+            );
+            request.allow_session = false;
+            let id = record["id"].clone();
+            if requests.try_send(request).is_err() {
+                let _ = writer.send_json(json!({"type":"extension_ui_response","id":id,"cancelled":true}));
+                return;
+            }
+            super::signal_wake();
+            let writer = writer.clone();
+            let confirm = method == "confirm";
+            std::thread::spawn(move || {
+                let mut result = json!({"type":"extension_ui_response","id":id});
+                match receiver.recv_blocking() {
+                    Ok(Response::Submit(values)) => result["value"] = values[0]["value"].clone(),
+                    Ok(Response::AllowOnce | Response::AllowSession) => result["confirmed"] = json!(true),
+                    _ if confirm => result["confirmed"] = json!(false),
+                    _ => result["cancelled"] = json!(true),
+                }
+                let _ = writer.send_json(result);
+            });
         }
         "notify" => {
             if let Some(message) = record["message"].as_str() {

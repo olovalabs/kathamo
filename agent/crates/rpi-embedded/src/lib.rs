@@ -40,7 +40,7 @@ use rpi_runtime::{RuntimeConfig, RuntimeSettings, ValueSource};
 mod antigravity;
 pub const ANTIGRAVITY: &str = rpi_ai::providers::antigravity::ID;
 pub use rpi_cli::native_auth::{AuthMethod, AuthMethods};
-pub use rpi_cli::session::task_list;
+pub use rpi_cli::session::{task_list, user_input};
 
 static EXTENSION_OAUTH_METHODS: std::sync::LazyLock<
     std::sync::RwLock<std::collections::BTreeMap<PathBuf, Arc<std::collections::BTreeSet<String>>>>,
@@ -782,6 +782,7 @@ pub struct SessionOptions {
     /// Hooks run outside queue locks. They must remain lightweight.
     pub phase_hook: Option<Arc<dyn Fn(&'static str, std::time::Duration) + Send + Sync>>,
     pub before_tool_call: Option<BeforeToolCall>,
+    pub user_input: bool,
 }
 
 impl SessionOptions {
@@ -797,6 +798,7 @@ impl SessionOptions {
             delta_arrival_hook: None,
             phase_hook: None,
             before_tool_call: None,
+            user_input: false,
         }
     }
 
@@ -853,6 +855,7 @@ enum Command {
         text: String,
         fallback: Option<(Option<String>, String)>,
     },
+    Steer(String),
     Abort,
     Thinking(rpi_ai::ThinkingLevel),
     Shutdown,
@@ -1001,6 +1004,10 @@ impl EmbeddedSession {
             text: prompt.to_owned(),
             fallback: context.map(|context| (resume.map(str::to_owned), context)),
         })
+    }
+
+    pub fn steer(&self, text: &str) -> Result<(), String> {
+        self.enqueue_command(text.len(), false, || Command::Steer(text.to_owned()))
     }
 
     pub fn cancel(&mut self) -> Result<(), String> {
@@ -1163,6 +1170,7 @@ async fn run_session(
         delta_arrival_hook,
         phase_hook,
         before_tool_call,
+        user_input,
     } = options;
     let trusted = project_trusted(&cwd);
     let started = std::time::Instant::now();
@@ -1219,6 +1227,7 @@ async fn run_session(
     args.no_extensions = true;
     args.offline = true;
     args.host_task_list = true;
+    args.host_user_input = user_input;
     args.provider = provider.clone();
     args.model = model.clone();
     args.session = resume.clone();
@@ -1383,6 +1392,16 @@ async fn run_session(
                     let error = lane.prompt_text(&text, Vec::new()).await.err();
                     let _ = finished.send(error.map(|error| error.to_string())).await;
                 }));
+            }
+            Command::Steer(text) => {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as i64;
+                let message = AgentMessage::User(rpi_ai::types::UserMessage::new(text, timestamp));
+                if let Err(error) = harness.steer(message).await {
+                    let _ = events.send(SessionEvent::Error(error.to_string())).await;
+                    wake.signal();
+                }
             }
             Command::Abort => {
                 if running.load(Ordering::SeqCst) {
@@ -2519,6 +2538,7 @@ mod tests {
             delta_arrival_hook: None,
             phase_hook: None,
             before_tool_call: None,
+            user_input: false,
         })
         .expect("worker starts");
 

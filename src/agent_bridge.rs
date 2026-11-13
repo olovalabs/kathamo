@@ -1,3 +1,4 @@
+use crate::agent_interaction::{self, Request, Response};
 use rpi_embedded::QueuedEvent;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -136,6 +137,7 @@ struct EmbeddedBridge {
     model: Option<String>,
     closed: bool,
     trace_id: u64,
+    requests: smol::channel::Receiver<Request>,
 }
 
 impl AgentBridge {
@@ -250,6 +252,20 @@ impl AgentBridge {
         }
     }
 
+    pub(crate) fn steer(&self, text: &str) -> Result<(), String> {
+        match &self.backend {
+            Backend::Embedded(bridge) => bridge.session.steer(text),
+            Backend::Rpc(bridge) => bridge.steer(text),
+        }
+    }
+
+    pub(crate) fn poll_requests(&self) -> Vec<Request> {
+        match &self.backend {
+            Backend::Embedded(bridge) => std::iter::from_fn(|| bridge.requests.try_recv().ok()).filter(Request::alive).collect(),
+            Backend::Rpc(bridge) => bridge.poll_requests(),
+        }
+    }
+
     pub fn poll(&mut self) -> Vec<AgentEvent> {
         match &mut self.backend {
             Backend::Embedded(bridge) => bridge.poll(),
@@ -307,9 +323,9 @@ impl EmbeddedBridge {
                     crate::stream_timing::record_for_trace(phase_trace, label, elapsed);
                 },
             ));
-        if uses_gemini(model) {
-            options.before_tool_call = Some(gemini_tool_approval());
-        }
+        let (request_tx, requests) = smol::channel::bounded(16);
+        options.user_input = true;
+        options.before_tool_call = Some(composer_tool_hook(request_tx, uses_gemini(model)));
         let spawn_start = std::time::Instant::now();
         let mut session = EmbeddedSession::spawn(options).map_err(|error| {
             format!(
@@ -326,6 +342,7 @@ impl EmbeddedBridge {
             model: model.map(str::to_owned),
             closed: false,
             trace_id,
+            requests,
         })
     }
 
@@ -396,39 +413,74 @@ fn uses_gemini(model: Option<&str>) -> bool {
     })
 }
 
-fn gemini_tool_approval() -> rpi_embedded::BeforeToolCall {
-    let dialogs = Arc::new(smol::lock::Mutex::new(()));
+fn composer_tool_hook(
+    sender: smol::channel::Sender<Request>,
+    require_approval: bool,
+) -> rpi_embedded::BeforeToolCall {
+    use rpi_embedded::user_input::{FORM, QUESTION};
+    let approvals = Arc::new(Mutex::new(std::collections::HashSet::new()));
     Arc::new(move |call, cancelled| {
-        let name = call.tool_call.name.clone();
-        if matches!(
-            name.as_str(),
-            "read" | "find" | "grep" | "ls" | rpi_embedded::task_list::NAME
-        ) {
+        let name = call.tool_call.name.as_str();
+        let asks_user = matches!(name, QUESTION | FORM);
+        if !asks_user
+            && (!require_approval
+                || matches!(name, "read" | "find" | "grep" | "ls" | rpi_embedded::task_list::NAME))
+        {
             return Box::pin(async { None });
         }
-        let arguments = call.args.to_string();
-        let dialogs = dialogs.clone();
+        let name = name.to_owned();
+        let args = call.args.clone();
+        let sender = sender.clone();
+        let approvals = approvals.clone();
         Box::pin(async move {
-            let approve = async {
-                let _dialog = dialogs.lock().await;
-                rfd::AsyncMessageDialog::new()
-                    .set_title(format!("Allow Gemini to run {name}?"))
-                    .set_description(&arguments)
-                    .set_buttons(rfd::MessageButtons::YesNo)
-                    .show()
-                    .await
-                    == rfd::MessageDialogResult::Yes
-            };
-            let approved = smol::future::race(approve, async {
-                cancelled.cancelled().await;
-                false
-            })
-            .await;
-            (!approved || cancelled.is_cancelled()).then(|| rpi_embedded::BeforeToolCallResult {
+            let deny = |reason: &str| Some(rpi_embedded::BeforeToolCallResult {
                 block: true,
-                reason: Some("Tool approval was declined or cancelled.".into()),
+                reason: Some(reason.to_owned()),
                 ..Default::default()
-            })
+            });
+            let scope = (name.clone(), args.to_string());
+            if !asks_user && approvals.lock().unwrap().contains(&scope) {
+                return None;
+            }
+            let (request, reply) = if asks_user {
+                let fields = match agent_interaction::fields(&args, name == QUESTION) {
+                    Ok(fields) => fields,
+                    Err(error) => return deny(error),
+                };
+                agent_interaction::request(
+                    args["title"].as_str().unwrap_or("Agent question").into(), None, fields, false,
+                )
+            } else {
+                agent_interaction::request(
+                    format!("Allow {name}?"),
+                    Some(serde_json::to_string_pretty(&args).unwrap_or_default()),
+                    Vec::new(),
+                    true,
+                )
+            };
+            if sender.try_send(request).is_err() {
+                return deny("The composer cannot accept more input requests.");
+            }
+            signal_wake();
+            let response = smol::future::race(async { reply.recv().await.ok() }, async {
+                cancelled.cancelled().await;
+                None
+            }).await;
+            if cancelled.is_cancelled() {
+                return deny("Operation cancelled.");
+            }
+            match response {
+                Some(Response::Submit(answer)) if asks_user => Some(rpi_embedded::BeforeToolCallResult {
+                    args: Some(serde_json::json!({"answer": answer})),
+                    ..Default::default()
+                }),
+                Some(Response::AllowOnce) if !asks_user => None,
+                Some(Response::AllowSession) if !asks_user => {
+                    approvals.lock().unwrap().insert(scope);
+                    None
+                }
+                _ => deny("The user dismissed or denied the request."),
+            }
         })
     })
 }

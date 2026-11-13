@@ -344,7 +344,7 @@ impl Element for Inline {
                     {
                         cx.stop_propagation();
                         let handler = cx.try_global::<super::TextLinkHandler>().map(|h| h.0.clone());
-                        if event.modifiers.control && handler.is_some_and(|handler| handler(&link.url, window, cx)) {
+                        if handler.is_some_and(|handler| handler(&link.url, window, cx)) {
                             return;
                         }
                         cx.open_url(&link.url);

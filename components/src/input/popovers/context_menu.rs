@@ -43,7 +43,7 @@ impl InputState {
             self.handle_hover_definition(offset, window, cx);
         }
 
-        let is_enable = !self.disabled;
+        let is_enable = !self.disabled && !self.read_only;
         let has_goto_definition = is_enable && self.lsp.definition_provider.is_some();
         let has_code_action = is_enable && !self.lsp.code_action_providers.is_empty();
         let is_selected = !self.selected_range.is_empty();

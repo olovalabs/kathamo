@@ -41,6 +41,7 @@ mod completion;
 mod conversations;
 mod diagnostics;
 mod file_icons;
+mod file_preview;
 mod integrations;
 #[cfg(unix)]
 mod kathamo_compat;
@@ -2550,6 +2551,23 @@ struct DiffPreview {
     tracked_collapsed: bool,
     untracked_collapsed: bool,
     request: u64,
+    file_request: u64,
+    file_view: Option<ReadOnlyFile>,
+    file_only: bool,
+}
+
+struct ReadOnlyFile {
+    path: String,
+    state: ReadOnlyFileState,
+}
+
+enum ReadOnlyFileState {
+    Loading,
+    Error(String),
+    Ready {
+        input: Entity<InputState>,
+        deleted: bool,
+    },
 }
 
 fn diff_counts(
@@ -2594,6 +2612,10 @@ pub struct TerminalPane {
     pub terminal: Entity<TerminalView>,
     markdown_preview: Option<(PathBuf, SharedString)>,
     diff_preview: Option<DiffPreview>,
+    /// Agent pane that owns this reusable preview. Preview panes reuse themselves.
+    preview_owner: Option<usize>,
+    /// Invalidates background work whenever the preview content is replaced.
+    preview_generation: u64,
     pub status: SessionStatus,
     pub detection: status::DetectionResult,
     pub title: String,
@@ -2732,6 +2754,8 @@ impl TerminalPane {
             terminal,
             markdown_preview: None,
             diff_preview: None,
+            preview_owner: None,
+            preview_generation: 0,
             status: SessionStatus::Idle,
             detection: status::DetectionResult::new(
                 SessionStatus::Idle,
@@ -3024,6 +3048,8 @@ struct AppState {
     session_index: HashMap<usize, (usize, usize)>,
     /// O(1) pane lookup by id: pane id -> (project idx, session idx, pane idx).
     pane_index: HashMap<usize, (usize, usize, usize)>,
+    /// Background-computed working-tree counts, shared by panes in a project.
+    project_change_counts: HashMap<PathBuf, Option<project_diff::ChangeSummary>>,
     /// Pane that currently owns keyboard focus, tracked every render frame
     /// and consumed by the status poller (Active state, sticky-state clearing).
     focused_pane_id: Option<usize>,
@@ -4002,7 +4028,7 @@ impl AppState {
                     let (path, _, _) = link.path_with_position();
                     let mut handled = false;
                     let _ = link_target.update(cx, |state, cx| {
-                        handled = state.open_markdown_preview(pane_id, &path, window, cx);
+                        handled = state.open_local_link(pane_id, &path, window, cx);
                     });
                     handled
                 })
@@ -5648,6 +5674,131 @@ impl AppState {
         }
     }
 
+    /// Find or create the one preview owned by a pane. Links opened from a
+    /// preview replace that preview, keeping the original agent pane intact.
+    fn prepare_preview_pane(
+        &mut self,
+        source: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let &(project, session, _) = self.pane_index.get(&source)?;
+        let screen = &self.projects[project].sessions[session];
+        let existing = if screen
+            .panes
+            .iter()
+            .any(|pane| pane.id == source && pane.preview_owner.is_some())
+        {
+            Some(source)
+        } else {
+            screen
+                .panes
+                .iter()
+                .find(|pane| pane.preview_owner == Some(source))
+                .map(|pane| pane.id)
+        };
+        let preview = if let Some(id) = existing {
+            id
+        } else {
+            let source_on_right = screen
+                .pane_tree
+                .as_ref()
+                .and_then(|tree| tree.preview_goes_left(source))
+                .unwrap_or(false);
+            let id = self.next_id + 1;
+            self.split_pane(source, gpui::Axis::Horizontal, window, cx);
+            let pane = self.pane_mut(id)?;
+            pane.preview_owner = Some(source);
+            if source_on_right {
+                if let Some(tree) = self.projects[project].sessions[session].pane_tree.as_mut() {
+                    tree.swap_split_children(source, id);
+                }
+            }
+            id
+        };
+        self.projects[project].sessions[session].maximized_pane_id = None;
+        let pane = self.pane_mut(preview)?;
+        pane.preview_generation = pane.preview_generation.wrapping_add(1);
+        pane.markdown_preview = None;
+        pane.diff_preview = None;
+        self.focused_pane_id = Some(preview);
+        cx.notify();
+        Some(preview)
+    }
+
+    /// Route local links to the opposite pane; external URLs keep their normal handler.
+    fn open_local_link(
+        &mut self,
+        source: usize,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(&(project, _, _)) = self.pane_index.get(&source) else {
+            return false;
+        };
+        let Some(pane) = self.pane_ref(source) else {
+            return false;
+        };
+        let base = pane
+            .markdown_preview
+            .as_ref()
+            .and_then(|(path, _)| path.parent().map(Path::to_path_buf))
+            .or_else(|| pane.chat.cwd.as_ref().map(PathBuf::from))
+            .or_else(|| self.pane_cwd_path(pane))
+            .unwrap_or_else(|| self.projects[project].path.clone());
+        let Some(path) = file_preview::local_link_path(target, &base) else {
+            return false;
+        };
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                matches!(
+                    ext.to_ascii_lowercase().as_str(),
+                    "md" | "markdown" | "mdown"
+                )
+            })
+            && self.open_markdown_preview(source, &path.to_string_lossy(), window, cx)
+        {
+            return true;
+        }
+        let root = self.projects[project].path.clone();
+        let display_path = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .to_string();
+        let Some(new_id) = self.prepare_preview_pane(source, window, cx) else {
+            return true;
+        };
+        let Some(pane) = self.pane_mut(new_id) else {
+            return true;
+        };
+        pane.display_title = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+            .into();
+        pane.diff_preview = Some(DiffPreview {
+            directory: root.clone(),
+            result: Some(Ok(project_diff::ProjectDiff {
+                root,
+                files: Vec::new(),
+            })),
+            expanded: HashSet::new(),
+            tracked_collapsed: false,
+            untracked_collapsed: false,
+            request: 0,
+            file_request: 0,
+            file_view: None,
+            file_only: true,
+        });
+        self.open_changed_file(new_id, display_path, window, cx);
+        true
+    }
+
     /// Open a local Markdown link beside its source, leaving the source running.
     fn open_markdown_preview(
         &mut self,
@@ -5679,7 +5830,7 @@ impl AppState {
         {
             return false;
         }
-        let Some(&(project, session, _)) = self.pane_index.get(&source) else {
+        let Some(&(project, _, _)) = self.pane_index.get(&source) else {
             return false;
         };
         let Some(pane) = self.pane_ref(source) else {
@@ -5707,13 +5858,9 @@ impl AppState {
             &mut html,
             pulldown_cmark::Parser::new_ext(&content, options),
         );
-        let source_on_right = self.projects[project].sessions[session]
-            .pane_tree
-            .as_ref()
-            .and_then(|tree| tree.preview_goes_left(source))
-            .unwrap_or(false);
-        let new_id = self.next_id + 1;
-        self.split_pane(source, gpui::Axis::Horizontal, window, cx);
+        let Some(new_id) = self.prepare_preview_pane(source, window, cx) else {
+            return false;
+        };
         if let Some(pane) = self.pane_mut(new_id) {
             pane.markdown_preview = Some((path.clone(), html.into()));
             pane.display_title = path
@@ -5725,27 +5872,18 @@ impl AppState {
         } else {
             return false;
         }
-        if source_on_right {
-            if let Some(tree) = self.projects[project].sessions[session].pane_tree.as_mut() {
-                tree.swap_split_children(source, new_id);
-            }
-        }
         cx.notify();
         true
     }
 
     fn open_project_diff(&mut self, source: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(&(project, session, _)) = self.pane_index.get(&source) else {
+        let Some(&(project, _, _)) = self.pane_index.get(&source) else {
             return;
         };
         let directory = self.projects[project].path.clone();
-        let source_on_right = self.projects[project].sessions[session]
-            .pane_tree
-            .as_ref()
-            .and_then(|tree| tree.preview_goes_left(source))
-            .unwrap_or(false);
-        let new_id = self.next_id + 1;
-        self.split_pane(source, gpui::Axis::Horizontal, window, cx);
+        let Some(new_id) = self.prepare_preview_pane(source, window, cx) else {
+            return;
+        };
         let Some(pane) = self.pane_mut(new_id) else {
             return;
         };
@@ -5757,20 +5895,19 @@ impl AppState {
             tracked_collapsed: false,
             untracked_collapsed: false,
             request: 0,
+            file_request: 0,
+            file_view: None,
+            file_only: false,
         });
-        if source_on_right {
-            if let Some(tree) = self.projects[project].sessions[session].pane_tree.as_mut() {
-                tree.swap_split_children(source, new_id);
-            }
-        }
         self.refresh_project_diff(new_id, cx);
     }
 
     fn refresh_project_diff(&mut self, pane_id: usize, cx: &mut Context<Self>) {
-        let Some(view) = self
-            .pane_mut(pane_id)
-            .and_then(|pane| pane.diff_preview.as_mut())
-        else {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let generation = pane.preview_generation;
+        let Some(view) = pane.diff_preview.as_mut() else {
             return;
         };
         view.request += 1;
@@ -5785,6 +5922,7 @@ impl AppState {
             let _ = this.update(cx, |this, cx| {
                 if let Some(view) = this
                     .pane_mut(pane_id)
+                    .filter(|pane| pane.preview_generation == generation)
                     .and_then(|pane| pane.diff_preview.as_mut())
                     .filter(|view| view.request == request)
                 {
@@ -5796,12 +5934,195 @@ impl AppState {
         .detach();
     }
 
+    fn open_changed_file(
+        &mut self,
+        pane_id: usize,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.pane_mut(pane_id) else {
+            return;
+        };
+        let generation = pane.preview_generation;
+        let Some(view) = pane.diff_preview.as_mut() else {
+            return;
+        };
+        let Some(Ok(diff)) = view.result.as_ref() else {
+            return;
+        };
+        let root = diff.root.clone();
+        view.file_request += 1;
+        let request = view.file_request;
+        view.file_view = Some(ReadOnlyFile {
+            path: path.clone(),
+            state: ReadOnlyFileState::Loading,
+        });
+        let target = cx.entity().downgrade();
+        let handle = window.window_handle();
+        cx.notify();
+        cx.spawn(async move |_, cx| {
+            let read_path = path.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { file_preview::read(root, read_path) })
+                .await;
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = target.update(cx, |this, cx| {
+                    let Some(view) = this
+                        .pane_mut(pane_id)
+                        .filter(|pane| pane.preview_generation == generation)
+                        .and_then(|pane| pane.diff_preview.as_mut())
+                        .filter(|view| view.file_request == request)
+                    else {
+                        return;
+                    };
+                    let Some(file) = view.file_view.as_mut().filter(|file| file.path == path)
+                    else {
+                        return;
+                    };
+                    file.state = match result {
+                        Ok(content) => {
+                            let language = file_preview::language(&path);
+                            let input = cx.new(|cx| {
+                                InputState::new(window, cx)
+                                    .code_editor(language)
+                                    .line_number(true)
+                                    .soft_wrap(false)
+                                    .default_value(content.text)
+                                    .read_only(true)
+                            });
+                            input.update(cx, |input, cx| input.focus(window, cx));
+                            ReadOnlyFileState::Ready {
+                                input,
+                                deleted: content.deleted,
+                            }
+                        }
+                        Err(error) => ReadOnlyFileState::Error(error),
+                    };
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn render_changed_file(
+        &self,
+        pane_id: usize,
+        file: &ReadOnlyFile,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tokens = self.tokens(cx);
+        let file_only = self
+            .pane_ref(pane_id)
+            .and_then(|pane| pane.diff_preview.as_ref())
+            .is_some_and(|view| view.file_only);
+        let mut header = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .py(px(9.0))
+            .child(
+                div()
+                    .id(("back-to-changes", pane_id))
+                    .cursor_pointer()
+                    .rounded(px(4.0))
+                    .px(px(6.0))
+                    .hover(|s| s.bg(tokens.card_hover))
+                    .text_color(tokens.text_secondary)
+                    .child(if file_only {
+                        "‹ Close"
+                    } else {
+                        "‹ Changes"
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            if file_only {
+                                this.close_pane(pane_id, window, cx);
+                            } else if let Some(view) = this
+                                .pane_mut(pane_id)
+                                .and_then(|pane| pane.diff_preview.as_mut())
+                            {
+                                view.file_request += 1;
+                                view.file_view = None;
+                                cx.notify();
+                            }
+                        }),
+                    ),
+            )
+            .child(
+                svg()
+                    .path(file_icons::icon_for_path(&file.path))
+                    .size(px(16.0))
+                    .text_color(tokens.text_secondary),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(12.0))
+                    .text_color(tokens.text_primary)
+                    .child(file.path.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(tokens.text_secondary)
+                    .child("Read only"),
+            );
+        if matches!(&file.state, ReadOnlyFileState::Ready { deleted: true, .. }) {
+            header = header.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(tokens.text_secondary)
+                    .child("Deleted · HEAD version"),
+            );
+        }
+        let body = match &file.state {
+            ReadOnlyFileState::Loading => div()
+                .p(px(16.0))
+                .text_color(tokens.text_secondary)
+                .child("Loading file…")
+                .into_any_element(),
+            ReadOnlyFileState::Error(error) => div()
+                .p(px(16.0))
+                .text_color(tokens.text_secondary)
+                .child(error.clone())
+                .into_any_element(),
+            ReadOnlyFileState::Ready { input, .. } => div()
+                .flex_1()
+                .min_h_0()
+                .size_full()
+                .child(
+                    Input::new(input)
+                        .appearance(false)
+                        .bordered(false)
+                        .size_full(),
+                )
+                .into_any_element(),
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(body)
+            .into_any_element()
+    }
+
     fn render_project_diff(
         &self,
         pane_id: usize,
         view: &DiffPreview,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(file) = &view.file_view {
+            return self.render_changed_file(pane_id, file, cx);
+        }
         let tokens = self.tokens(cx);
         let mut content = div()
             .id(("project-diff-content", pane_id))
@@ -5905,6 +6226,7 @@ impl AppState {
                         .filter(|(_, file)| file.group == group)
                     {
                         let path = file.path.clone();
+                        let toggle_path = path.clone();
                         let expanded = view.expanded.contains(&path);
                         let counts = (file.additions, file.deletions);
                         let mut card = div()
@@ -5916,6 +6238,7 @@ impl AppState {
                             .child(
                                 div()
                                     .id(("project-diff-file", pane_id * 100000 + index))
+                                    .debug_selector(move || format!("project-diff-file-{index}"))
                                     .flex()
                                     .items_center()
                                     .justify_between()
@@ -5932,7 +6255,38 @@ impl AppState {
                                             .min_w_0()
                                             .text_color(tokens.text_primary)
                                             .text_size(px(12.0))
-                                            .child(if expanded { "▾" } else { "▸" })
+                                            .child(
+                                                div()
+                                                    .id((
+                                                        "toggle-diff-file",
+                                                        pane_id * 100000 + index,
+                                                    ))
+                                                    .px(px(3.0))
+                                                    .cursor_pointer()
+                                                    .child(if expanded { "▾" } else { "▸" })
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            if let Some(view) = this
+                                                                .pane_mut(pane_id)
+                                                                .and_then(|pane| {
+                                                                    pane.diff_preview.as_mut()
+                                                                })
+                                                            {
+                                                                if !view
+                                                                    .expanded
+                                                                    .remove(&toggle_path)
+                                                                {
+                                                                    view.expanded.insert(
+                                                                        toggle_path.clone(),
+                                                                    );
+                                                                }
+                                                                cx.notify();
+                                                            }
+                                                        }),
+                                                    ),
+                                            )
                                             .child(
                                                 svg()
                                                     .path(file_icons::icon_for_path(&path))
@@ -5949,17 +6303,14 @@ impl AppState {
                                     ))
                                     .on_mouse_down(
                                         MouseButton::Left,
-                                        cx.listener(move |this, _, _, cx| {
+                                        cx.listener(move |this, _, window, cx| {
                                             cx.stop_propagation();
-                                            if let Some(view) = this
-                                                .pane_mut(pane_id)
-                                                .and_then(|pane| pane.diff_preview.as_mut())
-                                            {
-                                                if !view.expanded.remove(&path) {
-                                                    view.expanded.insert(path.clone());
-                                                }
-                                                cx.notify();
-                                            }
+                                            this.open_changed_file(
+                                                pane_id,
+                                                path.clone(),
+                                                window,
+                                                cx,
+                                            );
                                         }),
                                     ),
                             );
@@ -6149,6 +6500,18 @@ impl AppState {
                 if let Some(session) = p.sessions.get_mut(s_idx) {
                     if let Some(pane) = session.panes.iter_mut().find(|p| p.id == pane_id) {
                         if pane.chat.auth.is_some() {
+                            return;
+                        }
+                        if let Some(ReadOnlyFile {
+                            state: ReadOnlyFileState::Ready { input, .. },
+                            ..
+                        }) = pane
+                            .diff_preview
+                            .as_ref()
+                            .and_then(|view| view.file_view.as_ref())
+                        {
+                            input.update(cx, |input, cx| input.focus(window, cx));
+                            cx.notify();
                             return;
                         }
                         let should_show = pane.should_show_bottom_input(cx);
@@ -9919,6 +10282,12 @@ impl AppState {
         } else {
             self.pane_git_branch(pane)
         };
+        let change_summary = self
+            .pane_index
+            .get(&pane_id)
+            .and_then(|&(project, _, _)| self.projects.get(project))
+            .and_then(|project| self.project_change_counts.get(&project.path))
+            .and_then(Option::as_ref);
         let model_pill = pane
             .chat
             .selected_model
@@ -10428,7 +10797,25 @@ impl AppState {
                         )
                     })
                     .when(pane.chat.active, |row| {
+                        let added = if tokens.is_dark { rgba(0x3fb950ff) } else { rgba(0x1a7f37ff) };
+                        let removed = if tokens.is_dark { rgba(0xf85149ff) } else { rgba(0xcf222eff) };
                         row.child(div().flex_1().min_w_0()).child(
+                            div().id(("agent-changes", pane_id)).debug_selector(|| "agent-changes".into())
+                                .flex().items_center().gap(px(6.0)).h(px(28.0)).px(px(8.0)).rounded(px(7.0))
+                                .cursor_pointer().hover(|style| style.bg(tokens.pane_header_btn_hover))
+                                .text_size(px(11.0)).text_color(tokens.text_secondary)
+                                .tooltip(|window, cx| gpui_component::tooltip::Tooltip::new("Project working-tree changes").build(window, cx))
+                                .child(svg().path("zed_file_icons/diff.svg").size(px(14.0)).text_color(tokens.text_muted))
+                                .child("Changes")
+                                .when_some(change_summary, |button, summary| button
+                                    .child(div().debug_selector(|| "agent-changes-files".into()).text_color(tokens.text_secondary).child(format!("{}", summary.files)))
+                                    .child(div().debug_selector(|| "agent-changes-added".into()).text_color(added).child(format!("+{}", summary.additions)))
+                                    .child(div().debug_selector(|| "agent-changes-removed".into()).text_color(removed).child(format!("-{}", summary.deletions))))
+                                .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.open_project_diff(pane_id, window, cx);
+                                }))
+                        ).child(
                             div()
                                 .id(("agent-info-toggle", pane_id))
                                 .debug_selector(|| "agent-info-toggle".into())
@@ -13203,8 +13590,17 @@ impl AppState {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.open_terminal_context_menu(pane_id, event.position, window, cx);
+                            if this.pane_ref(pane_id).is_some_and(|pane| {
+                                pane.diff_preview.is_none() && pane.markdown_preview.is_none()
+                            }) {
+                                cx.stop_propagation();
+                                this.open_terminal_context_menu(
+                                    pane_id,
+                                    event.position,
+                                    window,
+                                    cx,
+                                );
+                            }
                         }),
                     )
                     .child(if let Some(view) = &pane.diff_preview {
@@ -16150,6 +16546,7 @@ fn main() -> Result<()> {
                         next_id: 1,
                         session_index: HashMap::new(),
                         pane_index: HashMap::new(),
+                        project_change_counts: HashMap::new(),
                         palette: palette.clone(),
                         focused_pane_id: None,
                         sidebar_visible: app_settings.sidebar.visible,
@@ -16417,6 +16814,33 @@ fn main() -> Result<()> {
                     })
                     .detach();
 
+                    // Keep the active project's summary fresh without running Git on the UI thread.
+                    // One loop serves all agent panes in the project and never overlaps requests.
+                    let changes_state = app_state.downgrade();
+                    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                        loop {
+                            let Ok(directory) = changes_state.update(cx, |state, _| {
+                                if state.active_view != ActiveView::Workspace { return None; }
+                                let project = state.projects.get(state.active_project_idx)?;
+                                let session = project.sessions.get(project.active_session_idx)?;
+                                session.panes.iter().any(|pane| pane.chat.active && pane.preview_owner.is_none())
+                                    .then(|| project.path.clone())
+                            }) else { break; };
+                            if let Some(directory) = directory {
+                                let workdir = directory.clone();
+                                let summary = cx.background_executor().spawn(async move { project_diff::summary(workdir).ok() }).await;
+                                if changes_state.update(cx, |state, cx| {
+                                    if state.projects.iter().any(|project| project.path == directory)
+                                        && state.project_change_counts.get(&directory) != Some(&summary) {
+                                        state.project_change_counts.insert(directory, summary);
+                                        cx.notify();
+                                    }
+                                }).is_err() { break; }
+                            }
+                            cx.background_executor().timer(std::time::Duration::from_secs(4)).await;
+                        }
+                    }).detach();
+
                     // Opt-in diagnostics: one line per second with frame
                     // timing, UI-thread work, CPU, RSS and wakeups. Not spawned
                     // at all unless `KATHAMO_DIAGNOSTICS` is set.
@@ -16484,7 +16908,7 @@ fn main() -> Result<()> {
                         let mut handled = false;
                         let _ = link_host.update(cx, |state, cx| {
                             if let Some(pane_id) = state.focused_pane_id {
-                                handled = state.open_markdown_preview(pane_id, link, window, cx);
+                                handled = state.open_local_link(pane_id, link, window, cx);
                             }
                         });
                         handled
@@ -16623,6 +17047,7 @@ mod resize_tests {
             next_id: 2,
             session_index: HashMap::from([(1, (0, 0))]),
             pane_index: HashMap::from([(1, (0, 0, 0))]),
+            project_change_counts: HashMap::new(),
             palette,
             focused_pane_id: Some(1),
             sidebar_visible: true,
@@ -16765,6 +17190,42 @@ mod resize_tests {
             cx.debug_bounds("agent-usage").is_none(),
             "terminal mode hides agent metrics"
         );
+    }
+
+    #[test]
+    fn agent_changes_indicator_opens_the_reusable_changes_pane() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        cx.update_window_entity(&state, |state, window, cx| {
+            state.set_chat_mode(1, true, window, cx);
+            let path = state.projects[0].path.clone();
+            state.project_change_counts.insert(
+                path,
+                Some(project_diff::ChangeSummary {
+                    files: 3,
+                    additions: 12,
+                    deletions: 4,
+                }),
+            );
+            cx.notify();
+        });
+        cx.draw_frame().unwrap();
+        let button = cx.debug_bounds("agent-changes").expect("changes indicator");
+        assert!(cx.debug_bounds("agent-changes-files").is_some());
+        assert!(cx.debug_bounds("agent-changes-added").is_some());
+        assert!(cx.debug_bounds("agent-changes-removed").is_some());
+        cx.simulate_click(button.center(), Modifiers::none());
+        cx.draw_frame().unwrap();
+        state.read_with(&cx, |state, _| {
+            let session = &state.projects[0].sessions[0];
+            assert_eq!(session.panes.len(), 2);
+            assert!(
+                session
+                    .panes
+                    .iter()
+                    .any(|pane| pane.preview_owner == Some(1) && pane.diff_preview.is_some())
+            );
+        });
     }
 
     #[test]
@@ -17910,6 +18371,7 @@ mod pane_tests {
             view.request += 1; // Keep the asynchronous Git result from replacing this fixture.
             view.expanded.insert("example.rs".to_owned());
             view.result = Some(Ok(project_diff::ProjectDiff {
+                root: std::env::temp_dir(),
                 files: vec![
                     project_diff::DiffFile {
                         group: project_diff::FileGroup::Tracked,
@@ -17950,6 +18412,168 @@ mod pane_tests {
             assert_eq!(session.panes.len(), 2);
             assert!(session.panes.iter().any(|pane| pane.diff_preview.is_some()));
         });
+    }
+
+    #[test]
+    fn repeated_links_and_changes_reuse_the_same_preview_pane() {
+        let dir =
+            std::env::temp_dir().join(format!("kathamo-reuse-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.md");
+        let second = dir.join("second.md");
+        let code = dir.join("code.rs");
+        std::fs::write(&first, "# First\n").unwrap();
+        std::fs::write(&second, "# Second\n").unwrap();
+        std::fs::write(&code, "fn main() {}\n").unwrap();
+        let mut cx = TestAppContext::new();
+        let (mut cx, app_state) = open_app(&mut cx);
+        let preview_id = cx.update_window_entity(&app_state, |state, window, cx| {
+            assert!(state.open_local_link(1, first.to_str().unwrap(), window, cx));
+            let id = state.focused_pane_id.unwrap();
+            assert!(state.open_local_link(1, second.to_str().unwrap(), window, cx));
+            assert_eq!(state.focused_pane_id, Some(id));
+            assert!(state.open_local_link(id, code.to_str().unwrap(), window, cx));
+            state.open_project_diff(1, window, cx);
+            assert!(state.open_local_link(1, second.to_str().unwrap(), window, cx));
+            id
+        });
+        cx.run_until_parked();
+        cx.draw_frame().expect("reused preview draws");
+        app_state.read_with(&cx, |state, _| {
+            let session = &state.active_project().unwrap().sessions[0];
+            assert_eq!(session.panes.len(), 2);
+            let preview = session
+                .panes
+                .iter()
+                .find(|pane| pane.id == preview_id)
+                .unwrap();
+            assert_eq!(preview.preview_owner, Some(1));
+            assert_eq!(preview.markdown_preview.as_ref().unwrap().0, second);
+            assert!(preview.diff_preview.is_none());
+        });
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.close_pane(preview_id, window, cx);
+            assert!(state.open_local_link(1, first.to_str().unwrap(), window, cx));
+        });
+        app_state.read_with(&cx, |state, _| {
+            assert_eq!(state.active_project().unwrap().sessions[0].panes.len(), 2)
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn local_file_url_opens_editor_beside_agent() {
+        let dir = std::env::temp_dir().join(format!("kathamo-local-link-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("App.svelte");
+        std::fs::write(&path, "<h1>Hello</h1>\n").unwrap();
+        let file_url = url::Url::from_file_path(&path).unwrap().to_string();
+        let mut cx = TestAppContext::new();
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            assert!(!state.open_local_link(1, "https://example.com/App.svelte", window, cx));
+            assert!(state.open_local_link(1, &file_url, window, cx));
+        });
+        cx.run_until_parked();
+        cx.draw_frame().expect("local file view draws");
+        app_state.read_with(&cx, |state, cx| {
+            let session = &state.active_project().unwrap().sessions[0];
+            assert_eq!(session.panes.len(), 2);
+            let view = session
+                .panes
+                .iter()
+                .find_map(|pane| pane.diff_preview.as_ref())
+                .unwrap();
+            assert!(view.file_only);
+            match &view.file_view.as_ref().unwrap().state {
+                ReadOnlyFileState::Ready { input, .. } => {
+                    assert_eq!(input.read(cx).value().to_string(), "<h1>Hello</h1>\n")
+                }
+                _ => panic!("local file did not load"),
+            }
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clicking_changed_file_opens_read_only_editor() {
+        let dir = std::env::temp_dir().join(format!("kathamo-click-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("example.rs"), "fn main() {}\n").unwrap();
+        let mut cx = TestAppContext::new();
+        let (mut cx, app_state) = open_app(&mut cx);
+        cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_diff(1, window, cx);
+            let id = state.focused_pane_id.unwrap();
+            let view = state.pane_mut(id).unwrap().diff_preview.as_mut().unwrap();
+            view.request += 1;
+            view.result = Some(Ok(project_diff::ProjectDiff {
+                root: dir.clone(),
+                files: vec![project_diff::DiffFile {
+                    group: project_diff::FileGroup::Tracked,
+                    path: "example.rs".into(),
+                    additions: Some(1),
+                    deletions: Some(0),
+                    patch: "+fn main() {}\n".into(),
+                }],
+            }));
+        });
+        cx.draw_frame().expect("changes draws");
+        let row = cx.debug_bounds("project-diff-file-0").expect("file row");
+        cx.simulate_click(row.origin + point(px(90.0), px(10.0)), Modifiers::default());
+        cx.run_until_parked();
+        cx.draw_frame().expect("file view draws");
+        app_state.read_with(&cx, |state, cx| {
+            let view = state
+                .pane_ref(state.focused_pane_id.unwrap())
+                .unwrap()
+                .diff_preview
+                .as_ref()
+                .unwrap();
+            match &view.file_view.as_ref().expect("file view opened").state {
+                ReadOnlyFileState::Ready { input, .. } => {
+                    assert_eq!(input.read(cx).value().to_string(), "fn main() {}\n")
+                }
+                _ => panic!("file did not finish loading"),
+            }
+        });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_file_editor_accepts_selection_but_not_edits() {
+        let mut cx = TestAppContext::new();
+        let (mut cx, app_state) = open_app(&mut cx);
+        let input = cx.update_window_entity(&app_state, |state, window, cx| {
+            state.open_project_diff(1, window, cx);
+            let id = state.focused_pane_id.unwrap();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .code_editor("rust")
+                    .line_number(true)
+                    .default_value("original text")
+                    .read_only(true)
+            });
+            let view = state.pane_mut(id).unwrap().diff_preview.as_mut().unwrap();
+            view.file_view = Some(ReadOnlyFile {
+                path: "test.rs".into(),
+                state: ReadOnlyFileState::Ready {
+                    input: input.clone(),
+                    deleted: false,
+                },
+            });
+            input.update(cx, |input, cx| input.focus(window, cx));
+            input
+        });
+        cx.draw_frame().expect("file editor draws");
+        cx.simulate_keystrokes("ctrl-a");
+        cx.simulate_input("replaced");
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        assert_eq!(
+            input.read_with(&cx, |input, _| input.value().to_string()),
+            "original text"
+        );
     }
 
     #[test]

@@ -281,6 +281,7 @@ pub struct InputState {
     pub(super) selecting: bool,
     pub(super) size: Size,
     pub(super) disabled: bool,
+    pub(super) read_only: bool,
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) soft_wrap: bool,
@@ -374,6 +375,7 @@ impl InputState {
             input_bounds: Bounds::default(),
             selecting: false,
             disabled: false,
+            read_only: false,
             masked: false,
             clean_on_escape: false,
             soft_wrap: true,
@@ -421,6 +423,12 @@ impl InputState {
         if !self.mode.is_auto_grow() {
             self.mode = InputMode::auto_grow(min_rows, max_rows);
         }
+    }
+
+    /// Prevent user edits while keeping navigation, selection and copying enabled.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     pub fn code_editor(mut self, language: impl Into<SharedString>) -> Self {
@@ -621,9 +629,12 @@ impl InputState {
             };
         self.history.ignore = true;
         let was_disabled = self.disabled;
+        let was_read_only = self.read_only;
         self.disabled = false;
+        self.read_only = false;
         self.replace_text(value, window, cx);
         self.disabled = was_disabled;
+        self.read_only = was_read_only;
         self.history.ignore = false;
 
         // Programmatic replacement (history recall, completions, clearing)
@@ -1911,7 +1922,7 @@ impl EntityInputHandler for InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
+        if self.disabled || self.read_only {
             return;
         }
 
@@ -1979,7 +1990,7 @@ impl EntityInputHandler for InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
+        if self.disabled || self.read_only {
             return;
         }
 

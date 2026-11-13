@@ -29,8 +29,9 @@ Kathamo combines native terminal rendering powered by [GPUI Fast](https://github
   - Quick-action buttons to create new terminal sessions per project or open existing directories.
 
 - **Project changes**
-  - Select **Changes** in a pane header or run `/diff` in agent chat to open a Git diff beside your work.
+  - The agent toolbar shows the project's changed-file count and line totals. Select **Changes** there or in a pane header, or run `/diff` in agent chat, to open a Git diff beside your work.
   - Review per-file patches and line counts against `HEAD` (or an empty tree before the first commit), grouped into collapsible tracked and untracked sections. Ignored untracked files are excluded; changed dotfiles and lockfiles remain visible. Use **Refresh** to reload the snapshot.
+  - Click a filename to read it in a syntax-highlighted, read-only editor; select the arrow beside it to expand its patch. Deleted files open their last committed version. Links and project changes reuse the same preview pane beside their source.
 
 - **🔌 First-Class Agent Integrations & CLI**
   - Automated one-command setup for popular agent CLIs:

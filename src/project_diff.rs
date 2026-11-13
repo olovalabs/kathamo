@@ -18,7 +18,24 @@ pub struct DiffFile {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectDiff {
+    pub root: PathBuf,
     pub files: Vec<DiffFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangeSummary {
+    pub files: usize,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+pub fn summary(directory: PathBuf) -> Result<ChangeSummary, String> {
+    let diff = load_impl(directory, false)?;
+    Ok(ChangeSummary {
+        files: diff.files.len(),
+        additions: diff.files.iter().filter_map(|file| file.additions).sum(),
+        deletions: diff.files.iter().filter_map(|file| file.deletions).sum(),
+    })
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
@@ -67,6 +84,10 @@ fn counts(record: &[u8]) -> Option<(Option<usize>, Option<usize>, String)> {
 }
 
 pub fn load(directory: PathBuf) -> Result<ProjectDiff, String> {
+    load_impl(directory, true)
+}
+
+fn load_impl(directory: PathBuf, with_patches: bool) -> Result<ProjectDiff, String> {
     let root_output = checked(&directory, &["rev-parse", "--show-toplevel"])
         .map_err(|e| format!("Not a Git repository: {e}"))?;
     let root = PathBuf::from(
@@ -94,25 +115,30 @@ pub fn load(directory: PathBuf) -> Result<ProjectDiff, String> {
         )?;
         for record in stats.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
             if let Some((additions, deletions, path)) = counts(record) {
-                let output = checked(
-                    &root,
-                    &[
-                        "diff",
-                        "--no-ext-diff",
-                        "--no-textconv",
-                        "--no-renames",
-                        "--no-color",
-                        "HEAD",
-                        "--",
-                        &path,
-                    ],
-                )?;
+                let patch = if with_patches {
+                    let output = checked(
+                        &root,
+                        &[
+                            "diff",
+                            "--no-ext-diff",
+                            "--no-textconv",
+                            "--no-renames",
+                            "--no-color",
+                            "HEAD",
+                            "--",
+                            &path,
+                        ],
+                    )?;
+                    String::from_utf8_lossy(&output.stdout).into_owned()
+                } else {
+                    String::new()
+                };
                 files.push(DiffFile {
                     group: FileGroup::Tracked,
                     path,
                     additions,
                     deletions,
-                    patch: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    patch,
                 });
             }
         }
@@ -155,17 +181,21 @@ pub fn load(directory: PathBuf) -> Result<ProjectDiff, String> {
         else {
             continue;
         };
-        let patch = no_index(&root, &path, false)?;
+        let patch = if with_patches {
+            String::from_utf8_lossy(&no_index(&root, &path, false)?.stdout).into_owned()
+        } else {
+            String::new()
+        };
         files.push(DiffFile {
             group,
             path,
             additions,
             deletions,
-            patch: String::from_utf8_lossy(&patch.stdout).into_owned(),
+            patch,
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(ProjectDiff { files })
+    Ok(ProjectDiff { root, files })
 }
 
 #[cfg(test)]
@@ -217,6 +247,14 @@ mod tests {
         repo.write("file with space.txt", b"one\nstaged\nworktree\n");
         repo.write("new.txt", b"new\nfile\n");
         let diff = load(repo.0.clone()).unwrap();
+        assert_eq!(
+            summary(repo.0.clone()).unwrap(),
+            ChangeSummary {
+                files: 2,
+                additions: 4,
+                deletions: 1
+            }
+        );
         assert_eq!(diff.files.len(), 2);
         let tracked = &diff.files[0];
         assert_eq!(tracked.path, "file with space.txt");

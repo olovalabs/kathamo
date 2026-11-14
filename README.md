@@ -153,13 +153,21 @@ clickable accordions once the agent begins answering. Tool calls display all exe
 details by default in rich cards: tool badges, call IDs (`#id`), inline argument summaries,
 status badges, and line counts. Cards present pretty-printed input parameters and
 streaming output blocks with dedicated one-click copy buttons for both arguments and results.
-emits retry or compaction notices, these appear as clean activity updates.
-Chat autoscrolling dynamically stays pinned to the bottom during live streaming and
-asynchronous Markdown layout changes; scrolling up pauses autoscroll so you can read
-earlier history without being yanked down, showing a floating "Scroll to bottom" button.
+Retry or compaction notices appear as activity updates. Chat autoscrolling stays
+pinned to the bottom during live streaming and asynchronous Markdown layout changes;
+scrolling up pauses autoscroll and shows a floating "Scroll to bottom" button.
 Kathamo opens an embedded session when you enter Agent mode or choose a model.
 For Gemini 3.8 Flash, **Fast** uses low reasoning and **Deep** uses high reasoning.
 Use `/thinking low|medium|high` to set a per-pane override.
+
+Start a prompt with `@browser` for autocomplete, or include the mention anywhere
+in a prompt, for example `@browser open example.com and summarize it`. Release
+builds bundle [agent-browser](https://github.com/vercel-labs/agent-browser). On
+first use, the agent checks for Chrome for Testing and downloads it if missing;
+this uses the shell tool and normal tool approvals apply. The browser is headless
+by default. Linux may need additional system libraries. Source builds without a
+bundled binary use agent-browser from PATH; to embed one, set
+`KATHAMO_AGENT_BROWSER_BIN` to the platform's native executable when building.
 
 Type `/auth` in agent mode to open provider authentication. API-key providers
 offer **Save Key & Connect**; providers with native browser/device sign-in also

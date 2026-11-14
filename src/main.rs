@@ -2771,6 +2771,19 @@ const AGENT_SLASH_COMMANDS: &[(&str, &str)] = &[
 ];
 
 fn agent_slash_completions(value: &str) -> Vec<completion::CompletionItem> {
+    if value.starts_with('@') && !value.chars().any(char::is_whitespace) {
+        return if "@browser".starts_with(&value.to_lowercase()) {
+            vec![completion::CompletionItem {
+                value: "@browser".into(),
+                display: "@browser".into(),
+                detail: "Use agent-browser for this request".into(),
+                kind: completion::CompletionKind::Command,
+                is_dir: false,
+            }]
+        } else {
+            Vec::new()
+        };
+    }
     if !value.starts_with('/') || value.chars().any(char::is_whitespace) {
         return Vec::new();
     }
@@ -7069,7 +7082,7 @@ impl AppState {
                 return;
             };
             self.close_completion_menu(pane_id, cx);
-            if item.value == "/thinking" {
+            if item.value == "/thinking" || item.value == "@browser" {
                 set_input_text(&input, format!("{} ", item.value), window, cx);
             } else {
                 set_input_text(&input, item.value, window, cx);
@@ -8387,6 +8400,10 @@ impl AppState {
             return;
         };
         let command = input.read(cx).value().trim().to_owned();
+        if command == "@browser" {
+            set_input_text(&input, "@browser ".into(), window, cx);
+            return;
+        }
         match command.as_str() {
             "/diff" => {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
@@ -10903,6 +10920,8 @@ impl AppState {
             rgba(0x236823ff).into()
         };
         let input_element = if let Some(input_state) = &pane.input_state {
+            let browser_mentioned = pane.chat.active
+                && agent_bridge::has_browser_mention(input_state.read(cx).value().as_str());
             div()
                 .id(("kathamo-input-wrapper", pane_id))
                 .debug_selector(|| "agent-composer-input".to_string())
@@ -10949,7 +10968,12 @@ impl AppState {
                             .focus_bordered(false)
                             .cleanable(false)
                             .px_0()
-                            .py_0(),
+                            .py_0()
+                            .when(browser_mentioned, |input| {
+                                input.prefix(
+                                    img("icons/browser-color.png").size(px(16.0)),
+                                )
+                            }),
                     ),
                 )
                 .into_any_element()
@@ -11548,12 +11572,16 @@ impl AppState {
                                     "/fast" => "icons/sparkle.svg",
                                     _ => "icons/settings.svg",
                                 };
-                                this.child(
-                                    svg()
-                                        .path(icon)
-                                        .size(px(14.0))
-                                        .text_color(tokens.text_secondary),
-                                )
+                                if item.value == "@browser" {
+                                    this.child(img("icons/browser-color.png").size(px(16.0)))
+                                } else {
+                                    this.child(
+                                        svg()
+                                            .path(icon)
+                                            .size(px(14.0))
+                                            .text_color(tokens.text_secondary),
+                                    )
+                                }
                             })
                             .when(!pane.chat.active, |this| {
                                 this.child(
@@ -18575,6 +18603,25 @@ mod resize_tests {
     }
 
     #[test]
+    fn browser_completion_inserts_mention_without_sending() {
+        let mut app = TestAppContext::new();
+        let (mut cx, state) = open_app(&mut app);
+        let pane_id = state.read_with(&cx, |s, _| s.projects[0].sessions[0].panes[0].id);
+        cx.update_window_entity(&state, |s, window, cx| {
+            s.set_chat_mode(pane_id, true, window, cx);
+            let input = s.pane_ref(pane_id).unwrap().input_state.clone().unwrap();
+            set_input_text(&input, "@bro".into(), window, cx);
+            s.on_pane_input_changed(pane_id, window, cx);
+            s.accept_completion_at(pane_id, 0, window, cx);
+            assert_eq!(input.read(cx).value().as_str(), "@browser ");
+            assert!(s.pane_ref(pane_id).unwrap().chat.messages.is_empty());
+            s.submit_agent_prompt(pane_id, window, cx);
+            assert_eq!(input.read(cx).value().as_str(), "@browser ");
+            assert!(s.pane_ref(pane_id).unwrap().chat.messages.is_empty());
+        });
+    }
+
+    #[test]
     fn agent_slash_menu_filters_only_command_input() {
         let names = |input: &str| {
             agent_slash_completions(input)
@@ -18588,6 +18635,8 @@ mod resize_tests {
         assert!(names("/thinking high").is_empty());
         assert!(names("explain /model").is_empty());
         assert!(names("/unknown").is_empty());
+        assert_eq!(names("@bro"), vec!["@browser"]);
+        assert!(names("@browser open example.com").is_empty());
     }
 
     #[test]

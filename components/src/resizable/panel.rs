@@ -194,6 +194,7 @@ pub struct ResizablePanel {
     size_range: Range<Pixels>,
     children: Vec<AnyElement>,
     visible: bool,
+    show_handle_line: bool,
 }
 
 impl ResizablePanel {
@@ -207,7 +208,14 @@ impl ResizablePanel {
             axis: Axis::Horizontal,
             children: vec![],
             visible: true,
+            show_handle_line: true,
         }
+    }
+
+    /// Show or hide the divider line while keeping the resize handle interactive.
+    pub fn show_handle_line(mut self, show: bool) -> Self {
+        self.show_handle_line = show;
+        self
     }
 
     pub fn visible(mut self, visible: bool) -> Self {
@@ -291,7 +299,7 @@ impl RenderOnce for ResizablePanel {
             .children(self.children)
             .when(self.panel_ix > 0, |this| {
                 let ix = self.panel_ix - 1;
-                this.child(resize_handle(("resizable-handle", ix), self.axis).on_drag(
+                this.child(resize_handle(("resizable-handle", ix), self.axis).show_line(self.show_handle_line).on_drag(
                     DragPanel,
                     move |drag_panel, _, _, cx| {
                         cx.stop_propagation();

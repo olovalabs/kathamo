@@ -14202,6 +14202,18 @@ impl AppState {
             .size_full()
             .bg(tokens.pane_bg)
             .rounded(px(10.0))
+            .shadow(vec![gpui::BoxShadow {
+                color: gpui::Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 0.0,
+                    a: 0.22,
+                },
+                blur_radius: px(8.0),
+                spread_radius: px(0.0),
+                offset: gpui::point(px(0.0), px(2.0)),
+                inset: false,
+            }])
             .border(px(0.5))
             .border_color(if is_focused {
                 tokens.pane_border_focused
@@ -14212,12 +14224,9 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| {
-                    if this
-                        .pane_ref(pane_id)
-                        .is_some_and(|p| {
-                            p.chat.auth.is_some() || p.chat.active && !p.chat.requests.is_empty()
-                        })
-                    {
+                    if this.pane_ref(pane_id).is_some_and(|p| {
+                        p.chat.auth.is_some() || p.chat.active && !p.chat.requests.is_empty()
+                    }) {
                         return;
                     }
                     this.focus_pane(pane_id, window, cx);
@@ -14453,7 +14462,10 @@ impl AppState {
         match node {
             PaneNode::Leaf(pane_id) => {
                 if let Some(pane) = session.panes.iter().find(|p| p.id == *pane_id) {
-                    self.render_terminal_pane(pane, is_maximized, window, cx)
+                    div()
+                        .size_full()
+                        .p(px(4.0))
+                        .child(self.render_terminal_pane(pane, is_maximized, window, cx))
                         .into_any_element()
                 } else {
                     div().into_any_element()
@@ -14473,22 +14485,20 @@ impl AppState {
                 if is_horizontal {
                     h_resizable(split_id)
                         .child(
-                            resizable_panel().size_range(px(100.0)..px(3000.0)).child(
+                            resizable_panel().show_handle_line(false).size_range(px(100.0)..px(3000.0)).child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .size_full()
-                                    .p(px(2.0))
                                     .child(div().flex_1().size_full().child(left_el)),
                             ),
                         )
                         .child(
-                            resizable_panel().size_range(px(100.0)..px(3000.0)).child(
+                            resizable_panel().show_handle_line(false).size_range(px(100.0)..px(3000.0)).child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .size_full()
-                                    .p(px(2.0))
                                     .child(div().flex_1().size_full().child(right_el)),
                             ),
                         )
@@ -14496,22 +14506,20 @@ impl AppState {
                 } else {
                     v_resizable(split_id)
                         .child(
-                            resizable_panel().size_range(px(70.0)..px(3000.0)).child(
+                            resizable_panel().show_handle_line(false).size_range(px(70.0)..px(3000.0)).child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .size_full()
-                                    .p(px(2.0))
                                     .child(div().flex_1().size_full().child(left_el)),
                             ),
                         )
                         .child(
-                            resizable_panel().size_range(px(70.0)..px(3000.0)).child(
+                            resizable_panel().show_handle_line(false).size_range(px(70.0)..px(3000.0)).child(
                                 div()
                                     .flex()
                                     .flex_col()
                                     .size_full()
-                                    .p(px(2.0))
                                     .child(div().flex_1().size_full().child(right_el)),
                             ),
                         )
@@ -16747,7 +16755,10 @@ impl Render for AppState {
             // running in the background.
             if let Some(max_pane_id) = session.maximized_pane_id {
                 if let Some(pane) = session.panes.iter().find(|p| p.id == max_pane_id) {
-                    self.render_terminal_pane(pane, true, _window, cx)
+                    div()
+                        .size_full()
+                        .p(px(4.0))
+                        .child(self.render_terminal_pane(pane, true, _window, cx))
                         .into_any_element()
                 } else if let Some(tree) = &session.pane_tree {
                     self.render_pane_node(tree, session, false, _window, cx)
@@ -16757,7 +16768,10 @@ impl Render for AppState {
             } else if let Some(tree) = &session.pane_tree {
                 self.render_pane_node(tree, session, false, _window, cx)
             } else if let Some(pane) = session.panes.first() {
-                self.render_terminal_pane(pane, false, _window, cx)
+                div()
+                    .size_full()
+                    .p(px(4.0))
+                    .child(self.render_terminal_pane(pane, false, _window, cx))
                     .into_any_element()
             } else {
                 div().into_any_element()
@@ -16940,7 +16954,7 @@ impl Render for AppState {
                     .size_full()
                     .bg(tokens.window_bg)
                     .overflow_hidden()
-                    .p(px(6.0))
+                    .p(px(4.0))
                     .child(div().flex().flex_col().size_full().child(terminal_area)),
             );
 

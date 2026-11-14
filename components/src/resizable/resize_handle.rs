@@ -23,6 +23,7 @@ pub(crate) struct ResizeHandle<T: 'static, E: 'static + Render> {
     axis: Axis,
     drag_value: Option<Rc<T>>,
     placement: Option<DockPlacement>,
+    show_line: bool,
     on_drag: Option<Rc<dyn Fn(&Point<Pixels>, &mut Window, &mut App) -> Entity<E>>>,
 }
 
@@ -34,6 +35,7 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
             on_drag: None,
             drag_value: None,
             placement: None,
+            show_line: true,
             axis,
         }
     }
@@ -48,6 +50,11 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
         self.on_drag = Some(Rc::new(move |p, window, cx| {
             f(value.clone(), p, window, cx)
         }));
+        self
+    }
+
+    pub(crate) fn show_line(mut self, show_line: bool) -> Self {
+        self.show_line = show_line;
         self
     }
 
@@ -151,13 +158,13 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
                                 .py(HANDLE_PADDING)
                         }),
                 })
-                .child(
+                .when(self.show_line, |this| this.child(
                     div()
                         .bg(bg_color)
                         .group_hover("handle", |this| this.bg(bg_color))
                         .when(axis.is_horizontal(), |this| this.h_full().w(HANDLE_SIZE))
                         .when(axis.is_vertical(), |this| this.w_full().h(HANDLE_SIZE)),
-                )
+                ))
                 .into_any_element();
 
             let layout_id = el.request_layout(window, cx);

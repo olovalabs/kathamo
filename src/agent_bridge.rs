@@ -27,7 +27,10 @@ fn bundled_browser() -> Result<Option<std::path::PathBuf>, String> {
         }
         std::fs::rename(&temp, &path).map_err(|error| error.to_string())?;
     }
-    std::fs::write(dir.join("LICENSE"), include_bytes!("../AGENT-BROWSER-LICENSE.txt"))
+    // agent-browser is Copyright 2025 Vercel Inc., licensed under Apache-2.0.
+    std::fs::write(dir.join("LICENSE"), include_bytes!("../LICENSE-APACHE"))
+        .map_err(|error| error.to_string())?;
+    std::fs::write(dir.join("NOTICE"), "agent-browser Copyright 2025 Vercel Inc. Licensed under the Apache License, Version 2.0.\n")
         .map_err(|error| error.to_string())?;
     Ok(Some(path))
 }
